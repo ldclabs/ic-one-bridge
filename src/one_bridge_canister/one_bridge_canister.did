@@ -1,0 +1,67 @@
+type BridgeLog = record {
+  to : BridgeTarget;
+  to_tx : opt BridgeTx;
+  from : BridgeTarget;
+  user : principal;
+  from_tx : BridgeTx;
+  created_at : nat64;
+  error : opt text;
+  icp_amount : nat;
+  finalized_at : nat64;
+};
+type BridgeTarget = variant { Evm : text; Icp };
+type BridgeTx = variant {
+  Evm : record { bool; blob };
+  Icp : record { bool; nat64 };
+};
+type CanisterArgs = variant { Upgrade : UpgradeArgs; Init : InitArgs };
+type InitArgs = record {
+  token_symbol : text;
+  governance_canister : opt principal;
+  key_name : text;
+  token_decimals : nat8;
+  token_ledger : principal;
+  token_logo : text;
+  token_name : text;
+};
+type Result = variant { Ok; Err : text };
+type Result_1 = variant { Ok : BridgeTx; Err : text };
+type Result_2 = variant { Ok : text; Err : text };
+type Result_3 = variant { Ok : StateInfo; Err : text };
+type Result_4 = variant { Ok : vec BridgeLog; Err : text };
+type StateInfo = record {
+  evm_address : text;
+  finalize_bridging_round : nat64;
+  min_threshold_to_bridge : nat;
+  token_symbol : text;
+  icp_address : principal;
+  evm_token_contracts : vec record { text; record { text; nat8; nat64 } };
+  evm_finalized_block : vec record { text; record { nat64; nat } };
+  key_name : text;
+  evm_providers : vec record { text; record { nat64; vec text } };
+  token_decimals : nat8;
+  token_ledger : principal;
+  token_logo : text;
+  token_name : text;
+};
+type UpgradeArgs = record {
+  token_symbol : opt text;
+  governance_canister : opt principal;
+  token_ledger : opt principal;
+  token_logo : opt text;
+  token_name : opt text;
+};
+service : (opt CanisterArgs) -> {
+  admin_add_evm_contract : (text, nat64, text) -> (Result);
+  admin_set_evm_providers : (text, nat64, vec text) -> (Result);
+  admin_update_evm_gas_price : () -> (Result);
+  bridge : (text, text, nat) -> (Result_1);
+  erc20_transfer : (text, text, nat) -> (Result_2);
+  erc20_transfer_tx : (text, text, nat) -> (Result_2);
+  info : () -> (Result_3) query;
+  my_evm_address : () -> (Result_2) query;
+  my_finalized_logs : (opt nat64, opt nat64) -> (Result_4) query;
+  my_pending_logs : () -> (Result_4) query;
+  validate_admin_add_evm_contract : (text, nat64, text) -> (Result_2);
+  validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_2);
+}

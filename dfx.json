@@ -1,0 +1,22 @@
+{
+  "canisters": {
+    "one_bridge_canister": {
+      "candid": "src/one_bridge_canister/one_bridge_canister.did",
+      "declarations": {
+        "node_compatibility": true
+      },
+      "package": "one_bridge_canister",
+      "optimize": "cycles",
+      "gzip": true,
+      "type": "rust"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}
