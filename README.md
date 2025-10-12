@@ -18,7 +18,7 @@ dfx deploy one_bridge_canister
 
 ### Deployment
 
-Deploy the canister to subnet `pzp6e`:
+#### 1. Deploy the canister to subnet `pzp6e`:
 ```bash
 dfx deploy one_bridge_canister --argument "(opt variant {Init =
   record {
@@ -33,9 +33,47 @@ dfx deploy one_bridge_canister --argument "(opt variant {Init =
 })" --ic --subnet pzp6e-ekpqk-3c5x7-2h6so-njoeq-mt45d-h3h6c-q3mxf-vpeq5-fk5o7-yae
 ```
 
+#### 2. Check info:
+```bash
 dfx canister call one_bridge_canister info '()' --ic
-
 dfx canister call one_bridge_canister my_evm_address '()' --ic
+```
+
+#### 3. Set EVM providers (e.g. BNB Chain Mainnet):
+```bash
+# chain_name = "BNB"
+# max_confirmations = 11
+# providers = vec { "https://bsc.nodereal.io"; "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3" }
+dfx canister call one_bridge_canister admin_set_evm_providers '("BNB", 11, vec { "https://bsc.nodereal.io"; "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3" })' --ic
+```
+
+#### 4. Add EVM contract (e.g. BNB Chain PANDA token):
+```bash
+# chain_name = "BNB"
+# chain_id = 56
+# contract_address = "0xe74583edAFF618D88463554b84Bc675196b36990" (this is testnet address, replace with mainnet address)
+dfx canister call one_bridge_canister admin_add_evm_contract '("BNB", 56, "0xe74583edAFF618D88463554b84Bc675196b36990")' --ic
+```
+
+**We can add other EVM chains (Ethereum, Base, Avalanche...) and contracts similarly.**
+
+#### 5. Bridge 1 PANDA from ICP to BNB Chain:
+- 5.1. The total supply of PANDA on BNB Chain should be hold by the bridge canister's EVM address at initialization.
+- 5.2. Make sure the bridge canister evm address has enough gas (BNB) to pay for the transaction fees on BNB Chain.
+- 5.3. The user should approve the canister to spend PANDA on their behalf.
+
+```bash
+# from_chain = "ICP"
+# to_chain = "BNB"
+# amount = 100_000_000 (1 PANDA with 8 decimals)
+dfx canister call one_bridge_canister bridge '("ICP", "BNB", 100_000_000)' --ic
+
+# check pending tansfers
+dfx canister call one_bridge_canister my_pending_logs '()' --ic
+
+# after some time, check finalized tansfers
+dfx canister call one_bridge_canister my_finalized_logs '(null, null)' --ic
+```
 
 ## API Reference
 
