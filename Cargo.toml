@@ -17,7 +17,11 @@ categories = ["web-programming"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-alloy = { version = "1", features = ["rpc"] }
+alloy-consensus = "1"
+alloy-eips = "1"
+alloy-primitives = "1.4"
+alloy-rpc-types-eth = "1"
+alloy-signer = "1"
 base64 = "0.22"
 candid = { version = "0.10", features = ["value", "printer"] }
 ciborium = "0.2"

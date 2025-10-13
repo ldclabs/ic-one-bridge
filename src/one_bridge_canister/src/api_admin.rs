@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use candid::{CandidType, IDLValue, pretty::candid::value::pp_value};
 use url::Url;
 

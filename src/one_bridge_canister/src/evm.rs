@@ -1,7 +1,5 @@
-use alloy::{
-    primitives::{Address, TxHash, U256, hex::FromHex},
-    rpc::types::TransactionReceipt,
-};
+use alloy_primitives::{Address, TxHash, U256, hex::FromHex};
+use alloy_rpc_types_eth::TransactionReceipt;
 use ic_cdk::management_canister::{HttpHeader, HttpMethod, HttpRequestArgs};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;

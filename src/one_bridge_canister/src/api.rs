@@ -1,7 +1,5 @@
-use alloy::{
-    eips::Encodable2718,
-    primitives::{Address, Bytes},
-};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_primitives::{Address, Bytes};
 
 use crate::{helper::msg_caller, store};
 

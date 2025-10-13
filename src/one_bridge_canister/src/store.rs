@@ -1,7 +1,6 @@
-use alloy::{
-    consensus::{SignableTransaction, Signed, TxEip1559},
-    primitives::{Address, Bytes, Signature, TxHash, U256, hex},
-};
+use alloy_consensus::{SignableTransaction, Signed, TxEip1559};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_primitives::{Address, Bytes, Signature, TxHash, U256, hex};
 use candid::{CandidType, Nat, Principal};
 use ciborium::{from_reader, into_writer};
 use ic_http_certification::{
@@ -273,7 +272,6 @@ thread_local! {
 pub mod state {
     use super::*;
 
-    use alloy::eips::Encodable2718;
     use lazy_static::lazy_static;
     use once_cell::sync::Lazy;
 
@@ -862,7 +860,7 @@ pub fn pubkey_bytes_to_address(pubkey_bytes: &[u8]) -> Address {
 }
 
 fn y_parity(prehash: &[u8], sig: &[u8], pubkey: &[u8]) -> Result<bool, String> {
-    use alloy::signers::k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    use alloy_signer::k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 
     let orig_key = VerifyingKey::from_sec1_bytes(pubkey).map_err(format_error)?;
     let signature = Signature::try_from(sig).map_err(format_error)?;
