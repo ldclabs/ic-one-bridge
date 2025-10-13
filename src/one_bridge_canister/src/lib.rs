@@ -5,6 +5,7 @@ mod api_init;
 mod ecdsa;
 mod evm;
 mod helper;
+mod outcall;
 mod store;
 
 use api_init::CanisterArgs;

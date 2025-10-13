@@ -31,6 +31,7 @@ use crate::{
     ecdsa::{PublicKeyOutput, derive_public_key, ecdsa_public_key, sign_with_ecdsa},
     evm::{EvmClient, encode_erc20_transfer},
     helper::{call, convert_amount, format_error},
+    outcall::DefaultHttpOutcall,
 };
 
 type Memory = VirtualMemory<DefaultMemoryImpl>;
@@ -48,8 +49,8 @@ pub struct State {
     pub min_threshold_to_bridge: u128,
     // chain_name => (contract_address, decimals, chain_id)
     pub evm_token_contracts: HashMap<String, (Address, u8, u64)>,
-    // chain_name => (latest_finalized_block_number, gas_price)
-    pub evm_finalized_block: HashMap<String, (u64, u128)>,
+    // chain_name => (gas_updated_at, gas_price, max_priority_fee_per_gas)
+    pub evm_latest_gas: HashMap<String, (u64, u128, u128)>,
     // chain_name => (max_confirmations, [provider_url])
     pub evm_providers: HashMap<String, (u64, Vec<String>)>,
     pub ecdsa_public_key: PublicKeyOutput,
@@ -71,7 +72,7 @@ pub struct StateInfo {
     pub token_ledger: Principal,
     pub min_threshold_to_bridge: u128,
     pub evm_token_contracts: HashMap<String, (String, u8, u64)>,
-    pub evm_finalized_block: HashMap<String, (u64, u128)>,
+    pub evm_latest_gas: HashMap<String, (u64, u128, u128)>,
     pub evm_providers: HashMap<String, (u64, Vec<String>)>,
     pub finalize_bridging_round: u64,
 }
@@ -94,8 +95,8 @@ impl From<&State> for StateInfo {
                 .map(|(k, v)| (k.clone(), (v.0.to_string(), v.1, v.2)))
                 .collect(),
 
-            evm_finalized_block: s
-                .evm_finalized_block
+            evm_latest_gas: s
+                .evm_latest_gas
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
@@ -123,7 +124,7 @@ impl State {
             min_threshold_to_bridge: 100_000_000, // 1 Token (8 decimals)
             evm_token_contracts: HashMap::new(),
             evm_providers: HashMap::new(),
-            evm_finalized_block: HashMap::new(),
+            evm_latest_gas: HashMap::new(),
             ecdsa_public_key: PublicKeyOutput {
                 public_key: vec![].into(),
                 chain_code: vec![].into(),
@@ -213,7 +214,7 @@ impl Storable for BridgeLog {
 
 #[derive(Clone, CandidType, Default, Serialize, Deserialize)]
 pub struct UserLogs {
-    pub logs: BTreeSet<u64>, // finalized_at timestamps
+    pub logs: BTreeSet<u64>,
 }
 
 impl Storable for UserLogs {
@@ -270,8 +271,6 @@ thread_local! {
 }
 
 pub mod state {
-    use std::u64;
-
     use super::*;
 
     use alloy::eips::Encodable2718;
@@ -330,8 +329,11 @@ pub mod state {
     pub fn load() {
         STATE_STORE.with_borrow(|r| {
             STATE.with_borrow_mut(|h| {
-                let v: State =
-                    from_reader(&r.get()[..]).expect("failed to decode STATE_STORE data");
+                let bytes = r.get();
+                if bytes.is_empty() {
+                    return;
+                }
+                let v: State = from_reader(&bytes[..]).expect("failed to decode STATE_STORE data");
                 *h = v;
             });
         });
@@ -359,19 +361,20 @@ pub mod state {
         })
     }
 
-    pub fn evm_client(chain: &str) -> EvmClient {
+    pub fn evm_client(chain: &str) -> EvmClient<DefaultHttpOutcall> {
         STATE.with_borrow(|s| {
             s.evm_providers
                 .get(chain)
-                .map(|(max_confirmations, providers)| EvmClient {
-                    providers: providers.clone(),
-                    max_confirmations: *max_confirmations,
-                    api_token: None,
+                .map(|(max_confirmations, providers)| {
+                    EvmClient::new(
+                        providers.clone(),
+                        *max_confirmations,
+                        None,
+                        DefaultHttpOutcall::new(s.icp_address),
+                    )
                 })
-                .unwrap_or_else(|| EvmClient {
-                    providers: vec![],
-                    max_confirmations: 1,
-                    api_token: None,
+                .unwrap_or_else(|| {
+                    EvmClient::new(vec![], 1, None, DefaultHttpOutcall::new(s.icp_address))
                 })
         })
     }
@@ -415,11 +418,10 @@ pub mod state {
                 BridgeTarget::Evm(to_chain)
             };
 
-            let mut user_pending_task: HashSet<(Principal, BridgeTarget)> = HashSet::new();
             for log in s.pending.iter() {
                 if log.user == user
+                    && log.from == from
                     && matches!(log.from_tx, BridgeTx::Evm(false, _))
-                    && !user_pending_task.insert((log.user, log.from.clone()))
                 {
                     return Err(format!(
                         "there is already a pending bridging task from {:?} for user {:?}",
@@ -457,7 +459,7 @@ pub mod state {
         Ok(from_tx)
     }
 
-    pub fn logs(user: Principal, prev: Option<u64>, take: usize) -> Vec<BridgeLog> {
+    pub fn user_logs(user: Principal, prev: Option<u64>, take: usize) -> Vec<BridgeLog> {
         USER_LOGS.with_borrow(|r| {
             let item = r.get(&user).unwrap_or_default();
             if item.logs.is_empty() {
@@ -487,6 +489,21 @@ pub mod state {
         })
     }
 
+    pub fn logs(prev: Option<u64>, take: usize) -> Vec<BridgeLog> {
+        BRIDGE_LOGS.with_borrow(|log_store| {
+            let max_id = log_store.len();
+            let mut idx = prev.unwrap_or(max_id).min(max_id);
+            let mut logs: Vec<BridgeLog> = Vec::with_capacity(take);
+            while idx > 0 && logs.len() < take {
+                idx -= 1;
+                if let Some(log) = log_store.get(idx) {
+                    logs.push(log);
+                }
+            }
+            logs
+        })
+    }
+
     async fn finalize_bridging(round: u64) {
         let tasks = STATE.with_borrow_mut(|s| {
             if s.finalize_bridging_round.1 || round < s.finalize_bridging_round.0 {
@@ -501,16 +518,20 @@ pub mod state {
             s.finalize_bridging_round.1 = true;
             // take up to 3 pending tasks to process in parallel
             let mut tasks = Vec::with_capacity(3);
-            let mut locker_pending_task: HashSet<(Principal, BridgeTarget)> = HashSet::new();
-            for task in s.pending.iter().take(3) {
-                if matches!(task.to_tx, Some(BridgeTx::Evm(false, _)))
-                    && !locker_pending_task.insert((s.icp_address, task.to.clone()))
+            // 针对 EVM 出口，按链互斥，避免同一 from 地址的 nonce 冲突
+            let mut evm_outgoing_locked: HashSet<String> = HashSet::new();
+            for task in s.pending.iter() {
+                if let BridgeTarget::Evm(chain) = &task.to
+                    && !evm_outgoing_locked.insert(chain.clone())
                 {
-                    // another task for the same evm chain is still pending
-                    break;
+                    // 已有同链任务在本轮处理，跳过以避免 nonce 冲突
+                    continue;
                 }
 
                 tasks.push(task.clone());
+                if tasks.len() == 3 {
+                    break;
+                }
             }
             Some(tasks)
         });
@@ -725,8 +746,8 @@ pub mod state {
         to_addr: &Address,
         icp_amount: u128,
         now_ms: u64,
-    ) -> Result<(EvmClient, Signed<TxEip1559>), String> {
-        let (key_name, from_pk, mut tx) = STATE.with_borrow(|s| {
+    ) -> Result<(EvmClient<DefaultHttpOutcall>, Signed<TxEip1559>), String> {
+        let (key_name, from_pk, mut tx, gas_updated_at) = STATE.with_borrow(|s| {
             let (contract, decimals, chain_id) = s
                 .evm_token_contracts
                 .get(chain)
@@ -737,12 +758,10 @@ pub mod state {
             let from_pk = derive_public_key(&s.ecdsa_public_key, vec![from.as_slice().to_vec()])
                 .expect("derive_public_key failed");
 
-            let input = encode_erc20_transfer(&to_addr, value);
-            let gas_price = s
-                .evm_finalized_block
-                .get(chain)
-                .map(|(_, gas_price)| *gas_price)
-                .unwrap_or(1_000_000_000u128); // default 1 Gwei
+            let input = encode_erc20_transfer(to_addr, value);
+            let (gas_updated_at, gas_price, max_priority_fee_per_gas) =
+                s.evm_latest_gas.get(chain).cloned().unwrap_or_default();
+            let max_priority_fee_per_gas = max_priority_fee_per_gas + max_priority_fee_per_gas / 5;
             Ok::<_, String>((
                 s.key_name.clone(),
                 from_pk,
@@ -750,12 +769,13 @@ pub mod state {
                     chain_id,
                     nonce: 0u64,
                     gas_limit: 84_000u64, // sample: ~53,696
-                    max_fee_per_gas: gas_price + gas_price / 2,
-                    max_priority_fee_per_gas: gas_price / 2,
+                    max_fee_per_gas: gas_price * 2 + max_priority_fee_per_gas,
+                    max_priority_fee_per_gas,
                     to: contract.into(),
                     input: input.into(),
                     ..Default::default()
                 },
+                gas_updated_at,
             ))
         })?;
 
@@ -763,9 +783,28 @@ pub mod state {
         if &from_addr == to_addr {
             return Err("from and to cannot be the same".to_string());
         }
+
         let client = evm_client(chain);
-        let nonce = client.get_transaction_count(now_ms, &from_addr).await?;
-        tx.nonce = nonce;
+        if gas_updated_at + 120_000 >= now_ms {
+            let nonce = client.get_transaction_count(now_ms, &from_addr).await?;
+            tx.nonce = nonce;
+        } else {
+            let (nonce, gas_price, max_priority_fee_per_gas) = futures::future::try_join3(
+                client.get_transaction_count(now_ms, &from_addr),
+                client.gas_price(now_ms),
+                client.max_priority_fee_per_gas(now_ms),
+            )
+            .await?;
+            tx.nonce = nonce;
+            tx.max_priority_fee_per_gas = max_priority_fee_per_gas + max_priority_fee_per_gas / 5;
+            tx.max_fee_per_gas = gas_price * 2 + tx.max_priority_fee_per_gas;
+            STATE.with_borrow_mut(|s| {
+                s.evm_latest_gas.insert(
+                    chain.to_string(),
+                    (now_ms, gas_price, max_priority_fee_per_gas),
+                );
+            })
+        }
 
         let msg_hash = tx.signature_hash();
         let sig =
@@ -793,16 +832,16 @@ pub mod state {
         .await;
         match (number, receipt) {
             (Ok(number), Ok(Some(receipt))) => {
-                if let Some(block_number) = receipt.block_number {
-                    if block_number + client.max_confirmations <= number {
-                        // TODO: validate receipt.logs
-                        // log.address == 代币合约地址
-                        // log.topics[0] == keccak256("Transfer(address,address,uint256)") = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
-                        // log.topics[1] == from 地址（32 字节左填充）
-                        // log.topics[2] == to 地址（32 字节左填充）
-                        // log.data 为 uint256 的转账数量（ABI 编码）
-                        return Ok(receipt.status());
-                    }
+                if let Some(block_number) = receipt.block_number
+                    && block_number + client.max_confirmations <= number
+                {
+                    // TODO: validate receipt.logs
+                    // log.address == 代币合约地址
+                    // log.topics[0] == keccak256("Transfer(address,address,uint256)") = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+                    // log.topics[1] == from 地址（32 字节左填充）
+                    // log.topics[2] == to 地址（32 字节左填充）
+                    // log.data 为 uint256 的转账数量（ABI 编码）
+                    return Ok(receipt.status());
                 }
                 Ok(false)
             }
@@ -829,14 +868,12 @@ fn y_parity(prehash: &[u8], sig: &[u8], pubkey: &[u8]) -> Result<bool, String> {
     let signature = Signature::try_from(sig).map_err(format_error)?;
     for parity in [0u8, 1] {
         let recid = RecoveryId::try_from(parity).map_err(format_error)?;
-        let recovered_key = VerifyingKey::recover_from_prehash(prehash, &signature, recid)
-            .expect("failed to recover key");
+        let recovered_key = match VerifyingKey::recover_from_prehash(prehash, &signature, recid) {
+            Ok(k) => k,
+            Err(_) => continue, // 尝试另一 parity
+        };
         if recovered_key == orig_key {
-            match parity {
-                0 => return Ok(false),
-                1 => return Ok(true),
-                _ => unreachable!(),
-            }
+            return Ok(parity == 1);
         }
     }
 

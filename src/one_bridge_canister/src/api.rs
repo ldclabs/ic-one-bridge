@@ -42,7 +42,23 @@ async fn my_finalized_logs(
 ) -> Result<Vec<store::BridgeLog>, String> {
     let caller = msg_caller()?;
     let take = take.unwrap_or(10).min(1000) as usize;
-    let rt = store::state::logs(caller, prev, take);
+    let rt = store::state::user_logs(caller, prev, take);
+    Ok(rt)
+}
+
+#[ic_cdk::query]
+async fn pending_logs() -> Result<Vec<store::BridgeLog>, String> {
+    let rt = store::state::with(|s| s.pending.iter().cloned().collect::<Vec<store::BridgeLog>>());
+    Ok(rt)
+}
+
+#[ic_cdk::query]
+async fn finalized_logs(
+    prev: Option<u64>,
+    take: Option<u64>,
+) -> Result<Vec<store::BridgeLog>, String> {
+    let take = take.unwrap_or(10).min(1000) as usize;
+    let rt = store::state::logs(prev, take);
     Ok(rt)
 }
 

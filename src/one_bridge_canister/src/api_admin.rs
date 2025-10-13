@@ -1,5 +1,5 @@
 use alloy::primitives::Address;
-use candid::{pretty::candid::value::pp_value, CandidType, IDLValue};
+use candid::{CandidType, IDLValue, pretty::candid::value::pp_value};
 use url::Url;
 
 use crate::store;
@@ -13,10 +13,10 @@ async fn admin_add_evm_contract(
     let address = check_admin_add_evm_contract(&chain_name, chain_id, &address)?;
     let cli = store::state::evm_client(&chain_name);
     let now_ms = ic_cdk::api::time() / 1_000_000;
-    let (cid, gas_price, block_number, symbol, decimals) = futures::future::try_join5(
+    let (cid, gas_price, max_priority_fee_per_gas, symbol, decimals) = futures::future::try_join5(
         cli.chain_id(now_ms),
         cli.gas_price(now_ms),
-        cli.block_number(now_ms),
+        cli.max_priority_fee_per_gas(now_ms),
         cli.erc20_symbol(now_ms, &address),
         cli.erc20_decimals(now_ms, &address),
     )
@@ -39,13 +39,8 @@ async fn admin_add_evm_contract(
 
         s.evm_token_contracts
             .insert(chain_name.clone(), (address, decimals, chain_id));
-        s.evm_finalized_block.insert(
-            chain_name,
-            (
-                block_number.saturating_sub(cli.max_confirmations),
-                gas_price,
-            ),
-        );
+        s.evm_latest_gas
+            .insert(chain_name, (now_ms, gas_price, max_priority_fee_per_gas));
         Ok(())
     })
 }
