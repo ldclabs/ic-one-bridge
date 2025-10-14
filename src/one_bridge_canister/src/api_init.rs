@@ -18,6 +18,7 @@ pub struct InitArgs {
     pub token_decimals: u8,
     pub token_logo: String,
     pub token_ledger: Principal,
+    pub min_threshold_to_bridge: u128,
     pub governance_canister: Option<Principal>,
 }
 
@@ -27,6 +28,7 @@ pub struct UpgradeArgs {
     pub token_symbol: Option<String>,
     pub token_logo: Option<String>,
     pub token_ledger: Option<Principal>,
+    pub min_threshold_to_bridge: Option<u128>,
     pub governance_canister: Option<Principal>,
 }
 
@@ -40,6 +42,7 @@ fn init(args: Option<CanisterArgs>) {
             s.token_decimals = args.token_decimals;
             s.token_logo = args.token_logo;
             s.token_ledger = args.token_ledger;
+            s.min_threshold_to_bridge = args.min_threshold_to_bridge;
             s.governance_canister = args.governance_canister;
         });
     } else if let Some(CanisterArgs::Upgrade(_)) = args {
@@ -73,6 +76,9 @@ fn post_upgrade(args: Option<CanisterArgs>) {
             if let Some(token_ledger) = args.token_ledger {
                 s.token_ledger = token_ledger;
             }
+            if let Some(min_threshold_to_bridge) = args.min_threshold_to_bridge {
+                s.min_threshold_to_bridge = min_threshold_to_bridge;
+            }
             if let Some(governance_canister) = args.governance_canister {
                 s.governance_canister = Some(governance_canister);
             }
@@ -85,5 +91,13 @@ fn post_upgrade(args: Option<CanisterArgs>) {
         _ => {}
     }
 
+    let round = store::state::with_mut(|s| {
+        s.finalize_bridging_round.1 = false; // reset the in-progress flag for edge case
+        s.finalize_bridging_round.0
+    });
     store::state::init_http_certified_data();
+    ic_cdk_timers::set_timer(
+        Duration::from_secs(3),
+        store::state::finalize_bridging(round),
+    );
 }

@@ -67,8 +67,8 @@ fn check_admin_add_evm_contract(
         return Err("chain_name must be non-empty, up to 8 chars, and all uppercase".to_string());
     }
 
-    let addr = Address::parse_checksummed(address, Some(chain_id))
-        .map_err(|err| format!("invalid address: {err:?}"))?;
+    let addr = Address::parse_checksummed(address, None)
+        .map_err(|err| format!("invalid address {address}: {err:?}"))?;
 
     store::state::with(|s| {
         if s.evm_token_contracts.contains_key(chain_name) {

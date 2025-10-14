@@ -492,17 +492,64 @@ mod tests {
     }
 
     #[test]
-    fn test_get_transaction_receipt_null() {
-        let null_body = serde_json::json!({
+    fn test_get_transaction_receipt() {
+        let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "result": null
         });
-        let mock = MockHttpOutcall::new(vec![success_response(null_body)]);
+        let mock = MockHttpOutcall::new(vec![success_response(body)]);
         let client = EvmClient::new(vec!["https://rpc".to_string()], 5, None, mock);
 
         let tx_hash = TxHash::from([0u8; 32]);
         let result = futures::executor::block_on(client.get_transaction_receipt(1000, &tx_hash));
         assert!(result.unwrap().is_none());
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "type": "0x2",
+                "from": "0x9ac6b9ffbb4269fc51cf0ef7bcd322cefb3e5e14",
+                "to": "0xe74583edaff618d88463554b84bc675196b36990",
+                "status": "0x1",
+                "cumulativeGasUsed": "0x3e45f",
+                "logsBloom": "0x0000000000008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000210800000000000000000000000000000000000000000000000000100000000000000000000004000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000800000000000000000000000000020000000000000000000000000000000000000000800000000000000",
+                "logs": [
+                    {
+                        "address": "0xe74583edaff618d88463554b84bc675196b36990",
+                        "topics": [
+                            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                            "0x0000000000000000000000009ac6b9ffbb4269fc51cf0ef7bcd322cefb3e5e14",
+                            "0x0000000000000000000000009792cc010fe26155c676d0cc0057a3c66564fbcd"
+                        ],
+                        "data": "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+                        "blockNumber": "0x418f472",
+                        "transactionHash": "0xbbded599a5f088cb82d9b439043ff691857ebff4f480225d5d563aed4ef11aaa",
+                        "transactionIndex": "0x3",
+                        "blockHash": "0xc2259f320a755bb1f21ab3cd3590f6838a48c8167268088dcf648acee2362b15",
+                        "logIndex": "0x5",
+                        "removed": false
+                    }
+                ],
+                "transactionHash": "0xbbded599a5f088cb82d9b439043ff691857ebff4f480225d5d563aed4ef11aaa",
+                "contractAddress": null,
+                "gasUsed": "0xcbdb",
+                "blockHash": "0xc2259f320a755bb1f21ab3cd3590f6838a48c8167268088dcf648acee2362b15",
+                "blockNumber": "0x418f472",
+                "transactionIndex": "0x3",
+                "effectiveGasPrice": "0x7270e00"
+            }
+        });
+        let mock = MockHttpOutcall::new(vec![success_response(body)]);
+        let client = EvmClient::new(vec!["https://rpc".to_string()], 5, None, mock);
+
+        let tx_hash =
+            TxHash::from_hex("0xbbded599a5f088cb82d9b439043ff691857ebff4f480225d5d563aed4ef11aaa")
+                .unwrap();
+        let result =
+            futures::executor::block_on(client.get_transaction_receipt(1000, &tx_hash)).unwrap();
+        assert!(result.is_some());
+        println!("{:?}", result);
     }
 }

@@ -1,5 +1,6 @@
 export const idlFactory = ({ IDL }) => {
   const UpgradeArgs = IDL.Record({
+    'min_threshold_to_bridge' : IDL.Opt(IDL.Nat),
     'token_symbol' : IDL.Opt(IDL.Text),
     'governance_canister' : IDL.Opt(IDL.Principal),
     'token_ledger' : IDL.Opt(IDL.Principal),
@@ -7,6 +8,7 @@ export const idlFactory = ({ IDL }) => {
     'token_name' : IDL.Opt(IDL.Text),
   });
   const InitArgs = IDL.Record({
+    'min_threshold_to_bridge' : IDL.Nat,
     'token_symbol' : IDL.Text,
     'governance_canister' : IDL.Opt(IDL.Principal),
     'key_name' : IDL.Text,
@@ -28,6 +30,7 @@ export const idlFactory = ({ IDL }) => {
   const Result_2 = IDL.Variant({ 'Ok' : IDL.Text, 'Err' : IDL.Text });
   const BridgeTarget = IDL.Variant({ 'Evm' : IDL.Text, 'Icp' : IDL.Null });
   const BridgeLog = IDL.Record({
+    'id' : IDL.Opt(IDL.Nat64),
     'to' : BridgeTarget,
     'to_tx' : IDL.Opt(BridgeTx),
     'from' : BridgeTarget,
@@ -44,7 +47,7 @@ export const idlFactory = ({ IDL }) => {
     'evm_latest_gas' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Nat64, IDL.Nat, IDL.Nat))
     ),
-    'finalize_bridging_round' : IDL.Nat64,
+    'finalize_bridging_round' : IDL.Tuple(IDL.Nat64, IDL.Bool),
     'min_threshold_to_bridge' : IDL.Nat,
     'token_symbol' : IDL.Text,
     'icp_address' : IDL.Principal,
@@ -61,6 +64,7 @@ export const idlFactory = ({ IDL }) => {
     'token_name' : IDL.Text,
   });
   const Result_4 = IDL.Variant({ 'Ok' : StateInfo, 'Err' : IDL.Text });
+  const Result_5 = IDL.Variant({ 'Ok' : BridgeLog, 'Err' : IDL.Text });
   return IDL.Service({
     'admin_add_evm_contract' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Text],
@@ -86,6 +90,7 @@ export const idlFactory = ({ IDL }) => {
         ['query'],
       ),
     'info' : IDL.Func([], [Result_4], ['query']),
+    'my_bridge_log' : IDL.Func([BridgeTx], [Result_5], ['query']),
     'my_evm_address' : IDL.Func([], [Result_2], ['query']),
     'my_finalized_logs' : IDL.Func(
         [IDL.Opt(IDL.Nat64), IDL.Opt(IDL.Nat64)],
@@ -108,6 +113,7 @@ export const idlFactory = ({ IDL }) => {
 };
 export const init = ({ IDL }) => {
   const UpgradeArgs = IDL.Record({
+    'min_threshold_to_bridge' : IDL.Opt(IDL.Nat),
     'token_symbol' : IDL.Opt(IDL.Text),
     'governance_canister' : IDL.Opt(IDL.Principal),
     'token_ledger' : IDL.Opt(IDL.Principal),
@@ -115,6 +121,7 @@ export const init = ({ IDL }) => {
     'token_name' : IDL.Opt(IDL.Text),
   });
   const InitArgs = IDL.Record({
+    'min_threshold_to_bridge' : IDL.Nat,
     'token_symbol' : IDL.Text,
     'governance_canister' : IDL.Opt(IDL.Principal),
     'key_name' : IDL.Text,

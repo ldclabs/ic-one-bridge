@@ -3,6 +3,7 @@ import type { ActorMethod } from '@dfinity/agent';
 import type { IDL } from '@dfinity/candid';
 
 export interface BridgeLog {
+  'id' : [] | [bigint],
   'to' : BridgeTarget,
   'to_tx' : [] | [BridgeTx],
   'from' : BridgeTarget,
@@ -20,6 +21,7 @@ export type BridgeTx = { 'Evm' : [boolean, Uint8Array | number[]] } |
 export type CanisterArgs = { 'Upgrade' : UpgradeArgs } |
   { 'Init' : InitArgs };
 export interface InitArgs {
+  'min_threshold_to_bridge' : bigint,
   'token_symbol' : string,
   'governance_canister' : [] | [Principal],
   'key_name' : string,
@@ -38,10 +40,12 @@ export type Result_3 = { 'Ok' : Array<BridgeLog> } |
   { 'Err' : string };
 export type Result_4 = { 'Ok' : StateInfo } |
   { 'Err' : string };
+export type Result_5 = { 'Ok' : BridgeLog } |
+  { 'Err' : string };
 export interface StateInfo {
   'evm_address' : string,
   'evm_latest_gas' : Array<[string, [bigint, bigint, bigint]]>,
-  'finalize_bridging_round' : bigint,
+  'finalize_bridging_round' : [bigint, boolean],
   'min_threshold_to_bridge' : bigint,
   'token_symbol' : string,
   'icp_address' : Principal,
@@ -54,6 +58,7 @@ export interface StateInfo {
   'token_name' : string,
 }
 export interface UpgradeArgs {
+  'min_threshold_to_bridge' : [] | [bigint],
   'token_symbol' : [] | [string],
   'governance_canister' : [] | [Principal],
   'token_ledger' : [] | [Principal],
@@ -72,6 +77,7 @@ export interface _SERVICE {
   'erc20_transfer_tx' : ActorMethod<[string, string, bigint], Result_2>,
   'finalized_logs' : ActorMethod<[[] | [bigint], [] | [bigint]], Result_3>,
   'info' : ActorMethod<[], Result_4>,
+  'my_bridge_log' : ActorMethod<[BridgeTx], Result_5>,
   'my_evm_address' : ActorMethod<[], Result_2>,
   'my_finalized_logs' : ActorMethod<[[] | [bigint], [] | [bigint]], Result_3>,
   'my_pending_logs' : ActorMethod<[], Result_3>,

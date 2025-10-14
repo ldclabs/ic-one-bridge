@@ -73,7 +73,7 @@ pub struct StateInfo {
     pub evm_token_contracts: HashMap<String, (String, u8, u64)>,
     pub evm_latest_gas: HashMap<String, (u64, u128, u128)>,
     pub evm_providers: HashMap<String, (u64, Vec<String>)>,
-    pub finalize_bridging_round: u64,
+    pub finalize_bridging_round: (u64, bool),
 }
 
 impl From<&State> for StateInfo {
@@ -104,7 +104,7 @@ impl From<&State> for StateInfo {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            finalize_bridging_round: s.finalize_bridging_round.0,
+            finalize_bridging_round: s.finalize_bridging_round,
         }
     }
 }
@@ -166,6 +166,8 @@ impl BridgeTx {
 
 #[derive(Clone, CandidType, Serialize, Deserialize)]
 pub struct BridgeLog {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
     pub user: Principal,
     pub from: BridgeTarget,
     pub to: BridgeTarget,
@@ -439,6 +441,7 @@ pub mod state {
         let delay = if from == BridgeTarget::Icp { 0 } else { 7 };
         let round = STATE.with_borrow_mut(|s| {
             s.pending.push_back(BridgeLog {
+                id: None,
                 user,
                 from,
                 to,
@@ -455,6 +458,43 @@ pub mod state {
         ic_cdk_timers::set_timer(Duration::from_secs(delay), finalize_bridging(round));
 
         Ok(from_tx)
+    }
+
+    pub fn my_bridge_log(user: Principal, from_tx: BridgeTx) -> Option<BridgeLog> {
+        let mut log = STATE.with_borrow(|s| {
+            s.pending
+                .iter()
+                .find(|item| item.user == user && item.from_tx == from_tx)
+                .cloned()
+        });
+
+        if log.is_none() {
+            log = USER_LOGS.with_borrow(|r| {
+                let item = r.get(&user).unwrap_or_default();
+                if item.logs.is_empty() {
+                    return None;
+                }
+                let ids = item.logs.iter().rev().cloned().collect::<Vec<u64>>();
+
+                if ids.is_empty() {
+                    return None;
+                }
+
+                BRIDGE_LOGS.with_borrow(|log_store| {
+                    for id in ids {
+                        if let Some(mut log) = log_store.get(id)
+                            && log.from_tx == from_tx
+                        {
+                            log.id = Some(id);
+                            return Some(log);
+                        }
+                    }
+                    None
+                })
+            });
+        }
+
+        log
     }
 
     pub fn user_logs(user: Principal, prev: Option<u64>, take: usize) -> Vec<BridgeLog> {
@@ -478,7 +518,8 @@ pub mod state {
             BRIDGE_LOGS.with_borrow(|log_store| {
                 let mut logs: Vec<BridgeLog> = Vec::with_capacity(ids.len());
                 for id in ids {
-                    if let Some(log) = log_store.get(id) {
+                    if let Some(mut log) = log_store.get(id) {
+                        log.id = Some(id);
                         logs.push(log);
                     }
                 }
@@ -494,7 +535,8 @@ pub mod state {
             let mut logs: Vec<BridgeLog> = Vec::with_capacity(take);
             while idx > 0 && logs.len() < take {
                 idx -= 1;
-                if let Some(log) = log_store.get(idx) {
+                if let Some(mut log) = log_store.get(idx) {
+                    log.id = Some(idx);
                     logs.push(log);
                 }
             }
@@ -502,7 +544,7 @@ pub mod state {
         })
     }
 
-    async fn finalize_bridging(round: u64) {
+    pub async fn finalize_bridging(round: u64) {
         let tasks = STATE.with_borrow_mut(|s| {
             if s.finalize_bridging_round.1 || round < s.finalize_bridging_round.0 {
                 // already running or old round
@@ -537,8 +579,10 @@ pub mod state {
         if let Some(tasks) = tasks {
             let tasks = try_finalize_tasks(tasks).await;
             let now_ms = ic_cdk::api::time() / 1_000_000;
-            let round = STATE.with_borrow_mut(|s| {
+            let next = STATE.with_borrow_mut(|s| {
+                let mut has_error = false;
                 for task in tasks {
+                    has_error = has_error || task.error.is_some();
                     for t in s.pending.iter_mut() {
                         if t.same_with(&task) {
                             *t = task;
@@ -551,26 +595,28 @@ pub mod state {
                                 USER_LOGS.with_borrow_mut(|r| {
                                     let mut logs = r.get(&t.user).unwrap_or_default();
                                     logs.logs.insert(idx);
-                                    r.insert(t.user, logs)
-                                        .expect("failed to insert to USER_LOGS");
+                                    r.insert(t.user, logs);
                                 });
                             }
                             break;
                         }
                     }
                 }
+
                 s.pending.retain(|t| !t.is_finalized());
                 s.finalize_bridging_round = (s.finalize_bridging_round.0 + 1, false);
 
                 if s.pending.is_empty() {
-                    0
+                    None
+                } else if has_error {
+                    Some((5, s.finalize_bridging_round.0))
                 } else {
-                    s.finalize_bridging_round.0
+                    Some((1, s.finalize_bridging_round.0))
                 }
             });
 
-            if round > 0 {
-                ic_cdk_timers::set_timer(Duration::from_secs(1), finalize_bridging(round));
+            if let Some((delay, round)) = next {
+                ic_cdk_timers::set_timer(Duration::from_secs(delay), finalize_bridging(round));
             }
         }
     }
@@ -622,9 +668,9 @@ pub mod state {
         }
         .await;
 
-        if let Err(err) = rt {
+        task.error = rt.err();
+        if let Some(err) = &task.error {
             ic_cdk::api::debug_print(format!("finalize_tasks failed: {err}"));
-            task.error = Some(err);
         }
 
         task

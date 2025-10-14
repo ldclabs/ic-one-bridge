@@ -1,4 +1,5 @@
 type BridgeLog = record {
+  id : opt nat64;
   to : BridgeTarget;
   to_tx : opt BridgeTx;
   from : BridgeTarget;
@@ -16,6 +17,7 @@ type BridgeTx = variant {
 };
 type CanisterArgs = variant { Upgrade : UpgradeArgs; Init : InitArgs };
 type InitArgs = record {
+  min_threshold_to_bridge : nat;
   token_symbol : text;
   governance_canister : opt principal;
   key_name : text;
@@ -29,10 +31,11 @@ type Result_1 = variant { Ok : BridgeTx; Err : text };
 type Result_2 = variant { Ok : text; Err : text };
 type Result_3 = variant { Ok : vec BridgeLog; Err : text };
 type Result_4 = variant { Ok : StateInfo; Err : text };
+type Result_5 = variant { Ok : BridgeLog; Err : text };
 type StateInfo = record {
   evm_address : text;
   evm_latest_gas : vec record { text; record { nat64; nat; nat } };
-  finalize_bridging_round : nat64;
+  finalize_bridging_round : record { nat64; bool };
   min_threshold_to_bridge : nat;
   token_symbol : text;
   icp_address : principal;
@@ -45,6 +48,7 @@ type StateInfo = record {
   token_name : text;
 };
 type UpgradeArgs = record {
+  min_threshold_to_bridge : opt nat;
   token_symbol : opt text;
   governance_canister : opt principal;
   token_ledger : opt principal;
@@ -60,6 +64,7 @@ service : (opt CanisterArgs) -> {
   erc20_transfer_tx : (text, text, nat) -> (Result_2);
   finalized_logs : (opt nat64, opt nat64) -> (Result_3) query;
   info : () -> (Result_4) query;
+  my_bridge_log : (BridgeTx) -> (Result_5) query;
   my_evm_address : () -> (Result_2) query;
   my_finalized_logs : (opt nat64, opt nat64) -> (Result_3) query;
   my_pending_logs : () -> (Result_3) query;
