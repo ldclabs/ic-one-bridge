@@ -419,6 +419,13 @@ pub mod state {
             };
 
             for log in s.pending.iter() {
+                if let Some(err) = &log.error {
+                    return Err(format!(
+                        "there is a pending bridging task with error, please retry later:\n{}",
+                        err
+                    ));
+                }
+
                 if log.user == user
                     && log.from == from
                     && matches!(log.from_tx, BridgeTx::Evm(false, _))
@@ -869,17 +876,18 @@ pub mod state {
         now_ms: u64,
     ) -> Result<bool, String> {
         let client = evm_client(chain);
-        let (number, receipt) = futures::future::join(
+        let (latest_block, receipt) = futures::future::join(
             client.block_number(now_ms),
             client.get_transaction_receipt(now_ms, tx_hash),
         )
         .await;
-        match (number, receipt) {
-            (Ok(number), Ok(Some(receipt))) => {
+        match (latest_block, receipt) {
+            (Ok(latest), Ok(Some(receipt))) => {
                 if let Some(block_number) = receipt.block_number
-                    && block_number + client.max_confirmations <= number
+                    && *tx_hash == receipt.transaction_hash
+                    && latest >= block_number + client.max_confirmations
                 {
-                    // TODO: validate receipt.logs
+                    // We don't need to check the logs here.
                     // log.address == 代币合约地址
                     // log.topics[0] == keccak256("Transfer(address,address,uint256)") = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
                     // log.topics[1] == from 地址（32 字节左填充）
