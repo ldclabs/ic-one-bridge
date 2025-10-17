@@ -45,6 +45,8 @@ pub struct State {
     pub token_decimals: u8,
     pub token_logo: String,
     pub token_ledger: Principal,
+    #[serde(default)]
+    pub token_bridge_fee: u128, // with the same decimals as token
     pub min_threshold_to_bridge: u128,
     // chain_name => (contract_address, decimals, chain_id)
     pub evm_token_contracts: HashMap<String, (Address, u8, u64)>,
@@ -69,6 +71,7 @@ pub struct StateInfo {
     pub token_decimals: u8,
     pub token_logo: String,
     pub token_ledger: Principal,
+    pub token_bridge_fee: u128,
     pub min_threshold_to_bridge: u128,
     pub evm_token_contracts: HashMap<String, (String, u8, u64)>,
     pub evm_latest_gas: HashMap<String, (u64, u128, u128)>,
@@ -87,6 +90,7 @@ impl From<&State> for StateInfo {
             token_decimals: s.token_decimals,
             token_logo: s.token_logo.clone(),
             token_ledger: s.token_ledger,
+            token_bridge_fee: s.token_bridge_fee,
             min_threshold_to_bridge: s.min_threshold_to_bridge,
             evm_token_contracts: s
                 .evm_token_contracts
@@ -120,6 +124,7 @@ impl State {
             token_decimals: 8,
             token_logo: "https://532er-faaaa-aaaaj-qncpa-cai.icp0.io/f/374?inline&filename=1734188626561.webp".to_string(),
             token_ledger: Principal::from_text("druyg-tyaaa-aaaaq-aactq-cai").unwrap(), // mainnet ledger
+            token_bridge_fee: 0,
             min_threshold_to_bridge: 100_000_000, // 1 Token (8 decimals)
             evm_token_contracts: HashMap::new(),
             evm_providers: HashMap::new(),
@@ -172,11 +177,79 @@ pub struct BridgeLog {
     pub from: BridgeTarget,
     pub to: BridgeTarget,
     pub icp_amount: u128,
+    pub fee: u128,
     pub from_tx: BridgeTx,
     pub to_tx: Option<BridgeTx>,
     pub created_at: u64,
     pub finalized_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Clone, CandidType, Serialize, Deserialize)]
+pub struct BridgeLogLocal {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    #[serde(rename = "u", alias = "user")]
+    pub user: Principal,
+    #[serde(rename = "f", alias = "from")]
+    pub from: BridgeTarget,
+    #[serde(rename = "t", alias = "to")]
+    pub to: BridgeTarget,
+    #[serde(rename = "a", alias = "icp_amount")]
+    pub icp_amount: u128,
+    #[serde(default, rename = "e", alias = "fee")]
+    pub fee: u128,
+    #[serde(rename = "ft", alias = "from_tx")]
+    pub from_tx: BridgeTx,
+    #[serde(rename = "tt", alias = "to_tx")]
+    pub to_tx: Option<BridgeTx>,
+    #[serde(rename = "ca", alias = "created_at")]
+    pub created_at: u64,
+    #[serde(rename = "fa", alias = "finalized_at")]
+    pub finalized_at: u64,
+    #[serde(
+        rename = "er",
+        alias = "error",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub error: Option<String>,
+}
+
+impl From<BridgeLogLocal> for BridgeLog {
+    fn from(log: BridgeLogLocal) -> Self {
+        Self {
+            id: log.id,
+            user: log.user,
+            from: log.from,
+            to: log.to,
+            icp_amount: log.icp_amount,
+            fee: log.fee,
+            from_tx: log.from_tx,
+            to_tx: log.to_tx,
+            created_at: log.created_at,
+            finalized_at: log.finalized_at,
+            error: log.error,
+        }
+    }
+}
+
+impl From<BridgeLog> for BridgeLogLocal {
+    fn from(log: BridgeLog) -> Self {
+        Self {
+            id: log.id,
+            user: log.user,
+            from: log.from,
+            to: log.to,
+            icp_amount: log.icp_amount,
+            fee: log.fee,
+            from_tx: log.from_tx,
+            to_tx: log.to_tx,
+            created_at: log.created_at,
+            finalized_at: log.finalized_at,
+            error: log.error,
+        }
+    }
 }
 
 impl BridgeLog {
@@ -193,23 +266,23 @@ impl BridgeLog {
     }
 }
 
-impl Storable for BridgeLog {
+impl Storable for BridgeLogLocal {
     const BOUND: Bound = Bound::Unbounded;
 
     fn into_bytes(self) -> Vec<u8> {
         let mut buf = vec![];
-        into_writer(&self, &mut buf).expect("failed to encode BridgeLog data");
+        into_writer(&self, &mut buf).expect("failed to encode BridgeLogLocal data");
         buf
     }
 
     fn to_bytes(&self) -> Cow<'_, [u8]> {
         let mut buf = vec![];
-        into_writer(&self, &mut buf).expect("failed to encode BridgeLog data");
+        into_writer(&self, &mut buf).expect("failed to encode BridgeLogLocal data");
         Cow::Owned(buf)
     }
 
     fn from_bytes(bytes: Cow<'_, [u8]>) -> Self {
-        from_reader(&bytes[..]).expect("failed to decode BridgeLog data")
+        from_reader(&bytes[..]).expect("failed to decode BridgeLogLocal data")
     }
 }
 
@@ -263,7 +336,7 @@ thread_local! {
         )
     );
 
-    static BRIDGE_LOGS: RefCell<StableLog<BridgeLog, Memory, Memory>> = RefCell::new(
+    static BRIDGE_LOGS: RefCell<StableLog<BridgeLogLocal, Memory, Memory>> = RefCell::new(
         StableLog::init(
             MEMORY_MANAGER.with_borrow(|m| m.get(BRIDGE_LOGS_INDEX_MEMORY_ID)),
             MEMORY_MANAGER.with_borrow(|m| m.get(BRIDGE_LOGS_DATA_MEMORY_ID)),
@@ -390,7 +463,7 @@ pub mod state {
             return Err("from_chain and to_chain cannot be the same".to_string());
         }
 
-        let (from, to, token_ledger) = STATE.with_borrow(|s| {
+        let (from, to, token_ledger, token_bridge_fee) = STATE.with_borrow(|s| {
             if icp_amount < s.min_threshold_to_bridge {
                 return Err(format!(
                     "amount {} is below the minimum threshold to bridge {}",
@@ -437,15 +510,30 @@ pub mod state {
                 }
             }
 
-            Ok((from, to, s.token_ledger))
+            Ok((from, to, s.token_ledger, s.token_bridge_fee))
         })?;
 
         let from_tx = match &from {
-            BridgeTarget::Icp => from_icp(token_ledger, user, icp_amount).await?,
-            BridgeTarget::Evm(chain) => from_evm(chain, user, icp_amount, now_ms).await?,
+            BridgeTarget::Icp => {
+                from_icp(
+                    token_ledger,
+                    user,
+                    icp_amount.saturating_add(token_bridge_fee),
+                )
+                .await?
+            }
+            BridgeTarget::Evm(chain) => {
+                from_evm(
+                    chain,
+                    user,
+                    icp_amount.saturating_add(token_bridge_fee),
+                    now_ms,
+                )
+                .await?
+            }
         };
 
-        let delay = if from == BridgeTarget::Icp { 0 } else { 7 };
+        let delay = if from == BridgeTarget::Icp { 0 } else { 5 };
         let round = STATE.with_borrow_mut(|s| {
             s.pending.push_back(BridgeLog {
                 id: None,
@@ -453,6 +541,7 @@ pub mod state {
                 from,
                 to,
                 icp_amount,
+                fee: token_bridge_fee,
                 from_tx: from_tx.clone(),
                 to_tx: None,
                 created_at: now_ms,
@@ -493,7 +582,7 @@ pub mod state {
                             && log.from_tx == from_tx
                         {
                             log.id = Some(id);
-                            return Some(log);
+                            return Some(log.into());
                         }
                     }
                     None
@@ -527,7 +616,7 @@ pub mod state {
                 for id in ids {
                     if let Some(mut log) = log_store.get(id) {
                         log.id = Some(id);
-                        logs.push(log);
+                        logs.push(log.into());
                     }
                 }
                 logs
@@ -544,7 +633,7 @@ pub mod state {
                 idx -= 1;
                 if let Some(mut log) = log_store.get(idx) {
                     log.id = Some(idx);
-                    logs.push(log);
+                    logs.push(log.into());
                 }
             }
             logs
@@ -597,7 +686,7 @@ pub mod state {
                                 t.error = None;
                                 t.finalized_at = now_ms;
                                 let idx = BRIDGE_LOGS
-                                    .with_borrow_mut(|r| r.append(t))
+                                    .with_borrow_mut(|r| r.append(&t.clone().into()))
                                     .expect("failed to append to BRIDGE_LOGS");
                                 USER_LOGS.with_borrow_mut(|r| {
                                     let mut logs = r.get(&t.user).unwrap_or_default();

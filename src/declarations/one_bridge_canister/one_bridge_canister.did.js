@@ -3,6 +3,7 @@ export const idlFactory = ({ IDL }) => {
     'min_threshold_to_bridge' : IDL.Opt(IDL.Nat),
     'token_symbol' : IDL.Opt(IDL.Text),
     'governance_canister' : IDL.Opt(IDL.Principal),
+    'token_bridge_fee' : IDL.Opt(IDL.Nat),
     'token_ledger' : IDL.Opt(IDL.Principal),
     'token_logo' : IDL.Opt(IDL.Text),
     'token_name' : IDL.Opt(IDL.Text),
@@ -11,6 +12,7 @@ export const idlFactory = ({ IDL }) => {
     'min_threshold_to_bridge' : IDL.Nat,
     'token_symbol' : IDL.Text,
     'governance_canister' : IDL.Opt(IDL.Principal),
+    'token_bridge_fee' : IDL.Nat,
     'key_name' : IDL.Text,
     'token_decimals' : IDL.Nat8,
     'token_ledger' : IDL.Principal,
@@ -32,6 +34,7 @@ export const idlFactory = ({ IDL }) => {
   const BridgeLog = IDL.Record({
     'id' : IDL.Opt(IDL.Nat64),
     'to' : BridgeTarget,
+    'fee' : IDL.Nat,
     'to_tx' : IDL.Opt(BridgeTx),
     'from' : BridgeTarget,
     'user' : IDL.Principal,
@@ -54,6 +57,7 @@ export const idlFactory = ({ IDL }) => {
     'evm_token_contracts' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Text, IDL.Nat8, IDL.Nat64))
     ),
+    'token_bridge_fee' : IDL.Nat,
     'key_name' : IDL.Text,
     'evm_providers' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Nat64, IDL.Vec(IDL.Text)))
@@ -116,6 +120,7 @@ export const init = ({ IDL }) => {
     'min_threshold_to_bridge' : IDL.Opt(IDL.Nat),
     'token_symbol' : IDL.Opt(IDL.Text),
     'governance_canister' : IDL.Opt(IDL.Principal),
+    'token_bridge_fee' : IDL.Opt(IDL.Nat),
     'token_ledger' : IDL.Opt(IDL.Principal),
     'token_logo' : IDL.Opt(IDL.Text),
     'token_name' : IDL.Opt(IDL.Text),
@@ -124,6 +129,7 @@ export const init = ({ IDL }) => {
     'min_threshold_to_bridge' : IDL.Nat,
     'token_symbol' : IDL.Text,
     'governance_canister' : IDL.Opt(IDL.Principal),
+    'token_bridge_fee' : IDL.Nat,
     'key_name' : IDL.Text,
     'token_decimals' : IDL.Nat8,
     'token_ledger' : IDL.Principal,

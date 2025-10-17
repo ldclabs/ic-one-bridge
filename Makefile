@@ -19,3 +19,4 @@ build-wasm:
 # cargo install candid-extractor
 build-did:
 	candid-extractor target/wasm32-unknown-unknown/release/one_bridge_canister.wasm > src/one_bridge_canister/one_bridge_canister.did
+	dfx generate

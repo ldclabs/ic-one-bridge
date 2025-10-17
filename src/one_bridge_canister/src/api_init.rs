@@ -18,6 +18,7 @@ pub struct InitArgs {
     pub token_decimals: u8,
     pub token_logo: String,
     pub token_ledger: Principal,
+    pub token_bridge_fee: u128,
     pub min_threshold_to_bridge: u128,
     pub governance_canister: Option<Principal>,
 }
@@ -28,6 +29,7 @@ pub struct UpgradeArgs {
     pub token_symbol: Option<String>,
     pub token_logo: Option<String>,
     pub token_ledger: Option<Principal>,
+    pub token_bridge_fee: Option<u128>,
     pub min_threshold_to_bridge: Option<u128>,
     pub governance_canister: Option<Principal>,
 }
@@ -42,6 +44,7 @@ fn init(args: Option<CanisterArgs>) {
             s.token_decimals = args.token_decimals;
             s.token_logo = args.token_logo;
             s.token_ledger = args.token_ledger;
+            s.token_bridge_fee = args.token_bridge_fee;
             s.min_threshold_to_bridge = args.min_threshold_to_bridge;
             s.governance_canister = args.governance_canister;
         });
@@ -75,6 +78,9 @@ fn post_upgrade(args: Option<CanisterArgs>) {
             }
             if let Some(token_ledger) = args.token_ledger {
                 s.token_ledger = token_ledger;
+            }
+            if let Some(token_bridge_fee) = args.token_bridge_fee {
+                s.token_bridge_fee = token_bridge_fee;
             }
             if let Some(min_threshold_to_bridge) = args.min_threshold_to_bridge {
                 s.min_threshold_to_bridge = min_threshold_to_bridge;

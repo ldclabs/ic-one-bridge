@@ -1,5 +1,5 @@
-# `one_bridge_canister`
-🪙 An Internet Computer canister to bridge ERC-20 & ICRC tokens.
+# `One Bridge Canister`
+🌉 A fully on-chain cross-chain token bridge (Internet Computer, Ethereum, BNB Chain and other EVM-compatible chains).
 
 ## Demo
 
@@ -28,6 +28,7 @@ dfx deploy one_bridge_canister --argument "(opt variant {Init =
     token_decimals = 8;
     token_logo = \"https://532er-faaaa-aaaaj-qncpa-cai.icp0.io/f/374?inline&filename=1734188626561.webp\";
     token_ledger = principal \"druyg-tyaaa-aaaaq-aactq-cai\";
+    token_bridge_fee = 100_000;
     min_threshold_to_bridge = 1_000_000_000;
     governance_canister = opt principal \"dwv6s-6aaaa-aaaaq-aacta-cai\";
   }
