@@ -1,5 +1,5 @@
 use alloy_primitives::Address;
-use candid::{CandidType, IDLValue, pretty::candid::value::pp_value};
+use candid::{CandidType, IDLValue, Principal, pretty::candid::value::pp_value};
 use url::Url;
 
 use crate::store;
@@ -128,8 +128,45 @@ fn validate_admin_set_evm_providers(
 }
 
 #[ic_cdk::update(guard = "is_controller")]
-async fn admin_update_evm_gas_price() -> Result<(), String> {
-    unimplemented!()
+async fn admin_collect_fees(to: Principal, icp_amount: u128) -> Result<store::BridgeTx, String> {
+    let ledger = store::state::with(|s| {
+        if icp_amount == 0 {
+            return Err("amount must be greater than 0".to_string());
+        }
+        if icp_amount + s.total_withdrawn_fees > s.total_collected_fees {
+            return Err(format!(
+                "amount {} exceeds available fees {}",
+                icp_amount,
+                s.total_collected_fees - s.total_withdrawn_fees
+            ));
+        }
+
+        Ok(s.token_ledger)
+    })?;
+
+    let tx = store::state::to_icp(ledger, to, icp_amount).await?;
+    store::state::with_mut(|s| {
+        s.total_withdrawn_fees += icp_amount;
+    });
+    Ok(tx)
+}
+
+#[ic_cdk::update]
+async fn validate_admin_collect_fees(to: Principal, icp_amount: u128) -> Result<String, String> {
+    store::state::with(|s| {
+        if icp_amount == 0 {
+            return Err("icp_amount must be greater than 0".to_string());
+        }
+        if icp_amount > s.total_collected_fees - s.total_withdrawn_fees {
+            return Err(format!(
+                "icp_amount {} exceeds available fees {}",
+                icp_amount,
+                s.total_collected_fees - s.total_withdrawn_fees
+            ));
+        }
+        Ok(())
+    })?;
+    pretty_format(&(to, icp_amount))
 }
 
 fn is_controller() -> Result<(), String> {

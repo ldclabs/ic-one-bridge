@@ -35,15 +35,19 @@ type Result_3 = variant { Ok : vec BridgeLog; Err : text };
 type Result_4 = variant { Ok : StateInfo; Err : text };
 type Result_5 = variant { Ok : BridgeLog; Err : text };
 type StateInfo = record {
+  total_withdrawn_fees : nat;
   evm_address : text;
   evm_latest_gas : vec record { text; record { nat64; nat; nat } };
   finalize_bridging_round : record { nat64; bool };
+  total_collected_fees : nat;
   min_threshold_to_bridge : nat;
   token_symbol : text;
   icp_address : principal;
+  total_bridge_count : nat64;
   evm_token_contracts : vec record { text; record { text; nat8; nat64 } };
   token_bridge_fee : nat;
   key_name : text;
+  total_bridged_tokens : nat;
   evm_providers : vec record { text; record { nat64; vec text } };
   token_decimals : nat8;
   token_ledger : principal;
@@ -61,11 +65,12 @@ type UpgradeArgs = record {
 };
 service : (opt CanisterArgs) -> {
   admin_add_evm_contract : (text, nat64, text) -> (Result);
+  admin_collect_fees : (principal, nat) -> (Result_1);
   admin_set_evm_providers : (text, nat64, vec text) -> (Result);
-  admin_update_evm_gas_price : () -> (Result);
   bridge : (text, text, nat) -> (Result_1);
   erc20_transfer : (text, text, nat) -> (Result_2);
   erc20_transfer_tx : (text, text, nat) -> (Result_2);
+  evm_transfer_tx : (text, text, nat) -> (Result_2);
   finalized_logs : (opt nat64, opt nat64) -> (Result_3) query;
   info : () -> (Result_4) query;
   my_bridge_log : (BridgeTx) -> (Result_5) query;
@@ -74,5 +79,6 @@ service : (opt CanisterArgs) -> {
   my_pending_logs : () -> (Result_3) query;
   pending_logs : () -> (Result_3) query;
   validate_admin_add_evm_contract : (text, nat64, text) -> (Result_2);
+  validate_admin_collect_fees : (principal, nat) -> (Result_2);
   validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_2);
 }

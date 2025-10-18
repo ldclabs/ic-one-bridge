@@ -59,6 +59,12 @@ pub struct State {
     pub pending: VecDeque<BridgeLog>,
     // (round, running)
     pub finalize_bridging_round: (u64, bool),
+    #[serde(default)]
+    pub total_bridged_tokens: u128,
+    #[serde(default)]
+    pub total_collected_fees: u128,
+    #[serde(default)]
+    pub total_withdrawn_fees: u128,
 }
 
 #[derive(CandidType, Serialize, Deserialize)]
@@ -77,6 +83,10 @@ pub struct StateInfo {
     pub evm_latest_gas: HashMap<String, (u64, u128, u128)>,
     pub evm_providers: HashMap<String, (u64, Vec<String>)>,
     pub finalize_bridging_round: (u64, bool),
+    pub total_bridged_tokens: u128,
+    pub total_collected_fees: u128,
+    pub total_withdrawn_fees: u128,
+    pub total_bridge_count: u64,
 }
 
 impl From<&State> for StateInfo {
@@ -109,6 +119,10 @@ impl From<&State> for StateInfo {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             finalize_bridging_round: s.finalize_bridging_round,
+            total_bridged_tokens: s.total_bridged_tokens,
+            total_collected_fees: s.total_collected_fees,
+            total_withdrawn_fees: s.total_withdrawn_fees,
+            total_bridge_count: 0,
         }
     }
 }
@@ -136,6 +150,9 @@ impl State {
             governance_canister: None,
             pending: VecDeque::new(),
             finalize_bridging_round: (0, false),
+            total_bridged_tokens: 0,
+            total_collected_fees: 0,
+            total_withdrawn_fees: 0,
         }
     }
 }
@@ -423,7 +440,9 @@ pub mod state {
     }
 
     pub fn info() -> StateInfo {
-        STATE.with_borrow(|s| StateInfo::from(s))
+        let mut info = STATE.with_borrow(|s| StateInfo::from(s));
+        info.total_bridge_count = BRIDGE_LOGS.with_borrow(|r| r.len());
+        info
     }
 
     pub fn evm_address(user: &Principal) -> Address {
@@ -464,6 +483,16 @@ pub mod state {
         }
 
         let (from, to, token_ledger, token_bridge_fee) = STATE.with_borrow(|s| {
+            for log in s.pending.iter() {
+                if let Some(err) = &log.error
+                    && (err.starts_with(from_chain.as_str()) || err.starts_with(to_chain.as_str()))
+                {
+                    return Err(format!(
+                        "there is a pending bridging task with error, please retry later:\n{}",
+                        err
+                    ));
+                }
+            }
             if icp_amount < s.min_threshold_to_bridge {
                 return Err(format!(
                     "amount {} is below the minimum threshold to bridge {}",
@@ -492,13 +521,6 @@ pub mod state {
             };
 
             for log in s.pending.iter() {
-                if let Some(err) = &log.error {
-                    return Err(format!(
-                        "there is a pending bridging task with error, please retry later:\n{}",
-                        err
-                    ));
-                }
-
                 if log.user == user
                     && log.from == from
                     && matches!(log.from_tx, BridgeTx::Evm(false, _))
@@ -685,6 +707,11 @@ pub mod state {
                             if t.to_tx.as_ref().is_some_and(|tx| tx.is_finalized()) {
                                 t.error = None;
                                 t.finalized_at = now_ms;
+                                s.total_bridged_tokens =
+                                    s.total_bridged_tokens.saturating_add(t.icp_amount);
+                                s.total_collected_fees =
+                                    s.total_collected_fees.saturating_add(t.fee);
+
                                 let idx = BRIDGE_LOGS
                                     .with_borrow_mut(|r| r.append(&t.clone().into()))
                                     .expect("failed to append to BRIDGE_LOGS");
@@ -798,16 +825,16 @@ pub mod state {
             0,
         )
         .await?;
-        let res =
-            res.map_err(|err| format!("failed to transfer ICP from user, error: {:?}", err))?;
+        let res = res
+            .map_err(|err| format!("ICP: failed to transfer token from user, error: {:?}", err))?;
         let idx = res
             .0
             .to_u64()
-            .ok_or_else(|| "block height too large".to_string())?;
+            .ok_or_else(|| "ICP: block height too large".to_string())?;
         Ok(BridgeTx::Icp(true, idx))
     }
 
-    async fn to_icp(
+    pub async fn to_icp(
         token_ledger: Principal,
         user: Principal,
         icp_amount: u128,
@@ -829,11 +856,12 @@ pub mod state {
             0,
         )
         .await?;
-        let res = res.map_err(|err| format!("failed to transfer ICP to user, error: {:?}", err))?;
+        let res =
+            res.map_err(|err| format!("ICP: failed to transfer token to user, error: {:?}", err))?;
         let idx = res
             .0
             .to_u64()
-            .ok_or_else(|| "block height too large".to_string())?;
+            .ok_or_else(|| "ICP: block height too large".to_string())?;
         Ok(BridgeTx::Icp(true, idx))
     }
 
@@ -845,13 +873,16 @@ pub mod state {
     ) -> Result<BridgeTx, String> {
         let to_addr = STATE.with_borrow(|s| s.evm_address);
         let (client, signed_tx) =
-            build_erc20_transfer_tx(chain, &user, &to_addr, icp_amount, now_ms).await?;
+            build_erc20_transfer_tx(chain, &user, &to_addr, icp_amount, now_ms)
+                .await
+                .map_err(|err| format!("{chain}: {err}"))?;
         let tx_hash: [u8; 32] = (*signed_tx.hash()).into();
         let data = signed_tx.encoded_2718();
 
         let _ = client
             .send_raw_transaction(now_ms, Bytes::from(data).to_string())
-            .await?;
+            .await
+            .map_err(|err| format!("{chain}: {err}"))?;
         Ok(BridgeTx::Evm(false, tx_hash.into()))
     }
 
@@ -869,14 +900,16 @@ pub mod state {
             icp_amount,
             now_ms,
         )
-        .await?;
+        .await
+        .map_err(|err| format!("{chain}: {err}"))?;
 
         let tx_hash: [u8; 32] = (*signed_tx.hash()).into();
         let data = signed_tx.encoded_2718();
 
         let _ = client
             .send_raw_transaction(now_ms, Bytes::from(data).to_string())
-            .await?;
+            .await
+            .map_err(|err| format!("{chain}: {err}"))?;
         Ok(BridgeTx::Evm(false, tx_hash.into()))
     }
 
@@ -892,11 +925,11 @@ pub mod state {
                 .evm_token_contracts
                 .get(chain)
                 .cloned()
-                .ok_or_else(|| "chain not found".to_string())?;
+                .ok_or_else(|| format!("chain {chain} not found"))?;
 
             let value = convert_amount(icp_amount, s.token_decimals, decimals)?;
             let from_pk = derive_public_key(&s.ecdsa_public_key, vec![from.as_slice().to_vec()])
-                .expect("derive_public_key failed");
+                .map_err(|_e| format!("{chain}: derive_public_key failed"))?;
 
             let input = encode_erc20_transfer(to_addr, value);
             let (gas_updated_at, gas_price, max_priority_fee_per_gas) =
@@ -913,6 +946,84 @@ pub mod state {
                     max_priority_fee_per_gas,
                     to: contract.into(),
                     input: input.into(),
+                    ..Default::default()
+                },
+                gas_updated_at,
+            ))
+        })?;
+
+        let from_addr = pubkey_bytes_to_address(&from_pk.public_key);
+        if &from_addr == to_addr {
+            return Err("from and to cannot be the same".to_string());
+        }
+
+        let client = evm_client(chain);
+        if gas_updated_at + 120_000 >= now_ms {
+            let nonce = client.get_transaction_count(now_ms, &from_addr).await?;
+            tx.nonce = nonce;
+        } else {
+            let (nonce, gas_price, max_priority_fee_per_gas) = futures::future::try_join3(
+                client.get_transaction_count(now_ms, &from_addr),
+                client.gas_price(now_ms),
+                client.max_priority_fee_per_gas(now_ms),
+            )
+            .await?;
+            tx.nonce = nonce;
+            tx.max_priority_fee_per_gas = max_priority_fee_per_gas + max_priority_fee_per_gas / 5;
+            tx.max_fee_per_gas = gas_price * 2 + tx.max_priority_fee_per_gas;
+            STATE.with_borrow_mut(|s| {
+                s.evm_latest_gas.insert(
+                    chain.to_string(),
+                    (now_ms, gas_price, max_priority_fee_per_gas),
+                );
+            })
+        }
+
+        let msg_hash = tx.signature_hash();
+        let sig =
+            sign_with_ecdsa(key_name, vec![from.as_slice().to_vec()], msg_hash.to_vec()).await?;
+        let signature = Signature::new(
+            U256::from_be_slice(&sig[0..32]),  // r
+            U256::from_be_slice(&sig[32..64]), // s
+            y_parity(msg_hash.as_slice(), &sig, from_pk.public_key.as_slice())?,
+        );
+
+        let signed_tx = tx.into_signed(signature);
+        Ok((client, signed_tx))
+    }
+
+    pub async fn build_evm_transfer_tx(
+        chain: &str,
+        from: &Principal,
+        to_addr: &Address,
+        amount: u128,
+        now_ms: u64,
+    ) -> Result<(EvmClient<DefaultHttpOutcall>, Signed<TxEip1559>), String> {
+        let (key_name, from_pk, mut tx, gas_updated_at) = STATE.with_borrow(|s| {
+            let chain_id = s
+                .evm_token_contracts
+                .get(chain)
+                .map(|(_, _, chain_id)| *chain_id)
+                .ok_or_else(|| "chain not found".to_string())?;
+
+            let from_pk = derive_public_key(&s.ecdsa_public_key, vec![from.as_slice().to_vec()])
+                .expect("derive_public_key failed");
+            let (gas_updated_at, gas_price, max_priority_fee_per_gas) =
+                s.evm_latest_gas.get(chain).cloned().unwrap_or_default();
+            let max_priority_fee_per_gas = max_priority_fee_per_gas + max_priority_fee_per_gas / 5;
+            Ok::<_, String>((
+                s.key_name.clone(),
+                from_pk,
+                TxEip1559 {
+                    chain_id,
+                    nonce: 0u64,
+                    gas_limit: 32_000u64, // sample: ~21,000
+                    max_fee_per_gas: gas_price * 2 + max_priority_fee_per_gas,
+                    max_priority_fee_per_gas,
+                    to: (*to_addr).into(),
+                    value: amount
+                        .try_into()
+                        .map_err(|_| "invalid amount".to_string())?,
                     ..Default::default()
                 },
                 gas_updated_at,
@@ -986,9 +1097,9 @@ pub mod state {
                 }
                 Ok(false)
             }
-            (Err(err), _) | (_, Err(err)) => {
-                Err(format!("failed to check evm tx finalized, error: {err}"))
-            }
+            (Err(err), _) | (_, Err(err)) => Err(format!(
+                "{chain}: failed to check evm tx finalized, error: {err}"
+            )),
             _ => Ok(false),
         }
     }

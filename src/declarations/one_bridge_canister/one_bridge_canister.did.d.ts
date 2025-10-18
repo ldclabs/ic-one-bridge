@@ -45,15 +45,19 @@ export type Result_4 = { 'Ok' : StateInfo } |
 export type Result_5 = { 'Ok' : BridgeLog } |
   { 'Err' : string };
 export interface StateInfo {
+  'total_withdrawn_fees' : bigint,
   'evm_address' : string,
   'evm_latest_gas' : Array<[string, [bigint, bigint, bigint]]>,
   'finalize_bridging_round' : [bigint, boolean],
+  'total_collected_fees' : bigint,
   'min_threshold_to_bridge' : bigint,
   'token_symbol' : string,
   'icp_address' : Principal,
+  'total_bridge_count' : bigint,
   'evm_token_contracts' : Array<[string, [string, number, bigint]]>,
   'token_bridge_fee' : bigint,
   'key_name' : string,
+  'total_bridged_tokens' : bigint,
   'evm_providers' : Array<[string, [bigint, Array<string>]]>,
   'token_decimals' : number,
   'token_ledger' : Principal,
@@ -71,14 +75,15 @@ export interface UpgradeArgs {
 }
 export interface _SERVICE {
   'admin_add_evm_contract' : ActorMethod<[string, bigint, string], Result>,
+  'admin_collect_fees' : ActorMethod<[Principal, bigint], Result_1>,
   'admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
     Result
   >,
-  'admin_update_evm_gas_price' : ActorMethod<[], Result>,
   'bridge' : ActorMethod<[string, string, bigint], Result_1>,
   'erc20_transfer' : ActorMethod<[string, string, bigint], Result_2>,
   'erc20_transfer_tx' : ActorMethod<[string, string, bigint], Result_2>,
+  'evm_transfer_tx' : ActorMethod<[string, string, bigint], Result_2>,
   'finalized_logs' : ActorMethod<[[] | [bigint], [] | [bigint]], Result_3>,
   'info' : ActorMethod<[], Result_4>,
   'my_bridge_log' : ActorMethod<[BridgeTx], Result_5>,
@@ -90,6 +95,7 @@ export interface _SERVICE {
     [string, bigint, string],
     Result_2
   >,
+  'validate_admin_collect_fees' : ActorMethod<[Principal, bigint], Result_2>,
   'validate_admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
     Result_2

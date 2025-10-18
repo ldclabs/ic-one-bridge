@@ -46,19 +46,23 @@ export const idlFactory = ({ IDL }) => {
   });
   const Result_3 = IDL.Variant({ 'Ok' : IDL.Vec(BridgeLog), 'Err' : IDL.Text });
   const StateInfo = IDL.Record({
+    'total_withdrawn_fees' : IDL.Nat,
     'evm_address' : IDL.Text,
     'evm_latest_gas' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Nat64, IDL.Nat, IDL.Nat))
     ),
     'finalize_bridging_round' : IDL.Tuple(IDL.Nat64, IDL.Bool),
+    'total_collected_fees' : IDL.Nat,
     'min_threshold_to_bridge' : IDL.Nat,
     'token_symbol' : IDL.Text,
     'icp_address' : IDL.Principal,
+    'total_bridge_count' : IDL.Nat64,
     'evm_token_contracts' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Text, IDL.Nat8, IDL.Nat64))
     ),
     'token_bridge_fee' : IDL.Nat,
     'key_name' : IDL.Text,
+    'total_bridged_tokens' : IDL.Nat,
     'evm_providers' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Nat64, IDL.Vec(IDL.Text)))
     ),
@@ -75,12 +79,12 @@ export const idlFactory = ({ IDL }) => {
         [Result],
         [],
       ),
+    'admin_collect_fees' : IDL.Func([IDL.Principal, IDL.Nat], [Result_1], []),
     'admin_set_evm_providers' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Vec(IDL.Text)],
         [Result],
         [],
       ),
-    'admin_update_evm_gas_price' : IDL.Func([], [Result], []),
     'bridge' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [Result_1], []),
     'erc20_transfer' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [Result_2], []),
     'erc20_transfer_tx' : IDL.Func(
@@ -88,6 +92,7 @@ export const idlFactory = ({ IDL }) => {
         [Result_2],
         [],
       ),
+    'evm_transfer_tx' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [Result_2], []),
     'finalized_logs' : IDL.Func(
         [IDL.Opt(IDL.Nat64), IDL.Opt(IDL.Nat64)],
         [Result_3],
@@ -105,6 +110,11 @@ export const idlFactory = ({ IDL }) => {
     'pending_logs' : IDL.Func([], [Result_3], ['query']),
     'validate_admin_add_evm_contract' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Text],
+        [Result_2],
+        [],
+      ),
+    'validate_admin_collect_fees' : IDL.Func(
+        [IDL.Principal, IDL.Nat],
         [Result_2],
         [],
       ),

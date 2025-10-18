@@ -108,3 +108,16 @@ async fn erc20_transfer(chain: String, to: String, icp_amount: u128) -> Result<S
 
     Ok(tx_hash)
 }
+
+#[ic_cdk::update]
+async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<String, String> {
+    let to_addr = to
+        .parse::<Address>()
+        .map_err(|err| format!("invalid to address: {}", err))?;
+    let caller = msg_caller()?;
+    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let (_, signed_tx) =
+        store::state::build_evm_transfer_tx(&chain, &caller, &to_addr, evm_amount, now_ms).await?;
+    let data = signed_tx.encoded_2718();
+    Ok(Bytes::from(data).to_string())
+}
