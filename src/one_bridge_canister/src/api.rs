@@ -69,10 +69,11 @@ async fn bridge(
     from_chain: String,
     to_chain: String,
     icp_amount: u128,
+    to: Option<String>,
 ) -> Result<store::BridgeTx, String> {
     let caller = msg_caller()?;
     let now_ms = ic_cdk::api::time() / 1_000_000;
-    store::state::bridge(from_chain, to_chain, icp_amount, caller, now_ms).await
+    store::state::bridge(from_chain, to_chain, icp_amount, to, caller, now_ms).await
 }
 
 #[ic_cdk::update]

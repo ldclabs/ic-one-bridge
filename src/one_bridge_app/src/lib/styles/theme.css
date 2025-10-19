@@ -1,0 +1,38 @@
+/* Design tokens (Panda black/white, Bamboo green, Wisdom purple) */
+:root {
+  --color-bg: #0b0d0f;
+  --color-bg-alt: #121417;
+  --color-border: #1f2328;
+  --color-text: #f5f7fa;
+  --color-text-dim: #b0b7c3;
+  --color-accent: #3ddc84; /* bamboo green */
+  --color-accent-alt: #6ee7b7;
+  --color-purple: #8b5cf6; /* wisdom purple */
+  --color-purple-alt: #a78bfa;
+  --color-danger: #ef4444;
+  --radius-sm: 4px;
+  --radius: 8px;
+  --radius-lg: 20px;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow:
+    0 4px 16px -4px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+  --gradient-accent: linear-gradient(
+    135deg,
+    var(--color-accent) 0%,
+    var(--color-purple) 70%
+  );
+  --font-sans:
+    system-ui, -apple-system,
+    BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+  text-autospace: normal;
+}
+
+html {
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+}

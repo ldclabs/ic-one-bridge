@@ -94,7 +94,7 @@ impl<H: HttpOutcall> EvmClient<H> {
             .call(
                 format!("eth_getTransactionCount-{}", now_ms),
                 "eth_getTransactionCount",
-                &[address.to_string().into(), "finalized".into()],
+                &[address.to_string().into(), "latest".into()],
             )
             .await?;
         hex_to_u64(&res)

@@ -1,6 +1,6 @@
 [package]
 name = "one_bridge_canister"
-description = "A fully on-chain cross-chain token bridge (Internet Computer, Ethereum, BNB Chain and other EVM-compatible chains)."
+description = "A Fully On-Chain Multi-Chain Token Bridge for the Internet Computer, Ethereum, BNB Chain and other EVM chains."
 publish = false
 repository = "https://github.com/ldclabs/ic-one-bridge/tree/main/src/one_bridge_canister"
 version.workspace = true

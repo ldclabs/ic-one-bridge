@@ -3,6 +3,7 @@ type BridgeLog = record {
   to : BridgeTarget;
   fee : nat;
   to_tx : opt BridgeTx;
+  to_addr : opt text;
   from : BridgeTarget;
   user : principal;
   from_tx : BridgeTx;
@@ -67,7 +68,7 @@ service : (opt CanisterArgs) -> {
   admin_add_evm_contract : (text, nat64, text) -> (Result);
   admin_collect_fees : (principal, nat) -> (Result_1);
   admin_set_evm_providers : (text, nat64, vec text) -> (Result);
-  bridge : (text, text, nat) -> (Result_1);
+  bridge : (text, text, nat, opt text) -> (Result_1);
   erc20_transfer : (text, text, nat) -> (Result_2);
   erc20_transfer_tx : (text, text, nat) -> (Result_2);
   evm_transfer_tx : (text, text, nat) -> (Result_2);

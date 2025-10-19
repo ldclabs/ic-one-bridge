@@ -197,6 +197,8 @@ pub struct BridgeLog {
     pub fee: u128,
     pub from_tx: BridgeTx,
     pub to_tx: Option<BridgeTx>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_addr: Option<String>,
     pub created_at: u64,
     pub finalized_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,6 +223,12 @@ pub struct BridgeLogLocal {
     pub from_tx: BridgeTx,
     #[serde(rename = "tt", alias = "to_tx")]
     pub to_tx: Option<BridgeTx>,
+    #[serde(
+        rename = "ta",
+        alias = "to_addr",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub to_addr: Option<String>,
     #[serde(rename = "ca", alias = "created_at")]
     pub created_at: u64,
     #[serde(rename = "fa", alias = "finalized_at")]
@@ -244,6 +252,7 @@ impl From<BridgeLogLocal> for BridgeLog {
             fee: log.fee,
             from_tx: log.from_tx,
             to_tx: log.to_tx,
+            to_addr: log.to_addr,
             created_at: log.created_at,
             finalized_at: log.finalized_at,
             error: log.error,
@@ -262,6 +271,7 @@ impl From<BridgeLog> for BridgeLogLocal {
             fee: log.fee,
             from_tx: log.from_tx,
             to_tx: log.to_tx,
+            to_addr: log.to_addr,
             created_at: log.created_at,
             finalized_at: log.finalized_at,
             error: log.error,
@@ -475,6 +485,7 @@ pub mod state {
         from_chain: String,
         to_chain: String,
         icp_amount: u128,
+        to_addr: Option<String>,
         user: Principal,
         now_ms: u64,
     ) -> Result<BridgeTx, String> {
@@ -511,10 +522,19 @@ pub mod state {
                 BridgeTarget::Evm(from_chain)
             };
             let to = if to_chain == "ICP" {
+                if let Some(to_addr) = &to_addr {
+                    let _ = Principal::from_text(to_addr)
+                        .map_err(|_| format!("invalid ICP address {to_addr}"))?;
+                }
                 BridgeTarget::Icp
             } else {
                 if !s.evm_token_contracts.contains_key(&to_chain) {
                     return Err(format!("to_chain {} not found or not supported", to_chain));
+                }
+                if let Some(to_addr) = &to_addr {
+                    let _ = to_addr
+                        .parse::<Address>()
+                        .map_err(|_| format!("invalid EVM address: {}", to_addr))?;
                 }
 
                 BridgeTarget::Evm(to_chain)
@@ -566,6 +586,7 @@ pub mod state {
                 fee: token_bridge_fee,
                 from_tx: from_tx.clone(),
                 to_tx: None,
+                to_addr,
                 created_at: now_ms,
                 finalized_at: 0,
                 error: None,
@@ -767,11 +788,23 @@ pub mod state {
                 match (&task.to, &mut task.to_tx) {
                     (BridgeTarget::Icp, None) => {
                         let token_ledger = STATE.with_borrow(|s| s.token_ledger);
-                        let to_tx = to_icp(token_ledger, task.user, task.icp_amount).await?;
+                        let to_addr = if let Some(addr) = &task.to_addr {
+                            Principal::from_text(addr)
+                                .map_err(|_| format!("ICP: invalid to_addr principal: {}", addr))?
+                        } else {
+                            task.user
+                        };
+                        let to_tx = to_icp(token_ledger, to_addr, task.icp_amount).await?;
                         task.to_tx = Some(to_tx);
                     }
                     (BridgeTarget::Evm(chain), None) => {
-                        let to_tx = to_evm(chain, task.user, task.icp_amount, now_ms).await?;
+                        let to_addr = if let Some(addr) = &task.to_addr {
+                            addr.parse::<Address>()
+                                .map_err(|_| format!("EVM: invalid to_addr address: {}", addr))?
+                        } else {
+                            state::evm_address(&task.user)
+                        };
+                        let to_tx = to_evm(chain, to_addr, task.icp_amount, now_ms).await?;
                         task.to_tx = Some(to_tx);
                     }
                     (BridgeTarget::Evm(chain), Some(BridgeTx::Evm(finalized, tx_hash)))
@@ -836,7 +869,7 @@ pub mod state {
 
     pub async fn to_icp(
         token_ledger: Principal,
-        user: Principal,
+        to_addr: Principal,
         icp_amount: u128,
     ) -> Result<BridgeTx, String> {
         let res: Result<Nat, TransferFromError> = call(
@@ -845,7 +878,7 @@ pub mod state {
             (TransferArg {
                 from_subaccount: None,
                 to: Account {
-                    owner: user,
+                    owner: to_addr,
                     subaccount: None,
                 },
                 fee: None,
@@ -888,11 +921,11 @@ pub mod state {
 
     async fn to_evm(
         chain: &str,
-        user: Principal,
+        to_addr: Address,
         icp_amount: u128,
         now_ms: u64,
     ) -> Result<BridgeTx, String> {
-        let to_addr = evm_address(&user);
+        // let to_addr = evm_address(&user);
         let (client, signed_tx) = build_erc20_transfer_tx(
             chain,
             &ic_cdk::api::canister_self(),
