@@ -32,9 +32,10 @@ type InitArgs = record {
 type Result = variant { Ok; Err : text };
 type Result_1 = variant { Ok : BridgeTx; Err : text };
 type Result_2 = variant { Ok : text; Err : text };
-type Result_3 = variant { Ok : vec BridgeLog; Err : text };
-type Result_4 = variant { Ok : StateInfo; Err : text };
-type Result_5 = variant { Ok : BridgeLog; Err : text };
+type Result_3 = variant { Ok : blob; Err : text };
+type Result_4 = variant { Ok : vec BridgeLog; Err : text };
+type Result_5 = variant { Ok : StateInfo; Err : text };
+type Result_6 = variant { Ok : BridgeLog; Err : text };
 type StateInfo = record {
   total_withdrawn_fees : nat;
   evm_address : text;
@@ -54,6 +55,7 @@ type StateInfo = record {
   token_ledger : principal;
   token_logo : text;
   token_name : text;
+  sub_bridges : vec principal;
 };
 type UpgradeArgs = record {
   min_threshold_to_bridge : opt nat;
@@ -65,21 +67,26 @@ type UpgradeArgs = record {
   token_name : opt text;
 };
 service : (opt CanisterArgs) -> {
+  admin_add_bridges : (vec principal) -> (Result);
   admin_add_evm_contract : (text, nat64, text) -> (Result);
   admin_collect_fees : (principal, nat) -> (Result_1);
+  admin_remove_bridges : (vec principal) -> (Result);
   admin_set_evm_providers : (text, nat64, vec text) -> (Result);
   bridge : (text, text, nat, opt text) -> (Result_1);
   erc20_transfer : (text, text, nat) -> (Result_2);
   erc20_transfer_tx : (text, text, nat) -> (Result_2);
+  evm_address : (opt principal) -> (Result_2) query;
+  evm_sign : (blob) -> (Result_3);
   evm_transfer_tx : (text, text, nat) -> (Result_2);
-  finalized_logs : (opt nat64, opt nat64) -> (Result_3) query;
-  info : () -> (Result_4) query;
-  my_bridge_log : (BridgeTx) -> (Result_5) query;
-  my_evm_address : () -> (Result_2) query;
-  my_finalized_logs : (opt nat64, opt nat64) -> (Result_3) query;
-  my_pending_logs : () -> (Result_3) query;
-  pending_logs : () -> (Result_3) query;
+  finalized_logs : (opt nat64, opt nat64) -> (Result_4) query;
+  info : () -> (Result_5) query;
+  my_bridge_log : (BridgeTx) -> (Result_6) query;
+  my_finalized_logs : (opt nat64, opt nat64) -> (Result_4) query;
+  my_pending_logs : () -> (Result_4) query;
+  pending_logs : () -> (Result_4) query;
+  validate_admin_add_bridges : (vec principal) -> (Result_2);
   validate_admin_add_evm_contract : (text, nat64, text) -> (Result_2);
   validate_admin_collect_fees : (principal, nat) -> (Result_2);
+  validate_admin_remove_bridges : (vec principal) -> (Result_2);
   validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_2);
 }

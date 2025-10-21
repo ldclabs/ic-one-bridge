@@ -27,7 +27,9 @@ use std::{
 };
 
 use crate::{
-    ecdsa::{PublicKeyOutput, derive_public_key, ecdsa_public_key, sign_with_ecdsa},
+    ecdsa::{
+        PublicKeyOutput, cost_sign_with_ecdsa, derive_public_key, ecdsa_public_key, sign_with_ecdsa,
+    },
     evm::{EvmClient, encode_erc20_transfer},
     helper::{call, convert_amount, format_error},
     outcall::DefaultHttpOutcall,
@@ -65,6 +67,8 @@ pub struct State {
     pub total_collected_fees: u128,
     #[serde(default)]
     pub total_withdrawn_fees: u128,
+    #[serde(default)]
+    pub sub_bridges: BTreeSet<Principal>,
 }
 
 #[derive(CandidType, Serialize, Deserialize)]
@@ -87,6 +91,7 @@ pub struct StateInfo {
     pub total_collected_fees: u128,
     pub total_withdrawn_fees: u128,
     pub total_bridge_count: u64,
+    pub sub_bridges: BTreeSet<Principal>,
 }
 
 impl From<&State> for StateInfo {
@@ -123,6 +128,7 @@ impl From<&State> for StateInfo {
             total_collected_fees: s.total_collected_fees,
             total_withdrawn_fees: s.total_withdrawn_fees,
             total_bridge_count: 0,
+            sub_bridges: s.sub_bridges.clone(),
         }
     }
 }
@@ -153,6 +159,7 @@ impl State {
             total_bridged_tokens: 0,
             total_collected_fees: 0,
             total_withdrawn_fees: 0,
+            sub_bridges: BTreeSet::new(),
         }
     }
 }
@@ -479,6 +486,28 @@ pub mod state {
                     EvmClient::new(vec![], 1, None, DefaultHttpOutcall::new(s.icp_address))
                 })
         })
+    }
+
+    pub async fn evm_sign(user: &Principal, message_hash: Vec<u8>) -> Result<Vec<u8>, String> {
+        let key_name = STATE.with_borrow(|s| {
+            if !s.sub_bridges.contains(user) {
+                Err("user is not authorized to sign".to_string())
+            } else {
+                Ok(s.key_name.clone())
+            }
+        })?;
+
+        let cycles = cost_sign_with_ecdsa(key_name.clone())?;
+        let received = ic_cdk::api::msg_cycles_accept(cycles);
+        if received < cycles {
+            return Err(format!(
+                "insufficient cycles: required {}, accepted {}",
+                cycles, received
+            ));
+        }
+
+        let derivation_path = vec![user.as_slice().to_vec()];
+        sign_with_ecdsa(key_name, derivation_path, message_hash).await
     }
 
     pub async fn bridge(

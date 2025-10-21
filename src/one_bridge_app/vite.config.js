@@ -1,4 +1,6 @@
+import { enhancedImages } from '@sveltejs/enhanced-img'
 import { sveltekit } from '@sveltejs/kit/vite'
+import tailwindcss from '@tailwindcss/vite'
 import dotenv from 'dotenv'
 import { defineConfig } from 'vite'
 import environment from 'vite-plugin-environment'
@@ -35,6 +37,7 @@ export default defineConfig({
   plugins: [
     environment('all', { prefix: 'CANISTER_' }),
     environment('all', { prefix: 'DFX_' }),
+    tailwindcss(), enhancedImages(),
     sveltekit(),
   ],
   resolve: {

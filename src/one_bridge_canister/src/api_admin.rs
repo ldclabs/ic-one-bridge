@@ -1,8 +1,43 @@
 use alloy_primitives::Address;
-use candid::{CandidType, IDLValue, Principal, pretty::candid::value::pp_value};
+use candid::Principal;
+use std::collections::BTreeSet;
 use url::Url;
 
-use crate::store;
+use crate::{
+    helper::{pretty_format, validate_principals},
+    store,
+};
+
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_add_bridges(args: BTreeSet<Principal>) -> Result<(), String> {
+    validate_principals(&args)?;
+    let mut args = args;
+    store::state::with_mut(|s| {
+        s.sub_bridges.append(&mut args);
+        Ok(())
+    })
+}
+
+#[ic_cdk::update]
+fn validate_admin_add_bridges(args: BTreeSet<Principal>) -> Result<String, String> {
+    validate_principals(&args)?;
+    pretty_format(&(args,))
+}
+
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_remove_bridges(args: BTreeSet<Principal>) -> Result<(), String> {
+    validate_principals(&args)?;
+    store::state::with_mut(|s| {
+        s.sub_bridges.retain(|p| !args.contains(p));
+        Ok(())
+    })
+}
+
+#[ic_cdk::update]
+fn validate_admin_remove_bridges(args: BTreeSet<Principal>) -> Result<String, String> {
+    validate_principals(&args)?;
+    pretty_format(&(args,))
+}
 
 #[ic_cdk::update(guard = "is_controller")]
 async fn admin_add_evm_contract(
@@ -178,14 +213,4 @@ fn is_controller() -> Result<(), String> {
     } else {
         Err("user is not a controller".to_string())
     }
-}
-
-fn pretty_format<T>(data: &T) -> Result<String, String>
-where
-    T: CandidType,
-{
-    let val = IDLValue::try_from_candid_type(data).map_err(|err| format!("{err:?}"))?;
-    let doc = pp_value(7, &val);
-
-    Ok(format!("{}", doc.pretty(120)))
 }

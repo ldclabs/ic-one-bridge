@@ -10,7 +10,7 @@ opt-level = 's'
 
 [workspace.package]
 edition = "2024"
-version = "0.2.2"
+version = "0.3.0"
 repository = "https://github.com/ldclabs/ic-one-bridge"
 keywords = ["canister", "icp", "bridge", "erc20", "icrc"]
 categories = ["web-programming"]

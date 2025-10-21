@@ -3,10 +3,12 @@ import { createRequest, JSON_MIME_TYPE } from './fetcher'
 export class EvmRpc {
   #providers: string[]
   #endpoint: string
+  #contract: string
 
-  constructor(providers: string[]) {
+  constructor(providers: string[], contract: string) {
     this.#providers = providers
     this.#endpoint = providers[0] as string
+    this.#contract = contract
   }
 
   async selectProvider() {
@@ -53,17 +55,14 @@ export class EvmRpc {
     return BigInt(rt)
   }
 
-  async getErc20Balance(
-    tokenAddress: string,
-    walletAddress: string
-  ): Promise<bigint> {
+  async getErc20Balance(address: string): Promise<bigint> {
     const data =
       '0x70a08231000000000000000000000000' +
-      walletAddress.toLowerCase().replace(/^0x/, '')
+      address.toLowerCase().replace(/^0x/, '')
     const rt =
       (await jsonRPC<string>(this.#endpoint, 'eth_call', [
         {
-          to: tokenAddress,
+          to: this.#contract,
           data: data
         },
         'latest'

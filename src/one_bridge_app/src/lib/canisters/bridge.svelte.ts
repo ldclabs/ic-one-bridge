@@ -5,9 +5,10 @@ import {
   type StateInfo,
   type _SERVICE
 } from '$declarations/one_bridge_canister/one_bridge_canister.did.js'
+import { type Chain } from '$lib/types/bridge'
 import { unwrapResult } from '$lib/types/result'
 import { EvmRpc } from '$lib/utils/evmrpc'
-import { type TokenInfo } from '$lib/utils/token'
+import { TokenDisplay, type TokenInfo } from '$lib/utils/token'
 import { Principal } from '@dfinity/principal'
 import { bytesToHex } from '@ldclabs/cose-ts/utils'
 import { SvelteMap } from 'svelte/reactivity'
@@ -31,29 +32,6 @@ export function txHash(tx: BridgeTx): string | null {
   return null
 }
 
-// interface BridgeLog {
-//   'id' : [] | [bigint],
-//   'to' : BridgeTarget,
-//   'fee' : bigint,
-//   'to_tx' : [] | [BridgeTx],
-//   'to_addr' : [] | [string],
-//   'from' : BridgeTarget,
-//   'user' : Principal,
-//   'from_tx' : BridgeTx,
-//   'created_at' : bigint,
-//   'error' : [] | [string],
-//   'icp_amount' : bigint,
-//   'finalized_at' : bigint,
-// }
-
-export class BridgeLogInfo {
-  readonly log: BridgeLog
-
-  constructor(log: BridgeLog) {
-    this.log = log
-  }
-}
-
 export class BridgeCanisterAPI {
   static #bridges: SvelteMap<string, BridgeCanisterAPI> = new SvelteMap()
 
@@ -64,16 +42,19 @@ export class BridgeCanisterAPI {
 
     const bridge = new BridgeCanisterAPI(canisterId)
     this.#bridges.set(canisterId, bridge)
+    await bridge.loadState()
     return bridge
   }
 
   readonly canisterId: Principal
   #actor: _SERVICE
   #token: TokenInfo | null = null
+  #tokenDisplay: TokenDisplay | null = null
   #tokenLedger: TokenLedgerAPI | null = null
+  #evmRPC: Map<string, EvmRpc> = new Map()
   #state = $state<StateInfo | null>(null)
 
-  constructor(canisterId: string) {
+  private constructor(canisterId: string) {
     this.canisterId = Principal.fromText(canisterId)
     this.#actor = createActor<_SERVICE>({
       canisterId: this.canisterId,
@@ -89,27 +70,37 @@ export class BridgeCanisterAPI {
     return this.#token
   }
 
+  get tokenDisplay(): TokenDisplay | null {
+    return this.#tokenDisplay
+  }
+
+  toIcpAmount(chain: string, evmBalance: bigint): bigint {
+    if (!this.#state) return evmBalance
+    const evmDecimals = this.#state.evm_token_contracts.find(
+      ([name, _]) => name === chain
+    )?.[1][1]
+    if (!evmDecimals) return evmBalance
+    if (this.#state.token_decimals > evmDecimals) {
+      const diff = this.#state.token_decimals - evmDecimals
+      return evmBalance * 10n ** BigInt(diff)
+    }
+    const diff = evmDecimals - this.#state.token_decimals
+    return evmBalance / 10n ** BigInt(diff)
+  }
+
+  parseAmount(amount: string | number): bigint {
+    if (!this.#tokenDisplay) return 0n
+    return this.#tokenDisplay.parseAmount(amount)
+  }
+
+  displayAmount(icpBalance: bigint): string {
+    if (!this.#tokenDisplay) return ''
+    return this.#tokenDisplay.displayValue(icpBalance)
+  }
+
   async loadState(): Promise<StateInfo> {
     if (this.#state == null) {
-      await this.refreshState()
-    }
-
-    return this.#state as StateInfo
-  }
-
-  async refreshState(): Promise<void> {
-    const state = await this.#actor.info()
-    this.#state = unwrapResult(state, 'call get_state failed')
-  }
-
-  async supportChains(): Promise<string[]> {
-    const state = await this.loadState()
-    return ['ICP', ...state.evm_token_contracts.map(([name, _]) => name)]
-  }
-
-  async loadICPTokenAPI(): Promise<TokenLedgerAPI> {
-    if (this.#tokenLedger == null) {
-      const state = await this.loadState()
+      const state = await this.refreshState()
       const token: TokenInfo = {
         name: state.token_name,
         symbol: state.token_symbol,
@@ -121,16 +112,75 @@ export class BridgeCanisterAPI {
       }
 
       this.#token = token
-      this.#tokenLedger = new TokenLedgerAPI(token)
-      let info = await this.#tokenLedger.fetchTokenInfo()
-      this.#token.fee = info.fee
+      const td = new TokenDisplay(token, state.min_threshold_to_bridge)
+      td.fee = state.token_bridge_fee
+      this.#tokenDisplay = td
+    }
+
+    return this.#state as StateInfo
+  }
+
+  async loadSubBridges(): Promise<BridgeCanisterAPI[]> {
+    const state = await this.loadState()
+    const subBridges = await Promise.all(
+      state.sub_bridges.map(async (canisterId) => {
+        try {
+          return await BridgeCanisterAPI.loadBridge(canisterId.toText())
+        } catch (error) {
+          console.error(
+            `Failed to load sub-bridge ${canisterId.toText()}:`,
+            error
+          )
+
+          return null
+        }
+      })
+    )
+
+    return subBridges.filter((b) => b !== null)
+  }
+
+  async refreshState(): Promise<StateInfo> {
+    const state = await this.#actor.info()
+    this.#state = unwrapResult(state, 'call get_state failed')
+    return this.#state as StateInfo
+  }
+
+  async supportChains(): Promise<Chain[]> {
+    const state = await this.loadState()
+    return ['ICP', ...state.evm_token_contracts.map(([name, _]) => name)].map(
+      getChain
+    )
+  }
+
+  async loadICPTokenAPI(): Promise<TokenLedgerAPI> {
+    if (this.#tokenLedger == null) {
+      await this.loadState()
+
+      this.#tokenLedger = new TokenLedgerAPI(this.#token!)
+      try {
+        let info = await this.#tokenLedger.fetchTokenInfo()
+        this.#token!.fee = info.fee
+      } catch (error) {
+        console.error('Failed to load ICP token API:', error)
+      }
     }
 
     return this.#tokenLedger
   }
 
   async loadEVMTokenAPI(chain: string): Promise<EvmRpc> {
+    if (this.#evmRPC.has(chain)) {
+      return this.#evmRPC.get(chain)!
+    }
+
     const state = await this.loadState()
+    const contract = state.evm_token_contracts.find(
+      ([name, _]) => name === chain
+    )
+    if (!contract) {
+      throw new Error(`EVM token contract for chain ${chain} not found`)
+    }
     const provider = state.evm_providers.find(([name, _]) => name === chain)
     if (!provider) {
       throw new Error(`EVM providers for chain ${chain} not found`)
@@ -140,9 +190,15 @@ export class BridgeCanisterAPI {
       throw new Error(`EVM provider URLs for chain ${chain} is empty`)
     }
 
-    const api = new EvmRpc(providerUrls)
+    const api = new EvmRpc(providerUrls, contract[1][0])
+    this.#evmRPC.set(chain, api)
     await api.selectProvider()
     return api
+  }
+
+  async myEvmAddress(): Promise<string> {
+    const res = await this.#actor.evm_address([])
+    return unwrapResult(res, 'call evm_address failed')
   }
 
   async getMyBridgeLog(fromTx: BridgeTx): Promise<BridgeLog> {
@@ -212,5 +268,32 @@ export class BridgeCanisterAPI {
   ): Promise<string> {
     const tx = await this.#actor.evm_transfer_tx(chain, toAddr, evmAmount)
     return unwrapResult(tx, 'call evm_transfer_tx failed')
+  }
+}
+
+function getChain(chain: string): Chain {
+  switch (chain) {
+    case 'ICP':
+      return {
+        id: 0,
+        name: 'ICP',
+        fullName: 'Internet Computer',
+        nativeToken: 'ICP',
+        explorerUrl: 'https://icexplorer.io',
+        logo: '/_assets/icp.webp',
+        averageFinalitySeconds: 2
+      }
+    case 'BNB':
+      return {
+        id: 56,
+        name: 'BNB',
+        fullName: 'BNB Chain',
+        nativeToken: 'BNB',
+        explorerUrl: 'https://bscscan.com',
+        logo: '/_assets/bnb.png',
+        averageFinalitySeconds: 15
+      }
+    default:
+      throw new Error(`unsupported chain ${chain}`)
   }
 }

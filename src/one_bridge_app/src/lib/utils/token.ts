@@ -12,13 +12,13 @@ export interface TokenInfo extends Token {
 }
 
 // export const PANDAToken: TokenInfo = {
-//   name: 'ICPanda',
-//   symbol: 'PANDA',
-//   decimals: 8,
-//   fee: 10000n,
-//   one: 100000000n,
-//   logo: '',
-//   canisterId: TOKEN_LEDGER_CANISTER_ID
+// name: 'ICPanda',
+// symbol: 'PANDA',
+// decimals: 8,
+// fee: 10000n,
+// one: 100000000n,
+// logo: '',
+// canisterId: TOKEN_LEDGER_CANISTER_ID
 // }
 
 export function formatNumber(val: number, maxDigits: number = 4): string {
@@ -98,6 +98,17 @@ export class TokenDisplay {
 
   get received(): bigint {
     return this.billedToSource ? this.amount : this.amount - this.fee
+  }
+
+  parseAmount(amount: string | number): bigint {
+    const val =
+      typeof amount === 'string'
+        ? (TokenAmount.fromString({ amount, token: this.token }) as TokenAmount)
+        : (TokenAmount.fromNumber({
+            amount,
+            token: this.token
+          }) as TokenAmount)
+    return val.toUlps()
   }
 
   fullFormat(value: number | bigint): string {

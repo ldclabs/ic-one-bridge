@@ -9,7 +9,7 @@
       "DOM.Iterable",
       "WebWorker"
     ],
-    "types": ["@sveltejs/kit", "vite/client"]
+    "types": ["@sveltejs/kit"]
   },
   "extends": ["../../tsconfig.json", "./.svelte-kit/tsconfig.json"],
   "include": [

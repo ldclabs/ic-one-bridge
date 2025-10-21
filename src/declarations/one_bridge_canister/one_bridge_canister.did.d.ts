@@ -39,11 +39,13 @@ export type Result_1 = { 'Ok' : BridgeTx } |
   { 'Err' : string };
 export type Result_2 = { 'Ok' : string } |
   { 'Err' : string };
-export type Result_3 = { 'Ok' : Array<BridgeLog> } |
+export type Result_3 = { 'Ok' : Uint8Array | number[] } |
   { 'Err' : string };
-export type Result_4 = { 'Ok' : StateInfo } |
+export type Result_4 = { 'Ok' : Array<BridgeLog> } |
   { 'Err' : string };
-export type Result_5 = { 'Ok' : BridgeLog } |
+export type Result_5 = { 'Ok' : StateInfo } |
+  { 'Err' : string };
+export type Result_6 = { 'Ok' : BridgeLog } |
   { 'Err' : string };
 export interface StateInfo {
   'total_withdrawn_fees' : bigint,
@@ -64,6 +66,7 @@ export interface StateInfo {
   'token_ledger' : Principal,
   'token_logo' : string,
   'token_name' : string,
+  'sub_bridges' : Array<Principal>,
 }
 export interface UpgradeArgs {
   'min_threshold_to_bridge' : [] | [bigint],
@@ -75,8 +78,10 @@ export interface UpgradeArgs {
   'token_name' : [] | [string],
 }
 export interface _SERVICE {
+  'admin_add_bridges' : ActorMethod<[Array<Principal>], Result>,
   'admin_add_evm_contract' : ActorMethod<[string, bigint, string], Result>,
   'admin_collect_fees' : ActorMethod<[Principal, bigint], Result_1>,
+  'admin_remove_bridges' : ActorMethod<[Array<Principal>], Result>,
   'admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
     Result
@@ -84,19 +89,22 @@ export interface _SERVICE {
   'bridge' : ActorMethod<[string, string, bigint, [] | [string]], Result_1>,
   'erc20_transfer' : ActorMethod<[string, string, bigint], Result_2>,
   'erc20_transfer_tx' : ActorMethod<[string, string, bigint], Result_2>,
+  'evm_address' : ActorMethod<[[] | [Principal]], Result_2>,
+  'evm_sign' : ActorMethod<[Uint8Array | number[]], Result_3>,
   'evm_transfer_tx' : ActorMethod<[string, string, bigint], Result_2>,
-  'finalized_logs' : ActorMethod<[[] | [bigint], [] | [bigint]], Result_3>,
-  'info' : ActorMethod<[], Result_4>,
-  'my_bridge_log' : ActorMethod<[BridgeTx], Result_5>,
-  'my_evm_address' : ActorMethod<[], Result_2>,
-  'my_finalized_logs' : ActorMethod<[[] | [bigint], [] | [bigint]], Result_3>,
-  'my_pending_logs' : ActorMethod<[], Result_3>,
-  'pending_logs' : ActorMethod<[], Result_3>,
+  'finalized_logs' : ActorMethod<[[] | [bigint], [] | [bigint]], Result_4>,
+  'info' : ActorMethod<[], Result_5>,
+  'my_bridge_log' : ActorMethod<[BridgeTx], Result_6>,
+  'my_finalized_logs' : ActorMethod<[[] | [bigint], [] | [bigint]], Result_4>,
+  'my_pending_logs' : ActorMethod<[], Result_4>,
+  'pending_logs' : ActorMethod<[], Result_4>,
+  'validate_admin_add_bridges' : ActorMethod<[Array<Principal>], Result_2>,
   'validate_admin_add_evm_contract' : ActorMethod<
     [string, bigint, string],
     Result_2
   >,
   'validate_admin_collect_fees' : ActorMethod<[Principal, bigint], Result_2>,
+  'validate_admin_remove_bridges' : ActorMethod<[Array<Principal>], Result_2>,
   'validate_admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
     Result_2

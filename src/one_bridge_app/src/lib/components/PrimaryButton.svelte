@@ -1,0 +1,16 @@
+<script lang="ts">
+  import Spinner from './Spinner.svelte'
+
+  let { children, disabled = false, isLoading = false, ...props } = $props()
+</script>
+
+<button
+  {...props}
+  disabled={disabled || isLoading}
+  class="mx-auto flex w-2/3 items-center justify-center space-x-2 rounded-xl bg-white/10 px-4 py-3 font-bold text-white shadow transition-all duration-300 hover:bg-white/20 disabled:cursor-not-allowed disabled:bg-gray-500"
+>
+  {#if isLoading}
+    <Spinner class="mr-3 -ml-1 size-5 text-white" />
+  {/if}
+  <span>{@render children()}</span>
+</button>

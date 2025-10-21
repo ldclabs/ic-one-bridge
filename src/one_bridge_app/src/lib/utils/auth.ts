@@ -10,7 +10,7 @@ import { AuthClient, IdbStorage } from '@dfinity/auth-client'
 import { DelegationChain } from '@dfinity/identity'
 import type { Principal } from '@dfinity/principal'
 
-export const EXPIRATION_MS = 1000 * 60 * 60 // 1 hour
+export const EXPIRATION_MS = 1000 * 60 * 10 // 20 minutes
 
 export class IdentityEx implements Identity {
   constructor(
@@ -102,13 +102,6 @@ function getDelegationExpiration(chain: DelegationChain): number {
     }
   }
   return expiration
-}
-
-export function shortId(id: string, long: boolean = false): string {
-  if (long) {
-    return id.length > 28 ? id.slice(0, 14) + '...' + id.slice(-14) : id
-  }
-  return id.length > 14 ? id.slice(0, 7) + '...' + id.slice(-7) : id
 }
 
 export class AuthAgent extends HttpAgent {

@@ -1,5 +1,5 @@
 # 🌉 `One Bridge Canister`
-The project enables seamless cross-chain token transfers across the Internet Computer, Ethereum, BNB Chain, and other EVM-compatible networks through a fully on-chain bridge.
+The project enables seamless multi-chain token transfers across the Internet Computer, Ethereum, BNB Chain, and other EVM-compatible networks through a fully on-chain bridge.
 
 ## Demo
 

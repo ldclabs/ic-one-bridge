@@ -233,3 +233,27 @@ export function scrollIntoView(
     })
   }
 }
+
+export function copyTextToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard
+      .writeText(text)
+      .then(() => true)
+      .catch(() => false)
+  }
+
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.top = '-9999px'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return Promise.resolve(ok)
+  } catch (e) {
+    return Promise.resolve(false)
+  }
+}

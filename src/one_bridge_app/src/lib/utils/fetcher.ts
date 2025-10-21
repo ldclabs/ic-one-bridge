@@ -43,6 +43,107 @@ export function createRequest(baseURL: string, defaultOptions: RequestInit) {
     new Headers(options?.headers).forEach((value, key) =>
       headers.set(key, value)
     )
+    if (!headers.has('Accept')) headers.set('Accept', JSON_MIME_TYPE)
+
+    if (options) {
+      options.mode = 'cors'
+    }
+    const resp = await fetch(url, { ...defaultOptions, ...options, headers })
+    const { status } = resp
+    const body =
+      resp.headers.get('Content-Type') === CBOR_MIME_TYPE
+        ? mapToObj(decodeCBOR(new Uint8Array(await resp.arrayBuffer())))
+        : resp.headers.get('Content-Type')?.startsWith(JSON_MIME_TYPE)
+          ? await resp.json()
+          : await resp.text()
+    if (resp.ok) {
+      return body as T
+    } else {
+      const requestId = resp.headers.get('X-Request-Id')
+      throw createHTTPError(status, body, requestId)
+    }
+  }
+
+  request.defaultOptions = Object.freeze(defaultOptions)
+  request.get = <T>(
+    path: string,
+    params?: URLSearchParamsInit,
+    signal: AbortSignal | null | undefined = null
+  ) => {
+    return request<T>(path, params, {
+      method: RequestMethod.GET,
+      signal
+    })
+  }
+  request.post = <T>(
+    path: string,
+    body?: object,
+    signal: AbortSignal | null | undefined = null
+  ) => {
+    return request<T>(path, undefined, {
+      method: RequestMethod.POST,
+      body: body ? JSON.stringify(body) : null,
+      headers: { 'Content-Type': JSON_MIME_TYPE },
+      signal
+    })
+  }
+  request.put = <T>(
+    path: string,
+    body?: object,
+    signal: AbortSignal | null | undefined = null
+  ) => {
+    return request<T>(path, undefined, {
+      method: RequestMethod.PUT,
+      body: body ? JSON.stringify(body) : null,
+      headers: { 'Content-Type': JSON_MIME_TYPE },
+      signal
+    })
+  }
+  request.patch = <T>(
+    path: string,
+    body?: object,
+    signal: AbortSignal | null | undefined = null
+  ) => {
+    return request<T>(path, undefined, {
+      method: RequestMethod.PATCH,
+      body: body ? JSON.stringify(body) : null,
+      headers: { 'Content-Type': JSON_MIME_TYPE },
+      signal
+    })
+  }
+  request.delete = <T>(
+    path: string,
+    params?: URLSearchParamsInit,
+    body?: object,
+    signal: AbortSignal | null | undefined = null
+  ) => {
+    return request<T>(path, params, {
+      method: RequestMethod.DELETE,
+      signal
+    })
+  }
+  return request
+}
+
+export function createCborRequest(
+  baseURL: string,
+  defaultOptions: RequestInit
+) {
+  const request = async <T>(
+    path: string,
+    params?: URLSearchParamsInit,
+    options?: RequestInit
+  ) => {
+    const pa = toURLSearchParams(params ?? {})
+    const url =
+      path.startsWith('http://') || path.startsWith('https://')
+        ? joinURL(path, '', pa)
+        : joinURL(baseURL, path, pa)
+
+    const headers = new Headers(defaultOptions.headers)
+    new Headers(options?.headers).forEach((value, key) =>
+      headers.set(key, value)
+    )
     if (!headers.has('Accept')) headers.set('Accept', CBOR_MIME_TYPE)
 
     if (options) {
@@ -119,8 +220,6 @@ export function createRequest(baseURL: string, defaultOptions: RequestInit) {
   ) => {
     return request<T>(path, params, {
       method: RequestMethod.DELETE,
-      body: body ? (encodeCBOR(body) as BufferSource) : null,
-      headers: { 'Content-Type': CBOR_MIME_TYPE },
       signal
     })
   }

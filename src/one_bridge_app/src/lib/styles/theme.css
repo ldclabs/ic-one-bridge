@@ -23,9 +23,7 @@
     var(--color-purple) 70%
   );
   --font-sans:
-    system-ui, -apple-system,
-    BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-  text-autospace: normal;
+    system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
 }
 
 html {
@@ -35,4 +33,5 @@ body {
   background: var(--color-bg);
   color: var(--color-text);
   font-family: var(--font-sans);
+  text-autospace: normal;
 }

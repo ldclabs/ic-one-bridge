@@ -1,27 +1,24 @@
 import { errMessage, tryRun, type TryRunResult } from '$lib/utils/tryrun'
+import type { Snippet } from 'svelte'
 
 export interface ToastModel {
   id: number
   type: 'success' | 'error' | 'info'
   message?: string
-  icon?: () => any
-  content?: () => any
+  content?: Snippet
   duration?: number // ms
   dismissable?: boolean
-  onclick: () => void
+  onclose: () => void
 }
 
 export const toastStore = $state<ToastModel[]>([])
 
 let idCounter = 0
-export function triggerToast(toast: Omit<ToastModel, 'id' | 'onclick'>) {
+export function triggerToast(toast: Omit<ToastModel, 'id' | 'onclose'>) {
   const id = ++idCounter
-  const model = {
+  const model: ToastModel = {
     id,
-    type: toast.type,
-    message: toast.message,
-    icon: toast.icon,
-    content: toast.content,
+    ...toast,
     duration:
       toast.duration ??
       (toast.type === 'success'
@@ -30,15 +27,17 @@ export function triggerToast(toast: Omit<ToastModel, 'id' | 'onclick'>) {
           ? 30000
           : 10000),
     dismissable: toast.dismissable ?? true,
-    onclick: () => removeToast(id)
-  } as ToastModel
+    onclose: () => removeToast(id)
+  }
 
   toastStore.push(model)
 
   // auto remove
-  setTimeout(() => {
-    removeToast(id)
-  }, model.duration)
+  if (model.duration && model.duration > 0) {
+    setTimeout(() => {
+      removeToast(id)
+    }, model.duration)
+  }
 }
 
 export const ErrorLogs = $state<Error[]>([])

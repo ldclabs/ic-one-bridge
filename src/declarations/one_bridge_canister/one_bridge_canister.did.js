@@ -30,6 +30,7 @@ export const idlFactory = ({ IDL }) => {
   });
   const Result_1 = IDL.Variant({ 'Ok' : BridgeTx, 'Err' : IDL.Text });
   const Result_2 = IDL.Variant({ 'Ok' : IDL.Text, 'Err' : IDL.Text });
+  const Result_3 = IDL.Variant({ 'Ok' : IDL.Vec(IDL.Nat8), 'Err' : IDL.Text });
   const BridgeTarget = IDL.Variant({ 'Evm' : IDL.Text, 'Icp' : IDL.Null });
   const BridgeLog = IDL.Record({
     'id' : IDL.Opt(IDL.Nat64),
@@ -45,7 +46,7 @@ export const idlFactory = ({ IDL }) => {
     'icp_amount' : IDL.Nat,
     'finalized_at' : IDL.Nat64,
   });
-  const Result_3 = IDL.Variant({ 'Ok' : IDL.Vec(BridgeLog), 'Err' : IDL.Text });
+  const Result_4 = IDL.Variant({ 'Ok' : IDL.Vec(BridgeLog), 'Err' : IDL.Text });
   const StateInfo = IDL.Record({
     'total_withdrawn_fees' : IDL.Nat,
     'evm_address' : IDL.Text,
@@ -71,16 +72,19 @@ export const idlFactory = ({ IDL }) => {
     'token_ledger' : IDL.Principal,
     'token_logo' : IDL.Text,
     'token_name' : IDL.Text,
+    'sub_bridges' : IDL.Vec(IDL.Principal),
   });
-  const Result_4 = IDL.Variant({ 'Ok' : StateInfo, 'Err' : IDL.Text });
-  const Result_5 = IDL.Variant({ 'Ok' : BridgeLog, 'Err' : IDL.Text });
+  const Result_5 = IDL.Variant({ 'Ok' : StateInfo, 'Err' : IDL.Text });
+  const Result_6 = IDL.Variant({ 'Ok' : BridgeLog, 'Err' : IDL.Text });
   return IDL.Service({
+    'admin_add_bridges' : IDL.Func([IDL.Vec(IDL.Principal)], [Result], []),
     'admin_add_evm_contract' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Text],
         [Result],
         [],
       ),
     'admin_collect_fees' : IDL.Func([IDL.Principal, IDL.Nat], [Result_1], []),
+    'admin_remove_bridges' : IDL.Func([IDL.Vec(IDL.Principal)], [Result], []),
     'admin_set_evm_providers' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Vec(IDL.Text)],
         [Result],
@@ -97,22 +101,28 @@ export const idlFactory = ({ IDL }) => {
         [Result_2],
         [],
       ),
+    'evm_address' : IDL.Func([IDL.Opt(IDL.Principal)], [Result_2], ['query']),
+    'evm_sign' : IDL.Func([IDL.Vec(IDL.Nat8)], [Result_3], []),
     'evm_transfer_tx' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [Result_2], []),
     'finalized_logs' : IDL.Func(
         [IDL.Opt(IDL.Nat64), IDL.Opt(IDL.Nat64)],
-        [Result_3],
+        [Result_4],
         ['query'],
       ),
-    'info' : IDL.Func([], [Result_4], ['query']),
-    'my_bridge_log' : IDL.Func([BridgeTx], [Result_5], ['query']),
-    'my_evm_address' : IDL.Func([], [Result_2], ['query']),
+    'info' : IDL.Func([], [Result_5], ['query']),
+    'my_bridge_log' : IDL.Func([BridgeTx], [Result_6], ['query']),
     'my_finalized_logs' : IDL.Func(
         [IDL.Opt(IDL.Nat64), IDL.Opt(IDL.Nat64)],
-        [Result_3],
+        [Result_4],
         ['query'],
       ),
-    'my_pending_logs' : IDL.Func([], [Result_3], ['query']),
-    'pending_logs' : IDL.Func([], [Result_3], ['query']),
+    'my_pending_logs' : IDL.Func([], [Result_4], ['query']),
+    'pending_logs' : IDL.Func([], [Result_4], ['query']),
+    'validate_admin_add_bridges' : IDL.Func(
+        [IDL.Vec(IDL.Principal)],
+        [Result_2],
+        [],
+      ),
     'validate_admin_add_evm_contract' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Text],
         [Result_2],
@@ -120,6 +130,11 @@ export const idlFactory = ({ IDL }) => {
       ),
     'validate_admin_collect_fees' : IDL.Func(
         [IDL.Principal, IDL.Nat],
+        [Result_2],
+        [],
+      ),
+    'validate_admin_remove_bridges' : IDL.Func(
+        [IDL.Vec(IDL.Principal)],
         [Result_2],
         [],
       ),

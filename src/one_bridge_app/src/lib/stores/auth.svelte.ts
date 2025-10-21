@@ -9,10 +9,6 @@ import {
 } from '$lib/utils/auth'
 import { popupCenter } from '$lib/utils/window'
 
-export interface AuthStoreData {
-  identity: IdentityEx
-}
-
 const IDENTITY_PROVIDER = IS_LOCAL
   ? 'http://rdmx6-jaaaa-aaaaa-aaadq-cai.localhost:4943'
   : 'https://id.ai'

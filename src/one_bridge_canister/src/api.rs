@@ -1,7 +1,12 @@
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes};
+use candid::Principal;
+use serde_bytes::ByteBuf;
 
-use crate::{helper::msg_caller, store};
+use crate::{
+    helper::{check_auth, msg_caller},
+    store,
+};
 
 #[ic_cdk::query]
 fn info() -> Result<store::StateInfo, String> {
@@ -9,9 +14,10 @@ fn info() -> Result<store::StateInfo, String> {
 }
 
 #[ic_cdk::query]
-fn my_evm_address() -> Result<String, String> {
-    let caller = msg_caller()?;
-    let addr = store::state::evm_address(&caller);
+fn evm_address(user: Option<Principal>) -> Result<String, String> {
+    let user = user.unwrap_or_else(|| ic_cdk::api::msg_caller());
+    check_auth(&user)?;
+    let addr = store::state::evm_address(&user);
     Ok(addr.to_string())
 }
 
@@ -121,4 +127,15 @@ async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<
         store::state::build_evm_transfer_tx(&chain, &caller, &to_addr, evm_amount, now_ms).await?;
     let data = signed_tx.encoded_2718();
     Ok(Bytes::from(data).to_string())
+}
+
+#[ic_cdk::update]
+async fn evm_sign(message_hash: ByteBuf) -> Result<ByteBuf, String> {
+    let caller = msg_caller()?;
+    if message_hash.len() != 32 {
+        return Err("message_hash must be 32 bytes".to_string());
+    }
+
+    let sig = store::state::evm_sign(&caller, message_hash.into_vec()).await?;
+    Ok(sig.into())
 }
