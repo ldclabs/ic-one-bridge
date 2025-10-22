@@ -22,6 +22,7 @@ use serde_bytes::ByteArray;
 use std::{
     borrow::Cow,
     cell::RefCell,
+    cmp,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     time::Duration,
 };
@@ -36,6 +37,8 @@ use crate::{
 };
 
 type Memory = VirtualMemory<DefaultMemoryImpl>;
+
+const MAX_ERROR_ROUNDS: u64 = 42;
 
 #[derive(Serialize, Deserialize)]
 pub struct State {
@@ -69,6 +72,8 @@ pub struct State {
     pub total_withdrawn_fees: u128,
     #[serde(default)]
     pub sub_bridges: BTreeSet<Principal>,
+    #[serde(default)]
+    pub error_rounds: u64,
 }
 
 #[derive(CandidType, Serialize, Deserialize)]
@@ -92,6 +97,7 @@ pub struct StateInfo {
     pub total_withdrawn_fees: u128,
     pub total_bridge_count: u64,
     pub sub_bridges: BTreeSet<Principal>,
+    pub error_rounds: u64,
 }
 
 impl From<&State> for StateInfo {
@@ -129,6 +135,7 @@ impl From<&State> for StateInfo {
             total_withdrawn_fees: s.total_withdrawn_fees,
             total_bridge_count: 0,
             sub_bridges: s.sub_bridges.clone(),
+            error_rounds: s.error_rounds,
         }
     }
 }
@@ -160,6 +167,7 @@ impl State {
             total_collected_fees: 0,
             total_withdrawn_fees: 0,
             sub_bridges: BTreeSet::new(),
+            error_rounds: 0,
         }
     }
 }
@@ -170,10 +178,20 @@ pub enum BridgeTarget {
     Evm(String), // chain_name
 }
 
-#[derive(Clone, CandidType, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, CandidType, Serialize, Deserialize)]
 pub enum BridgeTx {
     Icp(bool, u64),           // (finalized, block_height)
     Evm(bool, ByteArray<32>), // (finalized, tx_hash)
+}
+
+impl cmp::PartialEq for BridgeTx {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (BridgeTx::Icp(_, tx1), BridgeTx::Icp(_, tx2)) => tx1 == tx2,
+            (BridgeTx::Evm(_, tx1), BridgeTx::Evm(_, tx2)) => tx1 == tx2,
+            _ => false,
+        }
+    }
 }
 
 impl BridgeTx {
@@ -523,6 +541,10 @@ pub mod state {
         }
 
         let (from, to, token_ledger, token_bridge_fee) = STATE.with_borrow(|s| {
+            if s.error_rounds >= MAX_ERROR_ROUNDS {
+                return Err("the bridge is temporarily disabled due to errors, please contact the administrator".to_string());
+            }
+
             for log in s.pending.iter() {
                 if let Some(err) = &log.error
                     && (err.starts_with(from_chain.as_str()) || err.starts_with(to_chain.as_str()))
@@ -665,7 +687,7 @@ pub mod state {
         log
     }
 
-    pub fn user_logs(user: Principal, prev: Option<u64>, take: usize) -> Vec<BridgeLog> {
+    pub fn user_logs(user: Principal, take: usize, prev: Option<u64>) -> Vec<BridgeLog> {
         USER_LOGS.with_borrow(|r| {
             let item = r.get(&user).unwrap_or_default();
             if item.logs.is_empty() {
@@ -696,7 +718,7 @@ pub mod state {
         })
     }
 
-    pub fn logs(prev: Option<u64>, take: usize) -> Vec<BridgeLog> {
+    pub fn logs(take: usize, prev: Option<u64>) -> Vec<BridgeLog> {
         BRIDGE_LOGS.with_borrow(|log_store| {
             let max_id = log_store.len();
             let mut idx = prev.unwrap_or(max_id).min(max_id);
@@ -782,8 +804,14 @@ pub mod state {
                 if s.pending.is_empty() {
                     None
                 } else if has_error {
-                    Some((5, s.finalize_bridging_round.0))
+                    s.error_rounds += 1;
+                    if s.error_rounds >= MAX_ERROR_ROUNDS {
+                        None
+                    } else {
+                        Some((5 * s.error_rounds, s.finalize_bridging_round.0))
+                    }
                 } else {
+                    s.error_rounds = 0;
                     Some((1, s.finalize_bridging_round.0))
                 }
             });

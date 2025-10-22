@@ -49,6 +49,7 @@ export type Result_6 = { 'Ok' : BridgeLog } |
   { 'Err' : string };
 export interface StateInfo {
   'total_withdrawn_fees' : bigint,
+  'error_rounds' : bigint,
   'evm_address' : string,
   'evm_latest_gas' : Array<[string, [bigint, bigint, bigint]]>,
   'finalize_bridging_round' : [bigint, boolean],
@@ -92,10 +93,10 @@ export interface _SERVICE {
   'evm_address' : ActorMethod<[[] | [Principal]], Result_2>,
   'evm_sign' : ActorMethod<[Uint8Array | number[]], Result_3>,
   'evm_transfer_tx' : ActorMethod<[string, string, bigint], Result_2>,
-  'finalized_logs' : ActorMethod<[[] | [bigint], [] | [bigint]], Result_4>,
+  'finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_4>,
   'info' : ActorMethod<[], Result_5>,
   'my_bridge_log' : ActorMethod<[BridgeTx], Result_6>,
-  'my_finalized_logs' : ActorMethod<[[] | [bigint], [] | [bigint]], Result_4>,
+  'my_finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_4>,
   'my_pending_logs' : ActorMethod<[], Result_4>,
   'pending_logs' : ActorMethod<[], Result_4>,
   'validate_admin_add_bridges' : ActorMethod<[Array<Principal>], Result_2>,

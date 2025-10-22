@@ -49,6 +49,7 @@ export const idlFactory = ({ IDL }) => {
   const Result_4 = IDL.Variant({ 'Ok' : IDL.Vec(BridgeLog), 'Err' : IDL.Text });
   const StateInfo = IDL.Record({
     'total_withdrawn_fees' : IDL.Nat,
+    'error_rounds' : IDL.Nat64,
     'evm_address' : IDL.Text,
     'evm_latest_gas' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Nat64, IDL.Nat, IDL.Nat))
@@ -105,14 +106,14 @@ export const idlFactory = ({ IDL }) => {
     'evm_sign' : IDL.Func([IDL.Vec(IDL.Nat8)], [Result_3], []),
     'evm_transfer_tx' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [Result_2], []),
     'finalized_logs' : IDL.Func(
-        [IDL.Opt(IDL.Nat64), IDL.Opt(IDL.Nat64)],
+        [IDL.Nat32, IDL.Opt(IDL.Nat64)],
         [Result_4],
         ['query'],
       ),
     'info' : IDL.Func([], [Result_5], ['query']),
     'my_bridge_log' : IDL.Func([BridgeTx], [Result_6], ['query']),
     'my_finalized_logs' : IDL.Func(
-        [IDL.Opt(IDL.Nat64), IDL.Opt(IDL.Nat64)],
+        [IDL.Nat32, IDL.Opt(IDL.Nat64)],
         [Result_4],
         ['query'],
       ),

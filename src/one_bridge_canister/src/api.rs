@@ -15,7 +15,7 @@ fn info() -> Result<store::StateInfo, String> {
 
 #[ic_cdk::query]
 fn evm_address(user: Option<Principal>) -> Result<String, String> {
-    let user = user.unwrap_or_else(|| ic_cdk::api::msg_caller());
+    let user = user.unwrap_or_else(ic_cdk::api::msg_caller);
     check_auth(&user)?;
     let addr = store::state::evm_address(&user);
     Ok(addr.to_string())
@@ -40,13 +40,10 @@ fn my_pending_logs() -> Result<Vec<store::BridgeLog>, String> {
 }
 
 #[ic_cdk::query]
-fn my_finalized_logs(
-    prev: Option<u64>,
-    take: Option<u64>,
-) -> Result<Vec<store::BridgeLog>, String> {
+fn my_finalized_logs(take: u32, prev: Option<u64>) -> Result<Vec<store::BridgeLog>, String> {
     let caller = msg_caller()?;
-    let take = take.unwrap_or(10).min(1000) as usize;
-    let rt = store::state::user_logs(caller, prev, take);
+    let take = take.clamp(2, 100) as usize;
+    let rt = store::state::user_logs(caller, take, prev);
     Ok(rt)
 }
 
@@ -64,9 +61,9 @@ fn pending_logs() -> Result<Vec<store::BridgeLog>, String> {
 }
 
 #[ic_cdk::query]
-fn finalized_logs(prev: Option<u64>, take: Option<u64>) -> Result<Vec<store::BridgeLog>, String> {
-    let take = take.unwrap_or(10).min(1000) as usize;
-    let rt = store::state::logs(prev, take);
+fn finalized_logs(take: u32, prev: Option<u64>) -> Result<Vec<store::BridgeLog>, String> {
+    let take = take.clamp(2, 100) as usize;
+    let rt = store::state::logs(take, prev);
     Ok(rt)
 }
 

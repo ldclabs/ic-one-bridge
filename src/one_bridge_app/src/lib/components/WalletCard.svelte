@@ -2,9 +2,8 @@
   import { page } from '$app/state'
   import {
     type BridgeCanisterAPI,
-    BridgingProgress
+    TransferingProgress
   } from '$lib/canisters/bridge.svelte'
-  import ArrowLeftRightLine from '$lib/icons/arrow-left-right-line.svelte'
   import ArrowRightUpLine from '$lib/icons/arrow-right-up-line.svelte'
   import { authStore } from '$lib/stores/auth.svelte'
   import { toastRun } from '$lib/stores/toast.svelte'
@@ -22,13 +21,9 @@
   import TokenSelector from './TokenSelector.svelte'
 
   const {
-    isAuthenticated,
-    onSignIn,
     mainBridge
   }: {
-    isAuthenticated: boolean
-    onSignIn: () => Promise<void>
-    mainBridge: BridgeCanisterAPI | null
+    mainBridge: BridgeCanisterAPI
   } = $props()
 
   const defaultToken =
@@ -39,68 +34,45 @@
     page.url.searchParams.get('from') ||
     localStorage.getItem('defaultFrom') ||
     'ICP'
-  const defaultTo =
-    page.url.searchParams.get('to') ||
-    localStorage.getItem('defaultTo') ||
-    'BNB'
 
   let myIcpAddress = $state<string>('')
   let myEvmAddress = $state<string>('')
   let bridges = $state<BridgeCanisterAPI[]>([])
-  let selectedBridge = $state<BridgeCanisterAPI | null>(null)
+  let selectedBridge = $state<BridgeCanisterAPI>(mainBridge)
   let supportChains = $state<Chain[]>([])
   let supportTokens = $state<TokenInfo[]>([])
-  let bridgeCanister = $derived(
-    selectedBridge ? selectedBridge.canisterId.toText() : ''
-  )
+  let bridgeCanister = $derived(selectedBridge.canisterId.toText())
   let selectedToken = $state<TokenInfo | null>(null)
   let fromChain = $state<Chain | null>(null)
-  let toChain = $state<Chain | null>(null)
   let fromAddress = $state<string>('')
   let fromBalanceIcp = $state<bigint>(0n)
-  let bridgeBalanceIcp = $state<bigint>(0n)
-  let toAddress = $state<string>('')
+  let fromBalanceNative = $state<bigint>(0n)
+  let nativeToken = $state<boolean>(false)
   let thirdAddress = $state<string>('')
   let confirmAddress = $state<boolean>(false)
   let fromAmount = $state<number>()
   let error = $state<string | null>(null)
-  let bridgeError = $state<string | null>(null)
   let isLoading = $state<boolean>(false)
-  let isSigningIn = $state<boolean>(false)
-  let isBridging = $state<boolean>(false)
-  let bridgingProgress = $state<BridgingProgress | null>(null)
-  const disabledBridging = $derived.by(() => {
-    return !!(
-      isBridging ||
-      bridgeError ||
-      error ||
-      (thirdAddress && !confirmAddress)
-    )
+  let isTransfering = $state<boolean>(false)
+  let transferingProgress = $state<TransferingProgress | null>(null)
+  const disabledTransfering = $derived.by(() => {
+    return !!(isTransfering || error || !thirdAddress || !confirmAddress)
   })
 
   $effect(() => {
-    if (!mainBridge) return
-
-    if (isAuthenticated) {
-      myIcpAddress = authStore.identity.getPrincipal().toText()
-      mainBridge.myEvmAddress().then((addr) => {
-        myEvmAddress = addr
-        refreshMyTokenInfo()
-      })
-    } else {
-      myIcpAddress = ''
-      myEvmAddress = ''
-    }
+    myIcpAddress = authStore.identity.getPrincipal().toText()
+    mainBridge.myEvmAddress().then((addr) => {
+      myEvmAddress = addr
+      refreshMyTokenInfo()
+    })
   })
 
   $effect(() => {
-    if (!mainBridge) return
-
     selectedBridge = mainBridge
     mainBridge.loadSubBridges().then((subBridges) => {
       bridges = [mainBridge, ...subBridges]
       supportTokens = bridges.map((b) => b.token!)
-      if (selectedBridge?.token?.symbol != defaultToken) {
+      if (selectedBridge.token?.symbol != defaultToken) {
         selectedBridge =
           bridges.find((b) => b.token?.symbol === defaultToken) || mainBridge
       }
@@ -108,17 +80,10 @@
   })
 
   $effect(() => {
-    if (!selectedBridge || !selectedBridge.state) return
+    if (!selectedBridge.state) return
 
     return toastRun(async (_signal) => {
-      if (!selectedBridge || !selectedBridge.state) return
-
-      if (selectedBridge.state?.error_rounds >= 42n) {
-        bridgeError =
-          'the bridge is temporarily disabled due to errors, please contact the administrator'
-      } else {
-        bridgeError = null
-      }
+      if (!selectedBridge.state) return
 
       selectedToken = selectedBridge.token!
       supportChains = await selectedBridge.supportChains()
@@ -127,24 +92,20 @@
         supportChains.find((c) => c.name === defaultFrom) ||
         supportChains[0] ||
         null
-      if (defaultFrom != defaultTo) {
-        toChain =
-          supportChains.find((c) => c.name === defaultTo) ||
-          supportChains[1] ||
-          null
-      }
 
       await refreshMyTokenInfo()
     }).abort
   })
 
-  function resetBridge() {
-    isBridging = false
+  function resetTransfer() {
+    isTransfering = false
     thirdAddress = ''
     confirmAddress = false
     fromAmount = undefined
     error = null
-    bridgingProgress = null
+    transferingProgress = null
+
+    refreshMyTokenInfo()
   }
 
   function validateSendAmount(event: Event) {
@@ -164,10 +125,27 @@
       !selectedBridge ||
       !selectedBridge.token ||
       !selectedBridge.tokenDisplay ||
-      !fromChain ||
-      !toChain
+      !fromChain
     ) {
       return [0n, '']
+    }
+
+    if (nativeToken) {
+      const userBalance =
+        fromBalanceNative - (fromChain.name === 'ICP' ? 10000n : 0n)
+      const amount = selectedBridge.parseNativeAmount(
+        fromChain.name,
+        fromAmount || 0
+      )
+      let err = ''
+      if (amount > userBalance) {
+        const balance = selectedBridge.displayNativeAmount(
+          fromChain.name,
+          userBalance
+        )
+        err = `Insufficient ${fromChain.name} balance, should be less than ${balance}`
+      }
+      return [amount, err]
     }
 
     const userBalance =
@@ -176,13 +154,11 @@
     const amount = selectedBridge.parseAmount(fromAmount || 0)
     let err = ''
     if (amount < selectedBridge.tokenDisplay.amount) {
-      err = `Minimum bridge amount is ${selectedBridge.tokenDisplay.display()}`
+      err = `Minimum transfer amount is ${selectedBridge.tokenDisplay.display()}`
     } else if (amount > userBalance) {
       err = `Insufficient balance, should be less than ${selectedBridge.tokenDisplay.displayValue(
         userBalance
       )}`
-    } else if (amount >= bridgeBalanceIcp) {
-      err = 'Bridge has insufficient balance'
     }
 
     return [amount, err]
@@ -190,15 +166,15 @@
 
   function validateThirdAddress(event: Event) {
     const target = event.target as HTMLInputElement
-    if (!toChain) return
+    if (!fromChain) return
 
     let err = ''
     const addr = thirdAddress.trim()
     if (addr !== thirdAddress) thirdAddress = addr
-    if (addr) {
-      if (!validateAddress(toChain.name, addr)) {
-        err = `Invalid ${toChain.name} address format`
-      }
+    if (thirdAddress === fromAddress) {
+      err = 'The destination address cannot be the same as the source address'
+    } else if (!validateAddress(fromChain.name, addr)) {
+      err = `Invalid ${fromChain.name} address format`
     }
 
     if (err) {
@@ -217,13 +193,10 @@
       !mainBridge ||
       !selectedBridge ||
       !fromChain ||
-      !isAuthenticated ||
       !myIcpAddress ||
       !myEvmAddress
     ) {
-      fromAddress = ''
       fromBalanceIcp = 0n
-      toAddress = ''
       return
     }
 
@@ -234,29 +207,18 @@
         case 'ICP':
           fromAddress = myIcpAddress
           fromBalanceIcp = await icp.balance()
+          fromBalanceNative = await icp.getICPBalanceOf(
+            authStore.identity.getPrincipal()
+          )
           break
         default:
           const evm = await selectedBridge.loadEVMTokenAPI(fromChain.name)
           fromAddress = myEvmAddress
           const v = await evm.getErc20Balance(myEvmAddress)
           fromBalanceIcp = selectedBridge.toIcpAmount(fromChain.name, v)
+          fromBalanceNative = await evm.getBalance(myEvmAddress)
       }
 
-      if (toChain) {
-        switch (toChain.name) {
-          case 'ICP':
-            toAddress = myIcpAddress
-            bridgeBalanceIcp = await icp.getBalanceOf(selectedBridge.canisterId)
-            break
-          default:
-            toAddress = myEvmAddress
-            const evm = await selectedBridge.loadEVMTokenAPI(toChain.name)
-            const v = await evm.getErc20Balance(
-              selectedBridge.state?.evm_address!
-            )
-            bridgeBalanceIcp = selectedBridge.toIcpAmount(toChain.name, v)
-        }
-      }
       isLoading = false
     } catch (err) {
       isLoading = false
@@ -266,44 +228,35 @@
 
   function onSelectToken(token: TokenInfo) {
     const bridge = bridges.find((b) => b.token?.name === token.name)
+    nativeToken = false
     if (bridge) {
       selectedBridge = bridge
     }
   }
 
-  async function onSwapChains() {
-    const temp = fromChain
-    fromChain = toChain
-    toChain = temp
-    await refreshMyTokenInfo()
-  }
-
   async function onSelectFromChain(chain: Chain) {
     fromChain = chain
-    if (toChain?.name === chain.name) {
-      toChain = supportChains.find((c) => c.name !== chain.name) || null
-    }
+
     await refreshMyTokenInfo()
   }
 
-  async function onBridge() {
+  async function onTransfer() {
     const [amount, err] = _validateSendAmount()
     if (err) {
       error = err
     } else {
       error = null
     }
-    if (isBridging || amount <= 0n) return
+    if (isTransfering || amount <= 0n) return
 
-    isBridging = true
+    isTransfering = true
     toastRun(async () => {
       if (
         !selectedBridge ||
         !selectedBridge.state ||
         !selectedBridge.token ||
         !selectedBridge.tokenDisplay ||
-        !fromChain ||
-        !toChain
+        !fromChain
       ) {
         return
       }
@@ -311,26 +264,40 @@
       try {
         if (fromChain.name === 'ICP') {
           const icp = await selectedBridge.loadICPTokenAPI()
-          await icp.ensureAllowance(
-            selectedBridge.canisterId,
-            amount +
-              selectedBridge.token.fee +
-              selectedBridge.state.token_bridge_fee
-          )
+          const idx = nativeToken
+            ? await icp.transferICP(thirdAddress, amount)
+            : await icp.transfer(thirdAddress, amount)
+          transferingProgress = TransferingProgress.track(selectedBridge, {
+            chain: 'ICP',
+            native: nativeToken,
+            isFinalized: true,
+            Icp: idx
+          })
+        } else {
+          const evm = await selectedBridge.loadEVMTokenAPI(fromChain.name)
+          const signedTx = nativeToken
+            ? await selectedBridge.buildEvmTransferTx(
+                fromChain.name,
+                thirdAddress,
+                amount
+              )
+            : await selectedBridge.buildErc20TransferTx(
+                fromChain.name,
+                thirdAddress,
+                amount
+              )
+          const tx = await evm.sendRawTransaction(signedTx)
+          transferingProgress = TransferingProgress.track(selectedBridge, {
+            chain: fromChain.name,
+            native: nativeToken,
+            isFinalized: false,
+            Evm: tx
+          })
         }
 
-        bridgingProgress = await selectedBridge.bridge(
-          fromChain.name,
-          toChain.name,
-          amount,
-          thirdAddress
-        )
-
-        localStorage.setItem('defaultToken', selectedBridge.token.symbol)
-        localStorage.setItem('defaultFrom', fromChain.name)
-        localStorage.setItem('defaultTo', toChain.name)
+        refreshMyTokenInfo()
       } catch (err) {
-        isBridging = false
+        isTransfering = false
         throw err
       }
     })
@@ -360,9 +327,12 @@
       <hr class="mb-1 border-white/10" />
     {/if}
     <div class="relative">
-      <div class="flex w-full items-center gap-4">
+      <div
+        class="flex w-full items-center gap-4"
+        class:opacity-50={nativeToken}
+      >
         <TokenSelector
-          disabled={isLoading || isBridging}
+          disabled={isLoading || isTransfering}
           {selectedToken}
           {onSelectToken}
           tokens={supportTokens}
@@ -381,12 +351,12 @@
       </div>
     </div>
 
-    <div class="grid grid-cols-[1fr_32px_1fr] items-center gap-0">
+    <div class="grid grid-cols-[1fr_1fr] items-center justify-center gap-4">
       <!-- From Section -->
       <div class="">
-        <p class="mb-1 text-sm text-white/60">From</p>
+        <p class="mb-1 text-sm text-white/60">Chain</p>
         <NetworkSelector
-          disabled={isLoading || isBridging}
+          disabled={isLoading || isTransfering}
           selectedChain={fromChain}
           disabledChainName={''}
           onSelectChain={onSelectFromChain}
@@ -394,31 +364,18 @@
           containerClass="rounded-xl border border-white/40 shrink-0"
         />
       </div>
-
-      <!-- Swap Button -->
-      <div class="relative">
-        <p class="collapse mb-1 text-center text-sm">-</p>
-        <button
-          onclick={onSwapChains}
-          disabled={isLoading || isBridging}
-          title="Swap from and to"
-          class="flex size-8 items-center justify-center text-white/50 transition-all duration-500 hover:text-white/90"
+      <div class="">
+        <p class="collapse mb-1 text-sm text-white/60">-</p>
+        <label
+          class="flex items-center text-sm font-medium text-white/90 rtl:text-right"
+          ><input
+            type="checkbox"
+            name="nativeToken"
+            disabled={isLoading || isTransfering}
+            bind:checked={nativeToken}
+            class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0"
+          />Native Token</label
         >
-          <ArrowLeftRightLine />
-        </button>
-      </div>
-
-      <!-- To Section -->
-      <div class="relative">
-        <p class="mb-1 text-sm text-white/60">To</p>
-        <NetworkSelector
-          disabled={isLoading || isBridging}
-          selectedChain={toChain}
-          disabledChainName={fromChain?.name ?? ''}
-          onSelectChain={(chain) => (toChain = chain)}
-          chains={supportChains}
-          containerClass="rounded-xl border border-white/40 shrink-0"
-        />
       </div>
     </div>
 
@@ -432,7 +389,7 @@
       <input
         type="number"
         name="tokenAmount"
-        disabled={isLoading || isBridging}
+        disabled={isLoading || isTransfering}
         bind:value={fromAmount}
         oninput={validateSendAmount}
         inputmode="decimal"
@@ -443,132 +400,97 @@
         class="w-full flex-1 rounded-xl border border-white/10 bg-white/10 p-2 text-left font-mono text-xl leading-8 ring-0 transition-all duration-200 outline-none placeholder:text-gray-500 invalid:border-red-400 focus:bg-white/20"
       />
       {#if selectedBridge}
-        {@const token_bridge_fee = selectedBridge.state?.token_bridge_fee || 0n}
-        <div class="mt-1 text-sm text-white/60">
+        <div class="mt-1 flex items-center gap-4 text-sm text-white/60">
           <span
             >Your balance: {selectedBridge.displayAmount(fromBalanceIcp)}</span
           >
-          <span class="ml-4"
-            >Bridge balance: {selectedBridge.displayAmount(
-              bridgeBalanceIcp
+          <span
+            >Native {fromChain?.name} balance: {selectedBridge.displayNativeAmount(
+              fromChain?.name!,
+              fromBalanceNative
             )}</span
           >
-          {#if token_bridge_fee >= 0n}
-            <span class="ml-4"
-              >Bridge fee: {selectedBridge.displayAmount(token_bridge_fee)}
-            </span>
-          {/if}
         </div>
       {/if}
     </div>
 
     <div class="relative">
       <p class="mb-1 flex items-center gap-1 text-sm text-white/60">
-        <span>To {toChain?.name} address:</span>
-        {#if toAddress && !thirdAddress}
-          <span>{pruneAddress(toAddress)}</span>
-        {/if}
+        <span>To {fromChain?.name} address:</span>
       </p>
       <input
         type="text"
         name="thirdAddress"
-        disabled={isLoading || isBridging}
+        disabled={isLoading || isTransfering}
         bind:value={thirdAddress}
         oninput={validateThirdAddress}
-        placeholder={pruneAddress(toAddress) || '0x...'}
+        placeholder={'0x...'}
         data-1p-ignore
         autocomplete="off"
         class="mb-1 w-full min-w-0 flex-1 rounded-xl border border-white/10 bg-white/10 p-2 text-left leading-8 ring-0 transition-all duration-200 outline-none placeholder:text-gray-500 invalid:border-red-400 focus:bg-white/20"
       />
-      {#if thirdAddress}
-        <label
-          class="flex items-center text-sm font-medium text-white/60 rtl:text-right"
-          ><input
-            type="checkbox"
-            name="confirmAddress"
-            bind:checked={confirmAddress}
-            class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0"
-          />
-          I confirmed the address is correct and not an exchange or contract address.
-          Any tokens sent to an incorrect address will be unrecoverable.</label
-        >
-      {/if}
+      <label
+        class="flex items-center text-sm font-medium text-white/60 rtl:text-right"
+        ><input
+          type="checkbox"
+          name="confirmAddress"
+          disabled={isLoading || isTransfering}
+          bind:checked={confirmAddress}
+          class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0"
+        />
+        I confirmed the address is correct and not an exchange or contract address.
+        Any tokens sent to an incorrect address will be unrecoverable.</label
+      >
     </div>
 
     <div class="relative">
-      {#if bridgeError || error}
-        <p class="mb-1 text-sm text-red-400">{bridgeError || error}</p>
+      {#if error}
+        <p class="mb-1 text-sm text-red-400">{error}</p>
       {/if}
-      {#if bridgingProgress}
-        {@const message = bridgingProgress.message}
-        {@const info = bridgingProgress.info}
+      {#if transferingProgress}
+        {@const message = transferingProgress.message}
+        {@const [tx, txUrl] = [
+          transferingProgress.tx,
+          transferingProgress.txUrl
+        ]}
         {#if message}
           <p class="mb-1 text-sm text-green-500"
-            >{bridgingProgress.status}: {message}</p
+            >{transferingProgress.status}: {message}</p
           >
         {/if}
-        {#if info && info.fromTxUrl}
+        {#if tx && txUrl}
           <a
             class="mb-1 flex items-center gap-1 text-sm font-medium text-green-500"
-            href={info.fromTxUrl}
+            href={txUrl}
             target="_blank"
           >
-            <span
-              >{'From ' + info.from + ' Tx: ' + pruneAddress(info.fromTx)}</span
+            <span>{transferingProgress.chain + ' Tx: ' + pruneAddress(tx)}</span
             >
             <span class="*:size-4"><ArrowRightUpLine /></span>
           </a>
         {/if}
-        {#if info && info.toTx && info.toTxUrl}
-          <a
-            class="mb-1 flex items-center gap-1 text-sm font-medium text-green-500"
-            href={info.toTxUrl}
-            target="_blank"
-          >
-            <span>{'To ' + info.to + ' Tx: ' + pruneAddress(info.toTx)}</span>
-            <span class="*:size-4"><ArrowRightUpLine /></span>
-          </a>
-        {/if}
       {/if}
-      {#if isAuthenticated}
-        {#if bridgingProgress}
-          {@const isComplete = bridgingProgress.isComplete}
-          <PrimaryButton
-            onclick={resetBridge}
-            disabled={!isComplete}
-            isLoading={!isComplete}
-          >
-            {#if isComplete}
-              <span class="text-green-500">Bridge completed, start again</span>
-            {:else}
-              <span>Bridging...</span>
-            {/if}
-          </PrimaryButton>
-        {:else}
-          <PrimaryButton
-            onclick={onBridge}
-            disabled={disabledBridging}
-            isLoading={isLoading || isBridging || !selectedBridge}
-          >
-            {isBridging ? 'Bridging...' : 'Bridge tokens'}
-          </PrimaryButton>
-        {/if}
+
+      {#if transferingProgress}
+        <PrimaryButton
+          onclick={resetTransfer}
+          disabled={!transferingProgress.isComplete}
+          isLoading={!transferingProgress.isComplete}
+        >
+          {#if transferingProgress.isComplete}
+            <span class="text-green-500">Transfer completed, start again</span>
+          {:else}
+            <span>Transfering...</span>
+          {/if}
+        </PrimaryButton>
       {:else}
         <PrimaryButton
-          onclick={() => {
-            isSigningIn = true
-            onSignIn()
-              .then(() => {
-                isSigningIn = false
-              })
-              .catch(() => {
-                isSigningIn = false
-              })
-          }}
-          isLoading={isSigningIn}
-          ><span class="text-cyan-500">Sign in with Internet Identity</span
-          ></PrimaryButton
+          onclick={onTransfer}
+          disabled={disabledTransfering}
+          isLoading={isLoading || isTransfering || !selectedBridge}
         >
+          {isTransfering ? 'Transfering...' : 'Transfer tokens'}
+        </PrimaryButton>
       {/if}
     </div>
   {/key}

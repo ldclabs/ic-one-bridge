@@ -13,11 +13,16 @@ export class TokenLedgerAPI {
   readonly canisterId: Principal
   #token: TokenInfo
   #actor: _SERVICE
+  #icpActor: _SERVICE
 
   constructor(token: TokenInfo) {
     this.canisterId = Principal.fromText(token.canisterId)
     this.#actor = createActor<_SERVICE>({
       canisterId: token.canisterId,
+      idlFactory: idlFactory
+    })
+    this.#icpActor = createActor<_SERVICE>({
+      canisterId: 'ryjl3-tyaaa-aaaaa-aaaba-cai',
       idlFactory: idlFactory
     })
     this.#token = token
@@ -91,6 +96,10 @@ export class TokenLedgerAPI {
     return this.#actor.icrc1_balance_of({ owner, subaccount: [] })
   }
 
+  async getICPBalanceOf(owner: Principal): Promise<bigint> {
+    return this.#icpActor.icrc1_balance_of({ owner, subaccount: [] })
+  }
+
   async allowance(spender: Principal): Promise<Allowance> {
     return this.#actor.icrc2_allowance({
       account: { owner: dynAgent.id.getPrincipal(), subaccount: [] },
@@ -103,7 +112,7 @@ export class TokenLedgerAPI {
       fee: [],
       memo: [],
       from_subaccount: [],
-      created_at_time: [BigInt(Date.now() * 1_000_000)],
+      created_at_time: [],
       amount: amount,
       expected_allowance: [],
       expires_at: [],
@@ -120,7 +129,6 @@ export class TokenLedgerAPI {
       allowance.allowance < amount ||
       (expires_at > 0 && expires_at < BigInt((Date.now() + 60000) * 1_000_000))
     ) {
-      // Approve 10 times of the amount to avoid frequent approval
       await this.approve(spender, amount)
     }
   }
@@ -128,6 +136,40 @@ export class TokenLedgerAPI {
   async transfer(to: string, amount: bigint): Promise<bigint> {
     const principal = Principal.fromText(to)
     const res = await this.#actor.icrc1_transfer({
+      from_subaccount: [],
+      to: { owner: principal, subaccount: [] },
+      amount,
+      fee: [],
+      memo: [],
+      created_at_time: [BigInt(Date.now() * 1_000_000)]
+    })
+
+    return unwrapResult(res, 'call icrc1_transfer failed')
+  }
+
+  async transfer_from(
+    from: string,
+    to: string,
+    amount: bigint
+  ): Promise<bigint> {
+    const fromPrincipal = Principal.fromText(from)
+    const toPrincipal = Principal.fromText(to)
+    const res = await this.#actor.icrc2_transfer_from({
+      to: { owner: toPrincipal, subaccount: [] },
+      from: { owner: fromPrincipal, subaccount: [] },
+      spender_subaccount: [],
+      amount,
+      fee: [],
+      memo: [],
+      created_at_time: [BigInt(Date.now() * 1_000_000)]
+    })
+
+    return unwrapResult(res, 'call icrc2_transfer_from failed')
+  }
+
+  async transferICP(to: string, amount: bigint): Promise<bigint> {
+    const principal = Principal.fromText(to)
+    const res = await this.#icpActor.icrc1_transfer({
       from_subaccount: [],
       to: { owner: principal, subaccount: [] },
       amount,

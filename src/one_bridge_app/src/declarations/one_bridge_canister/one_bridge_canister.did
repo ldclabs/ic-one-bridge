@@ -38,6 +38,7 @@ type Result_5 = variant { Ok : StateInfo; Err : text };
 type Result_6 = variant { Ok : BridgeLog; Err : text };
 type StateInfo = record {
   total_withdrawn_fees : nat;
+  error_rounds : nat64;
   evm_address : text;
   evm_latest_gas : vec record { text; record { nat64; nat; nat } };
   finalize_bridging_round : record { nat64; bool };
@@ -78,10 +79,10 @@ service : (opt CanisterArgs) -> {
   evm_address : (opt principal) -> (Result_2) query;
   evm_sign : (blob) -> (Result_3);
   evm_transfer_tx : (text, text, nat) -> (Result_2);
-  finalized_logs : (opt nat64, opt nat64) -> (Result_4) query;
+  finalized_logs : (nat32, opt nat64) -> (Result_4) query;
   info : () -> (Result_5) query;
   my_bridge_log : (BridgeTx) -> (Result_6) query;
-  my_finalized_logs : (opt nat64, opt nat64) -> (Result_4) query;
+  my_finalized_logs : (nat32, opt nat64) -> (Result_4) query;
   my_pending_logs : () -> (Result_4) query;
   pending_logs : () -> (Result_4) query;
   validate_admin_add_bridges : (vec principal) -> (Result_2);

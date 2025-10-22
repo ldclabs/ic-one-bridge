@@ -1,7 +1,7 @@
 <script lang="ts">
   import ArrowDownSLine from '$lib/icons/arrow-down-s-line.svelte'
   import type { Chain } from '$lib/types/bridge'
-  import Dropdown from './Dropdown.svelte'
+  import Dropdown from '$lib/ui/Dropdown.svelte'
 
   let {
     disabled = false,

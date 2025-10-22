@@ -8,19 +8,23 @@ export type Chain = {
   averageFinalitySeconds: number
 }
 
+export type BridgingStatus = 'Accepted' | 'Pending' | 'Completed' | 'Error'
+
 export type BridgeLogInfo = {
   id: bigint
   user: string
   token: string
   from: string
   to: string
-  amount: number
-  fee: number
-  from_tx: string
-  to_tx?: string
-  to_addr?: string
-  created_at: number
-  finalized_at: number
-  status: 'pending' | 'success' | 'failed'
+  amount: string
+  fee: string
+  fromTx: string
+  fromTxUrl: string
+  toTx?: string
+  toTxUrl?: string
+  toAddr?: string
+  createdAt: number
+  finalizedAt: number
+  status: BridgingStatus
   error?: string
 }

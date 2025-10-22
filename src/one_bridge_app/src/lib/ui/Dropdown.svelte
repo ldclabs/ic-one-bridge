@@ -64,11 +64,14 @@
         const spaceAbove = triggerRect.top
 
         let top = 0
-        let left =
+        let left = Math.max(
+          16,
           triggerRect.left - (menuEl.offsetWidth - triggerRect.width) / 2
+        )
+        left = Math.min(left, window.innerWidth - menuEl.offsetWidth - 16)
 
         if (spaceBelow < menuHeight && spaceAbove > menuHeight) {
-          top = triggerRect.top - menuHeight - 8
+          top = Math.max(triggerRect.top - menuHeight - 8, 16)
         } else {
           top = triggerRect.bottom + 8
         }

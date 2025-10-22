@@ -24,6 +24,7 @@ class AuthStore {
     const authClient = await authClientPromise
     const identity = await loadIdentity(authClient)
     if (identity) {
+      identity.expiredHook = () => authStore.logout()
       dynAgent.setIdentity(identity)
       authStore.#identity = identity
     }
@@ -54,6 +55,7 @@ class AuthStore {
             authClient.getIdentity(),
             Date.now() + EXPIRATION_MS
           )
+          identity.expiredHook = () => this.logout()
           this.#identity = identity
           dynAgent.setIdentity(identity)
           resolve()
@@ -70,7 +72,7 @@ class AuthStore {
     })
   }
 
-  async logout(url: string) {
+  async logout(url?: string) {
     this.#identity = anonymousIdentity
     dynAgent.setIdentity(anonymousIdentity)
     const authClient = await authClientPromise

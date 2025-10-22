@@ -1,47 +1,99 @@
 <script lang="ts">
   import { BridgeCanisterAPI } from '$lib/canisters/bridge.svelte'
   import BridgeCard from '$lib/components/BridgeCard.svelte'
+  import BridgeLogs from '$lib/components/BridgeLogs.svelte'
+  import WalletCard from '$lib/components/WalletCard.svelte'
   import { BRIDGE_CANISTER_ID } from '$lib/constants'
   import ArrowRightUpLine from '$lib/icons/arrow-right-up-line.svelte'
   import GithubFill from '$lib/icons/github-fill.svelte'
+  import LogoutCircleRLine from '$lib/icons/logout-circle-r-line.svelte'
   import TwitterXLine from '$lib/icons/twitter-x-line.svelte'
   import { authStore } from '$lib/stores/auth.svelte'
   import { toastRun } from '$lib/stores/toast.svelte'
   import { type BridgeLogInfo } from '$lib/types/bridge'
-  import { onMount } from 'svelte'
+  import Spinner from '$lib/ui/Spinner.svelte'
+  import { onMount, tick } from 'svelte'
 
   const principal = $derived(authStore.identity.getPrincipal().toText())
   const isAuthenticated = $derived(authStore.identity.isAuthenticated)
 
-  let bridge = $state<BridgeCanisterAPI | null>(null)
+  let mainBridge = $state<BridgeCanisterAPI | null>(null)
   let recentLogs: BridgeLogInfo[] = $state([])
+  let myRecentLogs: BridgeLogInfo[] = $state([])
+  let isLoading = $state(false)
+  let isMyLoading = $state(false)
+  let activeTab: 'bridge' | 'wallet' = $state('bridge')
 
   function onSignIn() {
     return authStore.signIn()
   }
 
-  onMount(() => {
-    return toastRun(async (_signal) => {
-      if (bridge) return
-      const _bridge = await BridgeCanisterAPI.loadBridge(BRIDGE_CANISTER_ID)
-      // load sub-bridges in background
-      _bridge.loadSubBridges()
-      bridge = _bridge
-    }).abort
+  function fetchRecentLogs() {
+    if (!mainBridge || isLoading) return
+
+    isLoading = true
+    toastRun(async (_signal) => {
+      if (!mainBridge) return
+
+      const bridges = [mainBridge, ...(await mainBridge.loadSubBridges())]
+
+      const logs = await Promise.all(
+        bridges.map((b) => b.listFinalizedLogs(20))
+      ).then((logs) => logs.flat())
+      // 按时间降序排序
+      logs.sort((a, b) => Number(b.finalizedAt - a.finalizedAt))
+      recentLogs = logs.slice(0, 20)
+    }).finally(() => {
+      setTimeout(() => {
+        isLoading = false
+      }, 1000)
+    })
+  }
+
+  function fetchMyRecentLogs() {
+    if (!mainBridge || isMyLoading) return
+
+    isMyLoading = true
+    toastRun(async (_signal) => {
+      if (!mainBridge) return
+
+      const bridges = [mainBridge, ...(await mainBridge.loadSubBridges())]
+
+      const logs = await Promise.all(
+        bridges.map((b) => b.listMyFinalizedLogs(20))
+      ).then((logs) => logs.flat())
+      // 按时间降序排序
+      logs.sort((a, b) => Number(b.finalizedAt - a.finalizedAt))
+      myRecentLogs = logs.slice(0, 20)
+    }).finally(() => {
+      setTimeout(() => {
+        isMyLoading = false
+      }, 1000)
+    })
+  }
+
+  $effect(() => {
+    if (mainBridge && isAuthenticated) {
+      isLoading = false
+      tick().then(() => {
+        fetchMyRecentLogs()
+      })
+    } else {
+      myRecentLogs = []
+    }
   })
 
-  function formatTimeAgo(timestamp: number) {
-    const delta = Date.now() - new Date(timestamp).getTime()
-    const minutes = Math.max(Math.round(delta / (60 * 1000)), 1)
-    if (minutes > 60 * 24 * 36) {
-      const days = Math.round(minutes / (60 * 24))
-      return `${days} 天前`
-    } else if (minutes > 60) {
-      const hours = Math.round(minutes / 60)
-      return `${hours} 小时前`
-    }
-    return `${minutes} 分钟前`
-  }
+  onMount(() => {
+    return toastRun(async (_signal) => {
+      if (mainBridge) return
+
+      const bridge = await BridgeCanisterAPI.loadBridge(BRIDGE_CANISTER_ID)
+      // load sub-bridges in background
+      bridge.loadSubBridges()
+      mainBridge = bridge
+      fetchRecentLogs()
+    }).abort
+  })
 </script>
 
 <div class="min-h-screen bg-[var(--color-bg)] pb-24">
@@ -118,17 +170,94 @@
         </div>
 
         {#key principal + isAuthenticated}
-          <BridgeCard {isAuthenticated} {onSignIn} {bridge} />
+          <div class="relative" data-1p-ignore>
+            <div class="mx-6 -mb-[1px] flex items-center justify-between">
+              <div class="flex items-center">
+                <button
+                  class="rounded-t-xl px-6 py-2 transition-colors {activeTab ===
+                  'bridge'
+                    ? 'cursor-default bg-white/10 text-white'
+                    : 'text-white/60 hover:text-white/80'}"
+                  onclick={() => (activeTab = 'bridge')}
+                  disabled={activeTab === 'bridge'}
+                >
+                  Bridge
+                </button>
+                {#if isAuthenticated && mainBridge}
+                  <button
+                    class="rounded-t-xl px-6 py-2 transition-colors {activeTab ===
+                    'wallet'
+                      ? 'cursor-default bg-white/10 text-white'
+                      : 'text-white/60 hover:text-white/80'}"
+                    onclick={() => (activeTab = 'wallet')}
+                    disabled={activeTab === 'wallet'}
+                  >
+                    Wallet
+                  </button>
+                {/if}
+              </div>
+              {#if isAuthenticated}
+                <button
+                  title="Logout"
+                  class="-mr-6 rounded-t-xl p-2 text-white/60 transition-colors hover:text-white/80"
+                  onclick={() => {
+                    activeTab = 'bridge'
+                    authStore.logout()
+                  }}
+                >
+                  <span class="*:size-6"><LogoutCircleRLine /></span>
+                </button>
+              {/if}
+            </div>
+            <div class="relative">
+              <div class:hidden={activeTab !== 'bridge'}>
+                <BridgeCard {isAuthenticated} {onSignIn} {mainBridge} />
+              </div>
+              {#if isAuthenticated && mainBridge}
+                <div class:hidden={activeTab !== 'wallet'}>
+                  <WalletCard {mainBridge} />
+                </div>
+              {/if}
+            </div>
+          </div>
         {/key}
       </div>
     </div>
   </section>
 
-  <section
-    class="mx-auto w-full max-w-6xl px-6 pt-16 sm:px-10 {principal +
-      isAuthenticated}"
-  >
-    <div class="rounded-3xl border border-white/10 bg-[#0e1119] p-6 sm:p-10">
+  {#if isAuthenticated}
+    <section class="mx-auto w-full max-w-6xl px-6 pt-10 sm:px-10">
+      <div class="rounded-xl border border-white/10 bg-[#0e1119] p-6 sm:p-10">
+        <header
+          class="flex flex-col gap-2 pb-6 text-white sm:flex-row sm:items-end sm:justify-between"
+        >
+          <div>
+            <h2 class="text-2xl font-semibold">My bridge logs</h2>
+          </div>
+          <button
+            class="flex h-10 items-center rounded-xl bg-white/5 px-4 text-xs font-semibold text-white/70 transition hover:bg-white/20 hover:text-white"
+            type="button"
+            onclick={fetchMyRecentLogs}
+            disabled={isLoading || isMyLoading}
+          >
+            {#if isMyLoading}
+              <Spinner class="mr-3 -ml-1 size-5 text-white" />
+            {/if}
+            <span>Refresh logs</span>
+          </button>
+        </header>
+
+        <div
+          class="max-h-[800px] overflow-auto rounded-xl border border-white/5"
+        >
+          <BridgeLogs logs={myRecentLogs} />
+        </div>
+      </div>
+    </section>
+  {/if}
+
+  <section class="mx-auto w-full max-w-6xl px-6 pt-10 sm:px-10">
+    <div class="rounded-xl border border-white/10 bg-[#0e1119] p-6 sm:p-10">
       <header
         class="flex flex-col gap-2 pb-6 text-white sm:flex-row sm:items-end sm:justify-between"
       >
@@ -136,61 +265,20 @@
           <h2 class="text-2xl font-semibold">Bridge logs</h2>
         </div>
         <button
-          class="h-10 rounded-full border border-white/10 bg-white/5 px-4 text-xs font-semibold text-white/70 transition hover:border-[var(--color-accent)] hover:text-white"
+          class="flex h-10 items-center rounded-xl bg-white/5 px-4 text-xs font-semibold text-white/70 transition hover:bg-white/20 hover:text-white"
           type="button"
-          onclick={() => {}}
+          onclick={fetchRecentLogs}
+          disabled={isLoading || isMyLoading}
         >
-          Refresh logs
+          {#if isLoading}
+            <Spinner class="mr-3 -ml-1 size-5 text-white" />
+          {/if}
+          <span>Refresh logs</span>
         </button>
       </header>
 
-      <div class="overflow-hidden rounded-2xl border border-white/5">
-        <table
-          class="min-w-full divide-y divide-white/5 text-left text-sm text-white/70"
-        >
-          <thead
-            class="bg-white/5 text-xs tracking-[0.2em] text-white/40 uppercase"
-          >
-            <tr>
-              <th class="px-4 py-3">Bridge chain</th>
-              <th class="px-4 py-3">Token</th>
-              <th class="px-4 py-3">Amount</th>
-              <th class="px-4 py-3">Status</th>
-              <th class="px-4 py-3">Time</th>
-            </tr>
-          </thead>
-          <tbody class="divide-y divide-white/5">
-            {#each recentLogs as log}
-              <tr class="bg-white/0">
-                <td class="px-4 py-4 text-white">
-                  <div class="flex flex-col">
-                    <span class="font-semibold">
-                      {log.from} → {log.to}
-                    </span>
-                    <span class="text-xs text-white/40">{log.to_tx || ''}</span>
-                  </div>
-                </td>
-                <td class="px-4 py-4">{log.token}</td>
-                <td class="px-4 py-4">
-                  <div class="flex flex-col">
-                    <span class="font-semibold text-white">{log.amount}</span>
-                    <span class="text-xs text-white/40">
-                      Fee {log.fee}
-                    </span>
-                  </div>
-                </td>
-                <td class="px-4 py-4">
-                  <span
-                    class="rounded-full border border-[var(--color-accent)]/30 bg-[var(--color-accent)]/10 px-3 py-1 text-xs font-medium text-[var(--color-accent)] uppercase"
-                  >
-                    {log.status}
-                  </span>
-                </td>
-                <td class="px-4 py-4">{formatTimeAgo(log.finalized_at)}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
+      <div class="max-h-[800px] overflow-auto rounded-xl border border-white/5">
+        <BridgeLogs logs={recentLogs} />
       </div>
     </div>
   </section>

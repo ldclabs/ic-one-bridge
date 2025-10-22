@@ -10,9 +10,11 @@ import { AuthClient, IdbStorage } from '@dfinity/auth-client'
 import { DelegationChain } from '@dfinity/identity'
 import type { Principal } from '@dfinity/principal'
 
-export const EXPIRATION_MS = 1000 * 60 * 10 // 20 minutes
+export const EXPIRATION_MS = 1000 * 60 * 60 // 1 hour
 
 export class IdentityEx implements Identity {
+  expiredHook: (() => void) | null = null
+
   constructor(
     public readonly id: Identity,
     public readonly expiration: number, // in milliseconds
@@ -39,6 +41,7 @@ export class IdentityEx implements Identity {
 
   transformRequest(request: HttpAgentRequest): Promise<unknown> {
     if (this.isExpired) {
+      if (this.expiredHook) this.expiredHook()
       throw new Error('Identity expired, please sign in again')
     }
 
