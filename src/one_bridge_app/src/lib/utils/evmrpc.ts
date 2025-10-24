@@ -40,6 +40,14 @@ export class EvmRpc {
     return BigInt(rt)
   }
 
+  async gasFeeEstimation(gas: bigint = 54000n): Promise<bigint> {
+    const [gasPrice, maxPriorityFeePerGas] = await Promise.all([
+      this.gasPrice(),
+      this.maxPriorityFeePerGas()
+    ])
+    return gas * (gasPrice + maxPriorityFeePerGas)
+  }
+
   async blockNumber(): Promise<number> {
     const rt =
       (await jsonRPC<string>(this.#endpoint, 'eth_blockNumber', [])) || '0x0'

@@ -49,6 +49,7 @@
   let fromAddress = $state<string>('')
   let fromBalanceIcp = $state<bigint>(0n)
   let fromBalanceNative = $state<bigint>(0n)
+  let gasFee = $state<bigint>(0n)
   let nativeToken = $state<boolean>(false)
   let thirdAddress = $state<string>('')
   let confirmAddress = $state<boolean>(false)
@@ -133,8 +134,7 @@
     }
 
     if (nativeToken) {
-      const userBalance =
-        fromBalanceNative - (fromChain.name === 'ICP' ? 10000n : 0n)
+      const userBalance = fromBalanceNative - gasFee
       const amount = selectedBridge.parseNativeAmount(
         fromChain.name,
         fromAmount || 0
@@ -147,12 +147,12 @@
         )
         err = `Insufficient ${fromChain.name} balance, should be less than ${balance}`
       }
+
       return [amount, err]
     }
 
     const userBalance =
-      fromBalanceIcp -
-      (fromChain.name === 'ICP' ? selectedBridge.token.fee : 0n)
+      fromBalanceIcp - (fromChain.name === 'ICP' ? gasFee : 0n)
     const amount = selectedBridge.parseAmount(fromAmount || 0)
     let err = ''
     if (amount < selectedBridge.tokenDisplay.amount) {
@@ -161,6 +161,8 @@
       err = `Insufficient balance, should be less than ${selectedBridge.tokenDisplay.displayValue(
         userBalance
       )}`
+    } else if (fromChain.name !== 'ICP' && fromBalanceNative < gasFee) {
+      err = `Insufficient ${fromChain.name} balance to cover gas fee`
     }
 
     return [amount, err]
@@ -224,6 +226,7 @@
           fromBalanceNative = await icp.getICPBalanceOf(
             authStore.identity.getPrincipal()
           )
+          gasFee = nativeToken ? 10000n : selectedBridge.token!.fee
           break
         default:
           const evm = await selectedBridge.loadEVMTokenAPI(fromChain.name)
@@ -231,6 +234,7 @@
           const v = await evm.getErc20Balance(myEvmAddress)
           fromBalanceIcp = selectedBridge.toIcpAmount(fromChain.name, v)
           fromBalanceNative = await evm.getBalance(myEvmAddress)
+          gasFee = await evm.gasFeeEstimation()
       }
 
       isLoading = false
@@ -449,14 +453,14 @@
         bind:value={fromAmount}
         oninput={validateSendAmount}
         inputmode="decimal"
-        step="1.0"
         placeholder="0.0"
+        step="any"
         data-1p-ignore
         autocomplete="off"
         class="w-full flex-1 rounded-xl border border-white/10 bg-white/10 p-2 text-left font-mono text-xl leading-8 ring-0 transition-all duration-200 outline-none placeholder:text-gray-500 invalid:border-red-400 focus:bg-white/20 disabled:cursor-not-allowed"
       />
       {#if selectedBridge}
-        <div class="mt-1 flex items-center gap-4 text-sm text-white/60">
+        <div class="mt-1 flex items-center gap-2 text-sm text-white/60">
           <span
             >Your balance: {selectedBridge.displayAmount(fromBalanceIcp)}</span
           >
@@ -464,6 +468,12 @@
             >Native {fromChain?.name} balance: {selectedBridge.displayNativeAmount(
               fromChain?.name!,
               fromBalanceNative
+            )}</span
+          >
+          <span
+            >Gas fee: ~{selectedBridge.displayNativeAmount(
+              fromChain?.name!,
+              gasFee
             )}</span
           >
         </div>

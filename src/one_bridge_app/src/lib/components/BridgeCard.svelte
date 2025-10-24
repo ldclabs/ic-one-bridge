@@ -60,7 +60,9 @@
   let toChain = $state<Chain | null>(null)
   let fromAddress = $state<string>('')
   let fromBalanceIcp = $state<bigint>(0n)
+  let fromBalanceNative = $state<bigint>(0n)
   let bridgeBalanceIcp = $state<bigint>(0n)
+  let gasFee = $state<bigint>(0n)
   let toAddress = $state<string>('')
   let thirdAddress = $state<string>('')
   let confirmAddress = $state<boolean>(false)
@@ -174,8 +176,7 @@
     }
 
     const userBalance =
-      fromBalanceIcp -
-      (fromChain.name === 'ICP' ? selectedBridge.token.fee : 0n)
+      fromBalanceIcp - (fromChain.name === 'ICP' ? gasFee : 0n)
     const amount = selectedBridge.parseAmount(fromAmount || 0)
     let err = ''
     if (amount < selectedBridge.tokenDisplay.amount) {
@@ -186,6 +187,8 @@
       )}`
     } else if (amount >= bridgeBalanceIcp) {
       err = 'Bridge has insufficient balance'
+    } else if (fromChain.name !== 'ICP' && fromBalanceNative < gasFee) {
+      err = `Insufficient ${fromChain.name} balance to cover gas fee`
     }
 
     return [amount, err]
@@ -249,12 +252,15 @@
         case 'ICP':
           fromAddress = myIcpAddress
           fromBalanceIcp = await icp.balance()
+          gasFee = selectedBridge.token!.fee
           break
         default:
           const evm = await selectedBridge.loadEVMTokenAPI(fromChain.name)
           fromAddress = myEvmAddress
           const v = await evm.getErc20Balance(myEvmAddress)
           fromBalanceIcp = selectedBridge.toIcpAmount(fromChain.name, v)
+          fromBalanceNative = await evm.getBalance(myEvmAddress)
+          gasFee = await evm.gasFeeEstimation()
       }
 
       if (toChain) {
@@ -512,15 +518,15 @@
         bind:value={fromAmount}
         oninput={validateSendAmount}
         inputmode="decimal"
-        step="1.0"
         placeholder="0.0"
+        step="any"
         data-1p-ignore
         autocomplete="off"
         class="w-full flex-1 rounded-xl border border-white/10 bg-white/10 p-2 text-left font-mono text-xl leading-8 ring-0 transition-all duration-200 outline-none placeholder:text-gray-500 invalid:border-red-400 focus:bg-white/20 disabled:cursor-not-allowed"
       />
       {#if selectedBridge}
         {@const token_bridge_fee = selectedBridge.state?.token_bridge_fee || 0n}
-        <div class="mt-1 text-sm text-white/60">
+        <div class="mt-1 flex items-center gap-2 text-sm text-white/60">
           <span
             >Your balance: {selectedBridge.displayAmount(fromBalanceIcp)}</span
           >

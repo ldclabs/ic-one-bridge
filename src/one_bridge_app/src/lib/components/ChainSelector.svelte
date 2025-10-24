@@ -50,7 +50,7 @@
   {disabled}
   {trigger}
   {containerClass}
-  triggerClass="grid w-full grid-cols-[1fr_24px] rounded-xl p-2 duration-200 disabled:cursor-not-allowed disabled:bg-gray-500"
+  triggerClass="grid w-full grid-cols-[1fr_24px] rounded-xl p-2 duration-200 disabled:cursor-not-allowed disabled:opacity-50"
   menuClass="top-full z-20 mt-2 w-60 rounded-xl border border-white/20 bg-black shadow-lg"
 >
   <ul class="py-4">

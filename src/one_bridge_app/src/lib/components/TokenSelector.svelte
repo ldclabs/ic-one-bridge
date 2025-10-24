@@ -51,7 +51,7 @@
   {disabled}
   {trigger}
   {containerClass}
-  triggerClass="px-0 py-2 duration-200 overflow-hidden disabled:cursor-not-allowed disabled:bg-gray-500"
+  triggerClass="px-0 py-2 duration-200 overflow-hidden disabled:cursor-not-allowed disabled:opacity-50"
   menuClass="top-full mt-2 w-60 rounded-xl border border-white/20 bg-black shadow-lg"
 >
   <ul class="py-4">
@@ -61,7 +61,7 @@
         <button
           onclick={() => handleSelect(token)}
           disabled={isDisabled}
-          class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/80 hover:bg-white/20 hover:text-white disabled:cursor-not-allowed disabled:bg-gray-500"
+          class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/80 hover:bg-white/20 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
         >
           <img
             src={token.logo}
