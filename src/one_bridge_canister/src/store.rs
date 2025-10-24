@@ -98,6 +98,7 @@ pub struct StateInfo {
     pub total_bridge_count: u64,
     pub sub_bridges: BTreeSet<Principal>,
     pub error_rounds: u64,
+    pub governance_canister: Option<Principal>,
 }
 
 impl From<&State> for StateInfo {
@@ -136,6 +137,7 @@ impl From<&State> for StateInfo {
             total_bridge_count: 0,
             sub_bridges: s.sub_bridges.clone(),
             error_rounds: s.error_rounds,
+            governance_canister: s.governance_canister,
         }
     }
 }

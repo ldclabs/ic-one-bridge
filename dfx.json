@@ -13,7 +13,7 @@
     "one_bridge_app": {
       "dependencies": [],
       "build": [
-        "echo 'Disable dfx build for ic_panda_frontend because some issue, you should run npm build manually'"
+        "echo 'Disable dfx build for one_bridge_app because some issue, you should run npm build manually'"
       ],
       "source": [
         "src/one_bridge_app/build"

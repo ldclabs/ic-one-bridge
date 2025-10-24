@@ -58,6 +58,7 @@ export const idlFactory = ({ IDL }) => {
     'total_collected_fees' : IDL.Nat,
     'min_threshold_to_bridge' : IDL.Nat,
     'token_symbol' : IDL.Text,
+    'governance_canister' : IDL.Opt(IDL.Principal),
     'icp_address' : IDL.Principal,
     'total_bridge_count' : IDL.Nat64,
     'evm_token_contracts' : IDL.Vec(

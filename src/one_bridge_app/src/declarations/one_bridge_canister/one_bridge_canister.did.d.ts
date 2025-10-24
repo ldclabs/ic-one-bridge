@@ -56,6 +56,7 @@ export interface StateInfo {
   'total_collected_fees' : bigint,
   'min_threshold_to_bridge' : bigint,
   'token_symbol' : string,
+  'governance_canister' : [] | [Principal],
   'icp_address' : Principal,
   'total_bridge_count' : bigint,
   'evm_token_contracts' : Array<[string, [string, number, bigint]]>,

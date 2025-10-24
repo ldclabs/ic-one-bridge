@@ -45,6 +45,7 @@ type StateInfo = record {
   total_collected_fees : nat;
   min_threshold_to_bridge : nat;
   token_symbol : text;
+  governance_canister : opt principal;
   icp_address : principal;
   total_bridge_count : nat64;
   evm_token_contracts : vec record { text; record { text; nat8; nat64 } };
