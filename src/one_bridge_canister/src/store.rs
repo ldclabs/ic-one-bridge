@@ -40,7 +40,7 @@ type Memory = VirtualMemory<DefaultMemoryImpl>;
 
 const MAX_ERROR_ROUNDS: u64 = 42;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct State {
     pub key_name: String,
     pub icp_address: Principal,
@@ -609,23 +609,8 @@ pub mod state {
         })?;
 
         let from_tx = match &from {
-            BridgeTarget::Icp => {
-                from_icp(
-                    token_ledger,
-                    user,
-                    icp_amount.saturating_add(token_bridge_fee),
-                )
-                .await?
-            }
-            BridgeTarget::Evm(chain) => {
-                from_evm(
-                    chain,
-                    user,
-                    icp_amount.saturating_add(token_bridge_fee),
-                    now_ms,
-                )
-                .await?
-            }
+            BridgeTarget::Icp => from_icp(token_ledger, user, icp_amount).await?,
+            BridgeTarget::Evm(chain) => from_evm(chain, user, icp_amount, now_ms).await?,
         };
 
         let delay = if from == BridgeTarget::Icp { 0 } else { 5 };
@@ -853,7 +838,12 @@ pub mod state {
                         } else {
                             task.user
                         };
-                        let to_tx = to_icp(token_ledger, to_addr, task.icp_amount).await?;
+                        let to_tx = to_icp(
+                            token_ledger,
+                            to_addr,
+                            task.icp_amount.saturating_sub(task.fee),
+                        )
+                        .await?;
                         task.to_tx = Some(to_tx);
                     }
                     (BridgeTarget::Evm(chain), None) => {
@@ -863,7 +853,13 @@ pub mod state {
                         } else {
                             state::evm_address(&task.user)
                         };
-                        let to_tx = to_evm(chain, to_addr, task.icp_amount, now_ms).await?;
+                        let to_tx = to_evm(
+                            chain,
+                            to_addr,
+                            task.icp_amount.saturating_sub(task.fee),
+                            now_ms,
+                        )
+                        .await?;
                         task.to_tx = Some(to_tx);
                     }
                     (BridgeTarget::Evm(chain), Some(BridgeTx::Evm(finalized, tx_hash)))

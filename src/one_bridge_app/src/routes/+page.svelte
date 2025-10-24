@@ -7,6 +7,7 @@
   import ArrowRightUpLine from '$lib/icons/arrow-right-up-line.svelte'
   import GithubFill from '$lib/icons/github-fill.svelte'
   import LogoutCircleRLine from '$lib/icons/logout-circle-r-line.svelte'
+  import RefreshLine from '$lib/icons/refresh-line.svelte'
   import TwitterXLine from '$lib/icons/twitter-x-line.svelte'
   import { authStore } from '$lib/stores/auth.svelte'
   import { toastRun } from '$lib/stores/toast.svelte'
@@ -199,13 +200,14 @@
               {#if isAuthenticated}
                 <button
                   title="Logout"
-                  class="-mr-6 rounded-t-xl p-2 text-white/60 transition-colors hover:text-white/80"
+                  class="-mr-4 flex items-center gap-2 rounded-t-xl p-2 text-white/60 transition-colors hover:text-white/80"
                   onclick={() => {
                     activeTab = 'bridge'
                     authStore.logout()
                   }}
                 >
-                  <span class="*:size-6"><LogoutCircleRLine /></span>
+                  <span class="*:size-5"><LogoutCircleRLine /></span>
+                  <span class="">Logout</span>
                 </button>
               {/if}
             </div>
@@ -241,7 +243,9 @@
             disabled={isLoading || isMyLoading}
           >
             {#if isMyLoading}
-              <Spinner class="mr-3 -ml-1 size-5 text-white" />
+              <Spinner class="mr-2 size-5 text-white" />
+            {:else}
+              <span class="mr-2 *:size-5"><RefreshLine /></span>
             {/if}
             <span>Refresh logs</span>
           </button>
@@ -271,7 +275,9 @@
           disabled={isLoading || isMyLoading}
         >
           {#if isLoading}
-            <Spinner class="mr-3 -ml-1 size-5 text-white" />
+            <Spinner class="mr-2 size-5 text-white" />
+          {:else}
+            <span class="mr-2 *:size-5"><RefreshLine /></span>
           {/if}
           <span>Refresh logs</span>
         </button>

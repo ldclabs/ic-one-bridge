@@ -70,6 +70,24 @@ export class BridgeCanisterAPI {
     return this.#tokenDisplay
   }
 
+  getTokenUrl(chain: string): [string, string] {
+    if (!this.#state) return ['', '']
+    if (chain === 'ICP') {
+      const token = this.#state.token_ledger.toText()
+      return [token, `https://dashboard.internetcomputer.org/canister/${token}`]
+    }
+    const contract = this.#state.evm_token_contracts.find(
+      ([name, _]) => name === chain
+    )?.[1][0]
+    if (!contract) return ['', '']
+    switch (chain) {
+      case 'BNB':
+        return [contract, `https://bscscan.com/token/${contract}`]
+      default:
+        return ['', '']
+    }
+  }
+
   toIcpAmount(chain: string, evmBalance: bigint): bigint {
     if (!this.#state) return evmBalance
     const evmDecimals = this.#state.evm_token_contracts.find(
@@ -372,7 +390,7 @@ export class BridgingProgress {
     if (this.#log.error.length > 0) {
       return `${this.#log.error[0]}`
     }
-    if (this.#log.to_tx.length > 0) {
+    if (isFinalized(this.#log.from_tx)) {
       return `waiting for confirmation on ${getChainName(this.#log.to)}`
     }
     return `waiting for confirmation on ${getChainName(this.#log.from)}`

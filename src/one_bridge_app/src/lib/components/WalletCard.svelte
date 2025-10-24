@@ -5,6 +5,7 @@
     TransferingProgress
   } from '$lib/canisters/bridge.svelte'
   import ArrowRightUpLine from '$lib/icons/arrow-right-up-line.svelte'
+  import RefreshLine from '$lib/icons/refresh-line.svelte'
   import { authStore } from '$lib/stores/auth.svelte'
   import { toastRun } from '$lib/stores/toast.svelte'
   import type { Chain } from '$lib/types/bridge'
@@ -15,6 +16,7 @@
   } from '$lib/utils/helper'
   import { type TokenInfo } from '$lib/utils/token'
   import { tick } from 'svelte'
+  import Spinner from '../ui/Spinner.svelte'
   import TextClipboardButton from '../ui/TextClipboardButton.svelte'
   import NetworkSelector from './ChainSelector.svelte'
   import PrimaryButton from './PrimaryButton.svelte'
@@ -186,7 +188,7 @@
     }
   }
 
-  async function refreshMyTokenInfo() {
+  async function refreshMyTokenInfo(all: boolean = false) {
     await tick()
 
     if (
@@ -202,6 +204,18 @@
 
     try {
       isLoading = true
+
+      if (all) {
+        await mainBridge.refreshState()
+        if (selectedBridge !== mainBridge) {
+          await selectedBridge.refreshState()
+        }
+
+        const subBridges = await mainBridge.loadSubBridges()
+        bridges = [mainBridge, ...subBridges]
+        supportTokens = bridges.map((b) => b.token!)
+      }
+
       const icp = await selectedBridge.loadICPTokenAPI()
       switch (fromChain.name) {
         case 'ICP':
@@ -231,6 +245,7 @@
     nativeToken = false
     if (bridge) {
       selectedBridge = bridge
+      refreshMyTokenInfo()
     }
   }
 
@@ -296,6 +311,9 @@
         }
 
         refreshMyTokenInfo()
+        setTimeout(() => {
+          refreshMyTokenInfo()
+        }, 5000)
       } catch (err) {
         isTransfering = false
         throw err
@@ -308,19 +326,37 @@
   class="space-y-6 rounded-xl border border-white/10 bg-[#131721]/80 p-6 pb-10 text-white/90 shadow-2xl backdrop-blur"
 >
   {#key bridgeCanister}
+    <button
+      title="Refresh state"
+      class="absolute top-2 right-4 rounded-full bg-white/10 p-1 text-white/60 hover:bg-white/20 hover:text-white/80"
+      onclick={() => refreshMyTokenInfo(true)}
+      disabled={isLoading}
+    >
+      {#if isLoading}
+        <Spinner class="size-5 text-white" />
+      {:else}
+        <span class=" *:size-5"><RefreshLine /></span>
+      {/if}
+    </button>
     {#if myIcpAddress && myEvmAddress}
-      <div class="mb-3 flex flex-col gap-1 text-sm text-white/90">
+      <div class="mb-3 flex flex-col gap-1 text-sm text-white/80">
         <p class="mb-1 text-white/60">Your address</p>
         <p class="flex items-center gap-1">
           {#key myIcpAddress}
             <span>ICP: {pruneAddress(myIcpAddress, true)}</span>
-            <TextClipboardButton value={myIcpAddress} class="*:size-5" />
+            <TextClipboardButton
+              value={myIcpAddress}
+              class="text-white/60 *:size-5 hover:text-white/80"
+            />
           {/key}
         </p>
         <p class="flex items-center gap-1">
           {#key myEvmAddress}
             <span>EVM: {pruneAddress(myEvmAddress, true)}</span>
-            <TextClipboardButton value={myEvmAddress} class="*:size-5" />
+            <TextClipboardButton
+              value={myEvmAddress}
+              class="text-white/60 *:size-5 hover:text-white/80"
+            />
           {/key}
         </p>
       </div>
@@ -337,14 +373,15 @@
           {onSelectToken}
           tokens={supportTokens}
         />
-        {#if selectedToken}
+        {#if selectedBridge}
           <a
             class="flex items-center gap-1 text-sm font-medium text-white/60"
             title="View token ledger canister"
-            href="https://dashboard.internetcomputer.org/canister/{selectedToken.canisterId}"
+            href="https://dashboard.internetcomputer.org/canister/{selectedBridge.canisterId.toText()}"
             target="_blank"
           >
-            <span>{pruneCanister(selectedToken.canisterId)}</span>
+            <span>Bridge</span>
+            <span>{pruneCanister(selectedBridge.canisterId.toText())}</span>
             <span class="*:size-4"><ArrowRightUpLine /></span>
           </a>
         {/if}
@@ -354,7 +391,26 @@
     <div class="grid grid-cols-[1fr_1fr] items-center justify-center gap-4">
       <!-- From Section -->
       <div class="">
-        <p class="mb-1 text-sm text-white/60">Chain</p>
+        <p class="mb-1 flex items-center gap-2 text-sm text-white/60">
+          <span>Chain</span>
+          {#if selectedBridge && fromChain && !nativeToken}
+            {@const [token, tokenUrl] = selectedBridge.getTokenUrl(
+              fromChain.name
+            )}
+            {#if token && tokenUrl}
+              <a
+                class="flex items-center gap-1 text-sm font-medium text-white/60"
+                title="View {token} info"
+                href={tokenUrl}
+                target="_blank"
+              >
+                <span>Token</span>
+                <span>{pruneCanister(token, false)}</span>
+                <span class="*:size-4"><ArrowRightUpLine /></span>
+              </a>
+            {/if}
+          {/if}
+        </p>
         <NetworkSelector
           disabled={isLoading || isTransfering}
           selectedChain={fromChain}
@@ -373,7 +429,7 @@
             name="nativeToken"
             disabled={isLoading || isTransfering}
             bind:checked={nativeToken}
-            class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0"
+            class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0 disabled:cursor-not-allowed"
           />Native Token</label
         >
       </div>
@@ -397,7 +453,7 @@
         placeholder="0.0"
         data-1p-ignore
         autocomplete="off"
-        class="w-full flex-1 rounded-xl border border-white/10 bg-white/10 p-2 text-left font-mono text-xl leading-8 ring-0 transition-all duration-200 outline-none placeholder:text-gray-500 invalid:border-red-400 focus:bg-white/20"
+        class="w-full flex-1 rounded-xl border border-white/10 bg-white/10 p-2 text-left font-mono text-xl leading-8 ring-0 transition-all duration-200 outline-none placeholder:text-gray-500 invalid:border-red-400 focus:bg-white/20 disabled:cursor-not-allowed"
       />
       {#if selectedBridge}
         <div class="mt-1 flex items-center gap-4 text-sm text-white/60">
@@ -427,7 +483,7 @@
         placeholder={'0x...'}
         data-1p-ignore
         autocomplete="off"
-        class="mb-1 w-full min-w-0 flex-1 rounded-xl border border-white/10 bg-white/10 p-2 text-left leading-8 ring-0 transition-all duration-200 outline-none placeholder:text-gray-500 invalid:border-red-400 focus:bg-white/20"
+        class="mb-1 w-full min-w-0 flex-1 rounded-xl border border-white/10 bg-white/10 p-2 text-left leading-8 ring-0 transition-all duration-200 outline-none placeholder:text-gray-500 invalid:border-red-400 focus:bg-white/20 disabled:cursor-not-allowed"
       />
       <label
         class="flex items-center text-sm font-medium text-white/60 rtl:text-right"
@@ -436,7 +492,7 @@
           name="confirmAddress"
           disabled={isLoading || isTransfering}
           bind:checked={confirmAddress}
-          class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0"
+          class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0 disabled:cursor-not-allowed"
         />
         I confirmed the address is correct and not an exchange or contract address.
         Any tokens sent to an incorrect address will be unrecoverable.</label

@@ -1,8 +1,8 @@
 import { Principal } from '@dfinity/principal'
 
-export function pruneCanister(canisterId: string) {
-  if (window.innerWidth >= 640) return canisterId
-  return canisterId.slice(0, 8) + '...' + canisterId.slice(-8)
+export function pruneCanister(canisterId: string, long?: boolean) {
+  if (long ?? window.innerWidth >= 640) return canisterId
+  return canisterId.slice(0, 7) + '...' + canisterId.slice(-5)
 }
 
 export function pruneAddress(id: string, long?: boolean): string {
