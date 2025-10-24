@@ -1,5 +1,6 @@
 <script lang="ts">
   import ArrowDownSLine from '$lib/icons/arrow-down-s-line.svelte'
+  import ArrowRightUpLine from '$lib/icons/arrow-right-up-line.svelte'
   import Dropdown from '$lib/ui/Dropdown.svelte'
   import type { TokenInfo } from '$lib/utils/token'
 
@@ -77,4 +78,15 @@
       </li>
     {/each}
   </ul>
+  <div class="mb-6">
+    <a
+      type="button"
+      class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/80 hover:bg-white/20 hover:text-white"
+      href="https://github.com/ldclabs/ic-one-bridge/blob/main/token_listing.md"
+      target="_blank"
+    >
+      <span>Token Listing</span>
+      <span class="*:size-4"><ArrowRightUpLine /></span>
+    </a>
+  </div>
 </Dropdown>
