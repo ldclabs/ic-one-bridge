@@ -47,6 +47,7 @@
     'BNB'
 
   let myIcpAddress = $state<string>('')
+  let mySolAddress = $state<string>('')
   let myEvmAddress = $state<string>('')
   let bridges = $state<BridgeCanisterAPI[]>([])
   let selectedBridge = $state<BridgeCanisterAPI | null>(null)
@@ -87,12 +88,16 @@
 
     if (isAuthenticated) {
       myIcpAddress = authStore.identity.getPrincipal().toText()
-      mainBridge.myEvmAddress().then((addr) => {
-        myEvmAddress = addr
-        refreshMyTokenInfo()
-      })
+      Promise.all([mainBridge.mySvmAddress(), mainBridge.myEvmAddress()]).then(
+        ([svmAddr, evmAddr]) => {
+          mySolAddress = svmAddr
+          myEvmAddress = evmAddr
+          refreshMyTokenInfo()
+        }
+      )
     } else {
       myIcpAddress = ''
+      mySolAddress = ''
       myEvmAddress = ''
     }
   })
@@ -225,6 +230,7 @@
       !fromChain ||
       !isAuthenticated ||
       !myIcpAddress ||
+      !mySolAddress ||
       !myEvmAddress
     ) {
       fromAddress = ''
@@ -254,11 +260,19 @@
           fromBalanceIcp = await icp.balance()
           gasFee = selectedBridge.token!.fee
           break
+        case 'SOL':
+          fromAddress = mySolAddress
+          const svm = await selectedBridge.loadSvmTokenAPI()
+          const splBalance = await svm!.getSplBalance(mySolAddress)
+          fromBalanceIcp = selectedBridge.svmToIcpAmount(splBalance)
+          fromBalanceNative = splBalance
+          gasFee = 0n
+          break
         default:
           const evm = await selectedBridge.loadEVMTokenAPI(fromChain.name)
           fromAddress = myEvmAddress
           const v = await evm.getErc20Balance(myEvmAddress)
-          fromBalanceIcp = selectedBridge.toIcpAmount(fromChain.name, v)
+          fromBalanceIcp = selectedBridge.evmToIcpAmount(fromChain.name, v)
           fromBalanceNative = await evm.getBalance(myEvmAddress)
           gasFee = await evm.gasFeeEstimation()
       }
@@ -269,13 +283,21 @@
             toAddress = myIcpAddress
             bridgeBalanceIcp = await icp.getBalanceOf(selectedBridge.canisterId)
             break
+          case 'SOL':
+            toAddress = mySolAddress
+            const svm = await selectedBridge.loadSvmTokenAPI()
+            const splBalance = await svm!.getSplBalance(
+              selectedBridge.state?.svm_address!
+            )
+            bridgeBalanceIcp = selectedBridge.svmToIcpAmount(splBalance)
+            break
           default:
             toAddress = myEvmAddress
             const evm = await selectedBridge.loadEVMTokenAPI(toChain.name)
             const v = await evm.getErc20Balance(
               selectedBridge.state?.evm_address!
             )
-            bridgeBalanceIcp = selectedBridge.toIcpAmount(toChain.name, v)
+            bridgeBalanceIcp = selectedBridge.evmToIcpAmount(toChain.name, v)
         }
       }
       isLoading = false
@@ -304,6 +326,14 @@
     fromChain = chain
     if (toChain?.name === chain.name) {
       toChain = supportChains.find((c) => c.name !== chain.name) || null
+    }
+    await refreshMyTokenInfo()
+  }
+
+  async function onSelectToChain(chain: Chain) {
+    toChain = chain
+    if (fromChain?.name === chain.name) {
+      fromChain = supportChains.find((c) => c.name !== chain.name) || null
     }
     await refreshMyTokenInfo()
   }
@@ -388,6 +418,15 @@
             <span>ICP: {pruneAddress(myIcpAddress, true)}</span>
             <TextClipboardButton
               value={myIcpAddress}
+              class="text-white/60 *:size-5 hover:text-white/80"
+            />
+          {/key}
+        </p>
+        <p class="flex items-center gap-1">
+          {#key mySolAddress}
+            <span>SOL: {pruneAddress(mySolAddress, true)}</span>
+            <TextClipboardButton
+              value={mySolAddress}
               class="text-white/60 *:size-5 hover:text-white/80"
             />
           {/key}
@@ -497,7 +536,7 @@
           disabled={isLoading || isBridging}
           selectedChain={toChain}
           disabledChainName={fromChain?.name ?? ''}
-          onSelectChain={(chain) => (toChain = chain)}
+          onSelectChain={onSelectToChain}
           chains={supportChains}
           containerClass="rounded-xl border border-white/40 shrink-0"
         />

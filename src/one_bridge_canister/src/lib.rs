@@ -10,7 +10,10 @@ mod ecdsa;
 mod evm;
 mod helper;
 mod outcall;
+mod schnorr;
 mod store;
+mod svm;
+mod types;
 
 use api_init::CanisterArgs;
 

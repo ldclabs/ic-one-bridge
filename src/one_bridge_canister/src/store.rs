@@ -28,12 +28,17 @@ use std::{
 };
 
 use crate::{
-    ecdsa::{
-        PublicKeyOutput, cost_sign_with_ecdsa, derive_public_key, ecdsa_public_key, sign_with_ecdsa,
-    },
+    ecdsa::{cost_sign_with_ecdsa, derive_public_key, ecdsa_public_key, sign_with_ecdsa},
     evm::{EvmClient, encode_erc20_transfer},
     helper::{call, convert_amount, format_error},
     outcall::DefaultHttpOutcall,
+    schnorr::{derive_schnorr_public_key, schnorr_public_key, sign_with_schnorr},
+    svm::{
+        Message, Pubkey, Signature as SvmSignature, SignatureStatus, SvmClient, Transaction,
+        create_associated_token_account_idempotent, get_associated_token_address, instruction,
+        transfer_checked_instruction,
+    },
+    types::PublicKeyOutput,
 };
 
 type Memory = VirtualMemory<DefaultMemoryImpl>;
@@ -45,6 +50,8 @@ pub struct State {
     pub key_name: String,
     pub icp_address: Principal,
     pub evm_address: Address,
+    #[serde(default)]
+    pub svm_address: Pubkey,
     pub token_name: String,
     pub token_symbol: String,
     pub token_decimals: u8,
@@ -59,7 +66,14 @@ pub struct State {
     pub evm_latest_gas: HashMap<String, (u64, u128, u128)>,
     // chain_name => (max_confirmations, [provider_url])
     pub evm_providers: HashMap<String, (u64, Vec<String>)>,
+    // (token_address, decimals, token_program)
+    #[serde(default)]
+    pub svm_token_address: (Pubkey, u8, Pubkey),
+    #[serde(default)]
+    pub svm_providers: Vec<String>,
     pub ecdsa_public_key: PublicKeyOutput,
+    #[serde(default)]
+    pub ed25519_public_key: PublicKeyOutput,
     pub governance_canister: Option<Principal>,
     pub pending: VecDeque<BridgeLog>,
     // (round, running)
@@ -81,6 +95,7 @@ pub struct StateInfo {
     pub key_name: String,
     pub icp_address: Principal,
     pub evm_address: String,
+    pub svm_address: String,
     pub token_name: String,
     pub token_symbol: String,
     pub token_decimals: u8,
@@ -91,6 +106,8 @@ pub struct StateInfo {
     pub evm_token_contracts: HashMap<String, (String, u8, u64)>,
     pub evm_latest_gas: HashMap<String, (u64, u128, u128)>,
     pub evm_providers: HashMap<String, (u64, Vec<String>)>,
+    pub svm_token_address: (String, u8, String),
+    pub svm_providers: Vec<String>,
     pub finalize_bridging_round: (u64, bool),
     pub total_bridged_tokens: u128,
     pub total_collected_fees: u128,
@@ -107,6 +124,7 @@ impl From<&State> for StateInfo {
             key_name: s.key_name.clone(),
             icp_address: s.icp_address,
             evm_address: s.evm_address.to_string(),
+            svm_address: s.svm_address.to_string(),
             token_name: s.token_name.clone(),
             token_symbol: s.token_symbol.clone(),
             token_decimals: s.token_decimals,
@@ -130,6 +148,12 @@ impl From<&State> for StateInfo {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            svm_token_address: (
+                s.svm_token_address.0.to_string(),
+                s.svm_token_address.1,
+                s.svm_token_address.2.to_string(),
+            ),
+            svm_providers: s.svm_providers.clone(),
             finalize_bridging_round: s.finalize_bridging_round,
             total_bridged_tokens: s.total_bridged_tokens,
             total_collected_fees: s.total_collected_fees,
@@ -148,6 +172,7 @@ impl State {
             key_name: "dfx_test_key".to_string(),
             icp_address: ic_cdk::api::canister_self(),
             evm_address: [0u8; 20].into(),
+            svm_address: Pubkey::default(), // 11111111111111111111111111111111
             token_name: "ICPanda".to_string(),
             token_symbol: "PANDA".to_string(),
             token_decimals: 8,
@@ -158,10 +183,10 @@ impl State {
             evm_token_contracts: HashMap::new(),
             evm_providers: HashMap::new(),
             evm_latest_gas: HashMap::new(),
-            ecdsa_public_key: PublicKeyOutput {
-                public_key: vec![].into(),
-                chain_code: vec![].into(),
-            },
+            svm_token_address: (Pubkey::default(), 0, Pubkey::default()),
+            svm_providers: Vec::new(),
+            ecdsa_public_key: PublicKeyOutput::default(),
+            ed25519_public_key: PublicKeyOutput::default(),
             governance_canister: None,
             pending: VecDeque::new(),
             finalize_bridging_round: (0, false),
@@ -177,6 +202,7 @@ impl State {
 #[derive(Clone, CandidType, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum BridgeTarget {
     Icp,
+    Sol,
     Evm(String), // chain_name
 }
 
@@ -184,6 +210,7 @@ pub enum BridgeTarget {
 pub enum BridgeTx {
     Icp(bool, u64),           // (finalized, block_height)
     Evm(bool, ByteArray<32>), // (finalized, tx_hash)
+    Sol(bool, ByteArray<64>), // (finalized, tx_signature)
 }
 
 impl cmp::PartialEq for BridgeTx {
@@ -191,6 +218,7 @@ impl cmp::PartialEq for BridgeTx {
         match (self, other) {
             (BridgeTx::Icp(_, tx1), BridgeTx::Icp(_, tx2)) => tx1 == tx2,
             (BridgeTx::Evm(_, tx1), BridgeTx::Evm(_, tx2)) => tx1 == tx2,
+            (BridgeTx::Sol(_, tx1), BridgeTx::Sol(_, tx2)) => tx1 == tx2,
             _ => false,
         }
     }
@@ -201,6 +229,7 @@ impl BridgeTx {
         match self {
             BridgeTx::Icp(finalized, _) => *finalized,
             BridgeTx::Evm(finalized, _) => *finalized,
+            BridgeTx::Sol(finalized, _) => *finalized,
         }
     }
 
@@ -208,6 +237,7 @@ impl BridgeTx {
         match (self, other) {
             (BridgeTx::Icp(_, tx1), BridgeTx::Icp(_, tx2)) => tx1 == tx2,
             (BridgeTx::Evm(_, tx1), BridgeTx::Evm(_, tx2)) => tx1 == tx2,
+            (BridgeTx::Sol(_, tx1), BridgeTx::Sol(_, tx2)) => tx1 == tx2,
             _ => false,
         }
     }
@@ -399,6 +429,8 @@ thread_local! {
 }
 
 pub mod state {
+    use std::str::FromStr;
+
     use super::*;
 
     use lazy_static::lazy_static;
@@ -417,18 +449,69 @@ pub mod state {
 
     pub async fn init_public_key() {
         let key_name = STATE.with_borrow(|r| r.key_name.clone());
-        match ecdsa_public_key(key_name, vec![]).await {
+        match ecdsa_public_key(key_name.clone(), vec![]).await {
             Ok(root_pk) => {
                 STATE.with_borrow_mut(|s| {
                     let self_pk =
                         derive_public_key(&root_pk, vec![s.icp_address.as_slice().to_vec()])
                             .expect("derive_public_key failed");
                     s.ecdsa_public_key = root_pk;
-                    s.evm_address = pubkey_bytes_to_address(&self_pk.public_key);
+                    s.evm_address = self_pk.to_evm_adress().unwrap();
                 });
             }
             Err(err) => {
                 ic_cdk::api::debug_print(format!("failed to retrieve ECDSA public key: {err}"));
+            }
+        }
+
+        match schnorr_public_key(key_name, vec![], None).await {
+            Ok(root_pk) => {
+                STATE.with_borrow_mut(|s| {
+                    let self_pk = derive_schnorr_public_key(
+                        &root_pk,
+                        vec![s.icp_address.as_slice().to_vec()],
+                        None,
+                    )
+                    .expect("derive_schnorr_public_key failed");
+
+                    s.ed25519_public_key = root_pk;
+                    s.svm_address = self_pk.to_svm_pubkey().unwrap();
+                });
+            }
+            Err(err) => {
+                ic_cdk::api::debug_print(format!("failed to retrieve Schnorr public key: {err}"));
+            }
+        }
+    }
+
+    pub async fn try_init_ed25519_public_key() {
+        let (key_name, has_ed25519_public_key) = STATE.with_borrow(|r| {
+            (
+                r.key_name.clone(),
+                !r.ed25519_public_key.public_key.is_empty(),
+            )
+        });
+
+        if has_ed25519_public_key {
+            return;
+        }
+
+        match schnorr_public_key(key_name, vec![], None).await {
+            Ok(root_pk) => {
+                STATE.with_borrow_mut(|s| {
+                    let self_pk = derive_schnorr_public_key(
+                        &root_pk,
+                        vec![s.icp_address.as_slice().to_vec()],
+                        None,
+                    )
+                    .expect("derive_schnorr_public_key failed");
+
+                    s.ed25519_public_key = root_pk;
+                    s.svm_address = self_pk.to_svm_pubkey().unwrap();
+                });
+            }
+            Err(err) => {
+                ic_cdk::api::debug_print(format!("failed to retrieve Schnorr public key: {err}"));
             }
         }
     }
@@ -486,7 +569,7 @@ pub mod state {
         STATE.with_borrow(|s| {
             let pk = derive_public_key(&s.ecdsa_public_key, vec![user.as_slice().to_vec()])
                 .expect("derive_public_key failed");
-            pubkey_bytes_to_address(&pk.public_key)
+            pk.to_evm_adress().unwrap()
         })
     }
 
@@ -530,6 +613,29 @@ pub mod state {
         sign_with_ecdsa(key_name, derivation_path, message_hash).await
     }
 
+    pub fn svm_address(user: &Principal) -> Pubkey {
+        STATE.with_borrow(|s| {
+            let pk = derive_schnorr_public_key(
+                &s.ed25519_public_key,
+                vec![user.as_slice().to_vec()],
+                None,
+            )
+            .expect("derive_schnorr_public_key failed");
+            pk.to_svm_pubkey().unwrap()
+        })
+    }
+
+    pub fn svm_client() -> SvmClient<DefaultHttpOutcall> {
+        STATE.with_borrow(|s| {
+            SvmClient::new(
+                s.svm_providers.clone(),
+                None,
+                None,
+                DefaultHttpOutcall::new(s.icp_address),
+            )
+        })
+    }
+
     pub async fn bridge(
         from_chain: String,
         to_chain: String,
@@ -565,6 +671,11 @@ pub mod state {
             }
             let from = if from_chain == "ICP" {
                 BridgeTarget::Icp
+            } else if from_chain == "SOL" {
+                if s.svm_token_address.0 == Pubkey::default() {
+                    return Err("SOL token is not supported".to_string());
+                }
+                BridgeTarget::Sol
             } else {
                 if !s.evm_token_contracts.contains_key(&from_chain) {
                     return Err(format!(
@@ -574,12 +685,22 @@ pub mod state {
                 }
                 BridgeTarget::Evm(from_chain)
             };
+
             let to = if to_chain == "ICP" {
                 if let Some(to_addr) = &to_addr {
                     let _ = Principal::from_text(to_addr)
                         .map_err(|_| format!("invalid ICP address {to_addr}"))?;
                 }
                 BridgeTarget::Icp
+            } else if to_chain == "SOL" {
+                if s.svm_token_address.0 == Pubkey::default() {
+                    return Err("SOL token is not supported".to_string());
+                }
+                if let Some(to_addr) = &to_addr {
+                    let _ = Pubkey::from_str(to_addr)
+                        .map_err(|_| format!("invalid SOL address: {}", to_addr))?;
+                }
+                BridgeTarget::Sol
             } else {
                 if !s.evm_token_contracts.contains_key(&to_chain) {
                     return Err(format!("to_chain {} not found or not supported", to_chain));
@@ -610,6 +731,7 @@ pub mod state {
 
         let from_tx = match &from {
             BridgeTarget::Icp => from_icp(token_ledger, user, icp_amount).await?,
+            BridgeTarget::Sol => from_svm(user, icp_amount, now_ms).await?,
             BridgeTarget::Evm(chain) => from_evm(chain, user, icp_amount, now_ms).await?,
         };
 
@@ -825,6 +947,14 @@ pub mod state {
                     }
                     from_finalized
                 }
+                (BridgeTarget::Sol, BridgeTx::Sol(finalized, tx_hash)) if !*finalized => {
+                    let status = check_sol_tx_finalized(tx_hash, now_ms).await?;
+                    let from_finalized = status.is_some_and(|f| f.is_finalized());
+                    if from_finalized {
+                        *finalized = true;
+                    }
+                    from_finalized
+                }
                 _ => true,
             };
 
@@ -869,6 +999,28 @@ pub mod state {
                         let to_finalized = check_evm_tx_finalized(chain, &tx_hash, now_ms).await?;
                         if to_finalized {
                             *finalized = true;
+                        }
+                    }
+                    (BridgeTarget::Sol, None) => {
+                        let to_addr = if let Some(addr) = &task.to_addr {
+                            Pubkey::from_str(addr)
+                                .map_err(|_| format!("SOL: invalid to_addr address: {}", addr))?
+                        } else {
+                            state::svm_address(&task.user)
+                        };
+                        let to_tx =
+                            to_svm(to_addr, task.icp_amount.saturating_sub(task.fee), now_ms)
+                                .await?;
+                        task.to_tx = Some(to_tx);
+                    }
+                    (BridgeTarget::Sol, Some(BridgeTx::Sol(finalized, tx_hash))) if !*finalized => {
+                        let status = check_sol_tx_finalized(tx_hash, now_ms).await?;
+                        let from_finalized = status.as_ref().is_some_and(|f| f.is_finalized());
+                        if from_finalized {
+                            *finalized = true;
+                        } else if status.as_ref().is_none_or(|f| f.is_error()) {
+                            task.to_tx = None; // reset to_tx to retry
+                            return Err("SOL: transaction failed".to_string());
                         }
                     }
                     _ => {}
@@ -1001,6 +1153,38 @@ pub mod state {
         Ok(BridgeTx::Evm(false, tx_hash.into()))
     }
 
+    async fn from_svm(user: Principal, icp_amount: u128, now_ms: u64) -> Result<BridgeTx, String> {
+        let to_addr = STATE.with_borrow(|s| s.svm_address);
+        let (client, signed_tx) = build_spl_transfer_tx(&user, &to_addr, icp_amount, now_ms)
+            .await
+            .map_err(|err| format!("SOL: {err}"))?;
+        let tx_hash: [u8; 64] = signed_tx.signatures[0].into();
+        let data = bincode::serialize(&signed_tx).map_err(|err| format!("SOL: {err}"))?;
+
+        let _ = client
+            .send_transaction(now_ms, data.into(), true)
+            .await
+            .map_err(|err| format!("SOL: {err}"))?;
+        Ok(BridgeTx::Sol(false, tx_hash.into()))
+    }
+
+    async fn to_svm(to_addr: Pubkey, icp_amount: u128, now_ms: u64) -> Result<BridgeTx, String> {
+        // let to_addr = evm_address(&user);
+        let (client, signed_tx) =
+            build_spl_transfer_tx(&ic_cdk::api::canister_self(), &to_addr, icp_amount, now_ms)
+                .await
+                .map_err(|err| format!("SOL: {err}"))?;
+
+        let tx_hash: [u8; 64] = signed_tx.signatures[0].into();
+        let data = bincode::serialize(&signed_tx).map_err(|err| format!("SOL: {err}"))?;
+
+        let _ = client
+            .send_transaction(now_ms, data.into(), true)
+            .await
+            .map_err(|err| format!("SOL: {err}"))?;
+        Ok(BridgeTx::Sol(false, tx_hash.into()))
+    }
+
     pub async fn build_erc20_transfer_tx(
         chain: &str,
         from: &Principal,
@@ -1040,7 +1224,7 @@ pub mod state {
             ))
         })?;
 
-        let from_addr = pubkey_bytes_to_address(&from_pk.public_key);
+        let from_addr = from_pk.to_evm_adress()?;
         if &from_addr == to_addr {
             return Err("from and to cannot be the same".to_string());
         }
@@ -1118,7 +1302,7 @@ pub mod state {
             ))
         })?;
 
-        let from_addr = pubkey_bytes_to_address(&from_pk.public_key);
+        let from_addr = from_pk.to_evm_adress()?;
         if &from_addr == to_addr {
             return Err("from and to cannot be the same".to_string());
         }
@@ -1191,14 +1375,124 @@ pub mod state {
             _ => Ok(false),
         }
     }
-}
 
-pub fn pubkey_bytes_to_address(pubkey_bytes: &[u8]) -> Address {
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
-    let key = k256::PublicKey::from_sec1_bytes(pubkey_bytes)
-        .expect("failed to parse the public key as SEC1");
-    let point = key.to_encoded_point(false);
-    Address::from_raw_public_key(&point.as_bytes()[1..])
+    async fn check_sol_tx_finalized(
+        tx_hash: &[u8; 64],
+        now_ms: u64,
+    ) -> Result<Option<SignatureStatus>, String> {
+        let sig = SvmSignature::from(*tx_hash);
+        let client = svm_client();
+        let status = client
+            .get_signature_statuses(now_ms, sig.to_string().as_str())
+            .await
+            .map_err(|err| format!("SOL: failed to get signature status, error: {}", err))?;
+        Ok(status)
+    }
+
+    pub async fn build_spl_transfer_tx(
+        from: &Principal,
+        to_addr: &Pubkey,
+        icp_amount: u128,
+        now_ms: u64,
+    ) -> Result<(SvmClient<DefaultHttpOutcall>, Transaction), String> {
+        let (key_name, from_addr, ixs) = STATE.with_borrow(|s| {
+            let (mint_pubkey, decimals, token_program_id) = s.svm_token_address;
+
+            let amount = convert_amount(icp_amount, s.token_decimals, decimals)?;
+            let amount: u64 = amount
+                .try_into()
+                .map_err(|_| format!("amount is too large: {}", amount))?;
+            let from_pk = derive_schnorr_public_key(
+                &s.ed25519_public_key,
+                vec![from.as_slice().to_vec()],
+                None,
+            )
+            .map_err(|e| format!("derive_schnorr_public_key failed: {e}"))?;
+            let from_addr = from_pk.to_svm_pubkey()?;
+            if &from_addr == to_addr {
+                return Err("from and to cannot be the same".to_string());
+            }
+
+            let from_pubkey =
+                get_associated_token_address(&from_addr, &mint_pubkey, &token_program_id);
+            let to_pubkey = get_associated_token_address(to_addr, &mint_pubkey, &token_program_id);
+            let ix0 = create_associated_token_account_idempotent(
+                &from_addr,
+                to_addr,
+                &mint_pubkey,
+                &token_program_id,
+            );
+            let ix = transfer_checked_instruction(
+                &token_program_id,
+                &from_pubkey,
+                &mint_pubkey,
+                &to_pubkey,
+                &from_addr,
+                &[],
+                amount,
+                decimals,
+            );
+
+            Ok::<_, String>((s.key_name.clone(), from_addr, vec![ix0, ix]))
+        })?;
+
+        let client = svm_client();
+        let block = client
+            .get_latest_blockhash(now_ms)
+            .await
+            .map_err(|err| format!("SOL: failed to get latest blockhash, error: {}", err))?;
+
+        let message = Message::new_with_blockhash(&ixs, Some(&from_addr), &block);
+        let msg = bincode::serialize(&message).map_err(|err| format!("SOL: {err}"))?;
+        let sig = sign_with_schnorr(key_name, vec![from.as_slice().to_vec()], msg, None).await?;
+        let signature: [u8; 64] = sig.try_into().map_err(|_| "invalid signature length")?;
+        let transaction = Transaction {
+            message,
+            signatures: vec![signature.into()],
+        };
+
+        Ok((client, transaction))
+    }
+
+    pub async fn build_sol_transfer_tx(
+        from: &Principal,
+        to_addr: &Pubkey,
+        sol_amount: u64,
+        now_ms: u64,
+    ) -> Result<(SvmClient<DefaultHttpOutcall>, Transaction), String> {
+        let (key_name, from_addr, ixs) = STATE.with_borrow(|s| {
+            let from_pk = derive_schnorr_public_key(
+                &s.ed25519_public_key,
+                vec![from.as_slice().to_vec()],
+                None,
+            )
+            .map_err(|_e| "derive_schnorr_public_key failed".to_string())?;
+            let from_addr = from_pk.to_svm_pubkey()?;
+            if &from_addr == to_addr {
+                return Err("from and to cannot be the same".to_string());
+            }
+
+            let ix = instruction::transfer(&from_addr, to_addr, sol_amount);
+            Ok::<_, String>((s.key_name.clone(), from_addr, vec![ix]))
+        })?;
+
+        let client = svm_client();
+        let block = client
+            .get_latest_blockhash(now_ms)
+            .await
+            .map_err(|err| format!("failed to get latest blockhash, error: {}", err))?;
+
+        let message = Message::new_with_blockhash(&ixs, Some(&from_addr), &block);
+        let msg = bincode::serialize(&message).map_err(|err| format!("SOL: {err}"))?;
+        let sig = sign_with_schnorr(key_name, vec![from.as_slice().to_vec()], msg, None).await?;
+        let signature: [u8; 64] = sig.try_into().map_err(|_| "invalid signature length")?;
+        let transaction = Transaction {
+            message,
+            signatures: vec![signature.into()],
+        };
+
+        Ok((client, transaction))
+    }
 }
 
 fn y_parity(prehash: &[u8], sig: &[u8], pubkey: &[u8]) -> Result<bool, String> {

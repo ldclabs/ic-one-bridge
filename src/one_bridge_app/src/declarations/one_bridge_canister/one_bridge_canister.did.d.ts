@@ -17,9 +17,11 @@ export interface BridgeLog {
   'finalized_at' : bigint,
 }
 export type BridgeTarget = { 'Evm' : string } |
-  { 'Icp' : null };
+  { 'Icp' : null } |
+  { 'Sol' : null };
 export type BridgeTx = { 'Evm' : [boolean, Uint8Array | number[]] } |
-  { 'Icp' : [boolean, bigint] };
+  { 'Icp' : [boolean, bigint] } |
+  { 'Sol' : [boolean, Uint8Array | number[]] };
 export type CanisterArgs = { 'Upgrade' : UpgradeArgs } |
   { 'Init' : InitArgs };
 export interface InitArgs {
@@ -52,6 +54,7 @@ export interface StateInfo {
   'error_rounds' : bigint,
   'evm_address' : string,
   'evm_latest_gas' : Array<[string, [bigint, bigint, bigint]]>,
+  'svm_address' : string,
   'finalize_bridging_round' : [bigint, boolean],
   'total_collected_fees' : bigint,
   'min_threshold_to_bridge' : bigint,
@@ -60,6 +63,8 @@ export interface StateInfo {
   'icp_address' : Principal,
   'total_bridge_count' : bigint,
   'evm_token_contracts' : Array<[string, [string, number, bigint]]>,
+  'svm_providers' : Array<string>,
+  'svm_token_address' : [string, number, string],
   'token_bridge_fee' : bigint,
   'key_name' : string,
   'total_bridged_tokens' : bigint,
@@ -82,12 +87,14 @@ export interface UpgradeArgs {
 export interface _SERVICE {
   'admin_add_bridges' : ActorMethod<[Array<Principal>], Result>,
   'admin_add_evm_contract' : ActorMethod<[string, bigint, string], Result>,
+  'admin_add_svm_contract' : ActorMethod<[string], Result>,
   'admin_collect_fees' : ActorMethod<[Principal, bigint], Result_1>,
   'admin_remove_bridges' : ActorMethod<[Array<Principal>], Result>,
   'admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
     Result
   >,
+  'admin_set_svm_providers' : ActorMethod<[Array<string>], Result>,
   'bridge' : ActorMethod<[string, string, bigint, [] | [string]], Result_1>,
   'erc20_transfer' : ActorMethod<[string, string, bigint], Result_2>,
   'erc20_transfer_tx' : ActorMethod<[string, string, bigint], Result_2>,
@@ -100,17 +107,22 @@ export interface _SERVICE {
   'my_finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_4>,
   'my_pending_logs' : ActorMethod<[], Result_4>,
   'pending_logs' : ActorMethod<[], Result_4>,
+  'sol_transfer_tx' : ActorMethod<[string, bigint], Result_2>,
+  'spl_transfer_tx' : ActorMethod<[string, bigint], Result_2>,
+  'svm_address' : ActorMethod<[[] | [Principal]], Result_2>,
   'validate_admin_add_bridges' : ActorMethod<[Array<Principal>], Result_2>,
   'validate_admin_add_evm_contract' : ActorMethod<
     [string, bigint, string],
     Result_2
   >,
+  'validate_admin_add_svm_contract' : ActorMethod<[string], Result_2>,
   'validate_admin_collect_fees' : ActorMethod<[Principal, bigint], Result_2>,
   'validate_admin_remove_bridges' : ActorMethod<[Array<Principal>], Result_2>,
   'validate_admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
     Result_2
   >,
+  'validate_admin_set_svm_providers' : ActorMethod<[Array<string>], Result_2>,
 }
 export declare const idlFactory: IDL.InterfaceFactory;
 export declare const init: (args: { IDL: typeof IDL }) => IDL.Type[];

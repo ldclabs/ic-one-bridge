@@ -12,10 +12,11 @@ type BridgeLog = record {
   icp_amount : nat;
   finalized_at : nat64;
 };
-type BridgeTarget = variant { Evm : text; Icp };
+type BridgeTarget = variant { Evm : text; Icp; Sol };
 type BridgeTx = variant {
   Evm : record { bool; blob };
   Icp : record { bool; nat64 };
+  Sol : record { bool; blob };
 };
 type CanisterArgs = variant { Upgrade : UpgradeArgs; Init : InitArgs };
 type InitArgs = record {
@@ -41,6 +42,7 @@ type StateInfo = record {
   error_rounds : nat64;
   evm_address : text;
   evm_latest_gas : vec record { text; record { nat64; nat; nat } };
+  svm_address : text;
   finalize_bridging_round : record { nat64; bool };
   total_collected_fees : nat;
   min_threshold_to_bridge : nat;
@@ -49,6 +51,8 @@ type StateInfo = record {
   icp_address : principal;
   total_bridge_count : nat64;
   evm_token_contracts : vec record { text; record { text; nat8; nat64 } };
+  svm_providers : vec text;
+  svm_token_address : record { text; nat8; text };
   token_bridge_fee : nat;
   key_name : text;
   total_bridged_tokens : nat;
@@ -71,9 +75,11 @@ type UpgradeArgs = record {
 service : (opt CanisterArgs) -> {
   admin_add_bridges : (vec principal) -> (Result);
   admin_add_evm_contract : (text, nat64, text) -> (Result);
+  admin_add_svm_contract : (text) -> (Result);
   admin_collect_fees : (principal, nat) -> (Result_1);
   admin_remove_bridges : (vec principal) -> (Result);
   admin_set_evm_providers : (text, nat64, vec text) -> (Result);
+  admin_set_svm_providers : (vec text) -> (Result);
   bridge : (text, text, nat, opt text) -> (Result_1);
   erc20_transfer : (text, text, nat) -> (Result_2);
   erc20_transfer_tx : (text, text, nat) -> (Result_2);
@@ -86,9 +92,14 @@ service : (opt CanisterArgs) -> {
   my_finalized_logs : (nat32, opt nat64) -> (Result_4) query;
   my_pending_logs : () -> (Result_4) query;
   pending_logs : () -> (Result_4) query;
+  sol_transfer_tx : (text, nat64) -> (Result_2);
+  spl_transfer_tx : (text, nat) -> (Result_2);
+  svm_address : (opt principal) -> (Result_2) query;
   validate_admin_add_bridges : (vec principal) -> (Result_2);
   validate_admin_add_evm_contract : (text, nat64, text) -> (Result_2);
+  validate_admin_add_svm_contract : (text) -> (Result_2);
   validate_admin_collect_fees : (principal, nat) -> (Result_2);
   validate_admin_remove_bridges : (vec principal) -> (Result_2);
   validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_2);
+  validate_admin_set_svm_providers : (vec text) -> (Result_2);
 }

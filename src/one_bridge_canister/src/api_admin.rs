@@ -6,6 +6,7 @@ use url::Url;
 use crate::{
     helper::{pretty_format, validate_principals},
     store,
+    svm::{Pubkey, TokenAccountType, get_token_account},
 };
 
 #[ic_cdk::update(guard = "is_controller")]
@@ -48,11 +49,10 @@ async fn admin_add_evm_contract(
     let address = check_admin_add_evm_contract(&chain_name, chain_id, &address)?;
     let cli = store::state::evm_client(&chain_name);
     let now_ms = ic_cdk::api::time() / 1_000_000;
-    let (cid, gas_price, max_priority_fee_per_gas, symbol, decimals) = futures::future::try_join5(
+    let (cid, gas_price, max_priority_fee_per_gas, decimals) = futures::future::try_join4(
         cli.chain_id(now_ms),
         cli.gas_price(now_ms),
         cli.max_priority_fee_per_gas(now_ms),
-        cli.erc20_symbol(now_ms, &address),
         cli.erc20_decimals(now_ms, &address),
     )
     .await?;
@@ -65,13 +65,6 @@ async fn admin_add_evm_contract(
     }
 
     store::state::with_mut(|s| {
-        if s.token_symbol != symbol {
-            return Err(format!(
-                "token_symbol mismatch, got {}, expected {}",
-                symbol, s.token_symbol
-            ));
-        }
-
         s.evm_token_contracts
             .insert(chain_name.clone(), (address, decimals, chain_id));
         s.evm_latest_gas
@@ -122,6 +115,46 @@ fn check_admin_add_evm_contract(
 }
 
 #[ic_cdk::update(guard = "is_controller")]
+async fn admin_add_svm_contract(address: String) -> Result<(), String> {
+    let addr = check_admin_add_svm_contract(&address)?;
+    let cli = store::state::svm_client();
+    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let account = cli.get_account_info(now_ms, &address).await?;
+    let account = account.ok_or_else(|| format!("account {address} does not exist"))?;
+    let token_program = Pubkey::try_from(account.owner.as_str())
+        .map_err(|err| format!("invalid token program address {}: {:?}", account.owner, err))?;
+    let account = get_token_account(account)?;
+    let decimals = match account {
+        TokenAccountType::Mint(mint) => mint.decimals,
+        _ => return Err(format!("account {address} is not a token mint account")),
+    };
+
+    store::state::with_mut(|s| {
+        s.svm_token_address = (addr, decimals, token_program);
+    });
+    Ok(())
+}
+
+#[ic_cdk::update]
+fn validate_admin_add_svm_contract(address: String) -> Result<String, String> {
+    check_admin_add_svm_contract(&address)?;
+    pretty_format(&(address,))
+}
+
+fn check_admin_add_svm_contract(address: &str) -> Result<Pubkey, String> {
+    let addr =
+        Pubkey::try_from(address).map_err(|err| format!("invalid address {address}: {err:?}"))?;
+
+    store::state::with(|s| {
+        if s.svm_token_address.0 != Pubkey::default() {
+            return Err("address already exists".to_string());
+        }
+        Ok(())
+    })?;
+    Ok(addr)
+}
+
+#[ic_cdk::update(guard = "is_controller")]
 fn admin_set_evm_providers(
     chain_name: String,
     max_confirmations: u64,
@@ -160,6 +193,32 @@ fn validate_admin_set_evm_providers(
         return Err("max_confirmations must be at least 2".to_string());
     }
     pretty_format(&(chain_name, max_confirmations, providers))
+}
+
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_set_svm_providers(providers: Vec<String>) -> Result<(), String> {
+    for url in &providers {
+        let v = Url::parse(url).map_err(|err| format!("invalid url {url}, error: {err}"))?;
+        if v.scheme() != "https" {
+            return Err(format!("url scheme must be https, got: {url}"));
+        }
+    }
+
+    store::state::with_mut(|s| {
+        s.svm_providers = providers;
+        Ok(())
+    })
+}
+
+#[ic_cdk::update]
+fn validate_admin_set_svm_providers(providers: Vec<String>) -> Result<String, String> {
+    for url in &providers {
+        let v = Url::parse(url).map_err(|err| format!("invalid url {url}, error: {err}"))?;
+        if v.scheme() != "https" {
+            return Err(format!("url scheme must be https, got: {url}"));
+        }
+    }
+    pretty_format(&(providers,))
 }
 
 #[ic_cdk::update(guard = "is_controller")]

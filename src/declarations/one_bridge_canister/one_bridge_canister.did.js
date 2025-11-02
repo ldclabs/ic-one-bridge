@@ -27,11 +27,16 @@ export const idlFactory = ({ IDL }) => {
   const BridgeTx = IDL.Variant({
     'Evm' : IDL.Tuple(IDL.Bool, IDL.Vec(IDL.Nat8)),
     'Icp' : IDL.Tuple(IDL.Bool, IDL.Nat64),
+    'Sol' : IDL.Tuple(IDL.Bool, IDL.Vec(IDL.Nat8)),
   });
   const Result_1 = IDL.Variant({ 'Ok' : BridgeTx, 'Err' : IDL.Text });
   const Result_2 = IDL.Variant({ 'Ok' : IDL.Text, 'Err' : IDL.Text });
   const Result_3 = IDL.Variant({ 'Ok' : IDL.Vec(IDL.Nat8), 'Err' : IDL.Text });
-  const BridgeTarget = IDL.Variant({ 'Evm' : IDL.Text, 'Icp' : IDL.Null });
+  const BridgeTarget = IDL.Variant({
+    'Evm' : IDL.Text,
+    'Icp' : IDL.Null,
+    'Sol' : IDL.Null,
+  });
   const BridgeLog = IDL.Record({
     'id' : IDL.Opt(IDL.Nat64),
     'to' : BridgeTarget,
@@ -54,6 +59,7 @@ export const idlFactory = ({ IDL }) => {
     'evm_latest_gas' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Nat64, IDL.Nat, IDL.Nat))
     ),
+    'svm_address' : IDL.Text,
     'finalize_bridging_round' : IDL.Tuple(IDL.Nat64, IDL.Bool),
     'total_collected_fees' : IDL.Nat,
     'min_threshold_to_bridge' : IDL.Nat,
@@ -64,6 +70,8 @@ export const idlFactory = ({ IDL }) => {
     'evm_token_contracts' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Text, IDL.Nat8, IDL.Nat64))
     ),
+    'svm_providers' : IDL.Vec(IDL.Text),
+    'svm_token_address' : IDL.Tuple(IDL.Text, IDL.Nat8, IDL.Text),
     'token_bridge_fee' : IDL.Nat,
     'key_name' : IDL.Text,
     'total_bridged_tokens' : IDL.Nat,
@@ -85,6 +93,7 @@ export const idlFactory = ({ IDL }) => {
         [Result],
         [],
       ),
+    'admin_add_svm_contract' : IDL.Func([IDL.Text], [Result], []),
     'admin_collect_fees' : IDL.Func([IDL.Principal, IDL.Nat], [Result_1], []),
     'admin_remove_bridges' : IDL.Func([IDL.Vec(IDL.Principal)], [Result], []),
     'admin_set_evm_providers' : IDL.Func(
@@ -92,6 +101,7 @@ export const idlFactory = ({ IDL }) => {
         [Result],
         [],
       ),
+    'admin_set_svm_providers' : IDL.Func([IDL.Vec(IDL.Text)], [Result], []),
     'bridge' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Opt(IDL.Text)],
         [Result_1],
@@ -120,6 +130,9 @@ export const idlFactory = ({ IDL }) => {
       ),
     'my_pending_logs' : IDL.Func([], [Result_4], ['query']),
     'pending_logs' : IDL.Func([], [Result_4], ['query']),
+    'sol_transfer_tx' : IDL.Func([IDL.Text, IDL.Nat64], [Result_2], []),
+    'spl_transfer_tx' : IDL.Func([IDL.Text, IDL.Nat], [Result_2], []),
+    'svm_address' : IDL.Func([IDL.Opt(IDL.Principal)], [Result_2], ['query']),
     'validate_admin_add_bridges' : IDL.Func(
         [IDL.Vec(IDL.Principal)],
         [Result_2],
@@ -130,6 +143,7 @@ export const idlFactory = ({ IDL }) => {
         [Result_2],
         [],
       ),
+    'validate_admin_add_svm_contract' : IDL.Func([IDL.Text], [Result_2], []),
     'validate_admin_collect_fees' : IDL.Func(
         [IDL.Principal, IDL.Nat],
         [Result_2],
@@ -142,6 +156,11 @@ export const idlFactory = ({ IDL }) => {
       ),
     'validate_admin_set_evm_providers' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Vec(IDL.Text)],
+        [Result_2],
+        [],
+      ),
+    'validate_admin_set_svm_providers' : IDL.Func(
+        [IDL.Vec(IDL.Text)],
         [Result_2],
         [],
       ),

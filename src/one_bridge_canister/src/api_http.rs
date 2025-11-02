@@ -1,6 +1,6 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use candid::CandidType;
-use ic_auth_types::{cbor_into_vec, ByteBufB64};
+use ic_auth_types::{ByteBufB64, cbor_into_vec};
 use ic_http_certification::{HeaderField, HttpRequest};
 use serde::{Deserialize, Serialize};
 use url::Url;

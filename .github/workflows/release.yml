@@ -11,9 +11,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build canisters
         run: |
+          mkdir -p out
+          rustup update --no-self-update stable
           rustup target add wasm32-unknown-unknown
           cargo install ic-wasm
-          mkdir out
           cargo build --target wasm32-unknown-unknown --release --locked -p one_bridge_canister
           for CAN in one_bridge_canister
           do

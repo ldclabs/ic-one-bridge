@@ -1,11 +1,15 @@
+use std::str::FromStr;
+
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes};
 use candid::Principal;
+use ic_auth_types::ByteBufB64;
 use serde_bytes::ByteBuf;
 
 use crate::{
     helper::{check_auth, msg_caller},
     store,
+    svm::Pubkey,
 };
 
 #[ic_cdk::query]
@@ -18,6 +22,14 @@ fn evm_address(user: Option<Principal>) -> Result<String, String> {
     let user = user.unwrap_or_else(ic_cdk::api::msg_caller);
     check_auth(&user)?;
     let addr = store::state::evm_address(&user);
+    Ok(addr.to_string())
+}
+
+#[ic_cdk::query]
+fn svm_address(user: Option<Principal>) -> Result<String, String> {
+    let user = user.unwrap_or_else(ic_cdk::api::msg_caller);
+    check_auth(&user)?;
+    let addr = store::state::svm_address(&user);
     Ok(addr.to_string())
 }
 
@@ -124,6 +136,30 @@ async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<
         store::state::build_evm_transfer_tx(&chain, &caller, &to_addr, evm_amount, now_ms).await?;
     let data = signed_tx.encoded_2718();
     Ok(Bytes::from(data).to_string())
+}
+
+#[ic_cdk::update]
+async fn spl_transfer_tx(to: String, icp_amount: u128) -> Result<String, String> {
+    let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
+    let caller = msg_caller()?;
+    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let (_, signed_tx) =
+        store::state::build_spl_transfer_tx(&caller, &to_addr, icp_amount, now_ms).await?;
+    let data = bincode::serialize(&signed_tx)
+        .map_err(|err| format!("failed to serialize signed tx: {}", err))?;
+    Ok(ByteBufB64::from(data).to_base64())
+}
+
+#[ic_cdk::update]
+async fn sol_transfer_tx(to: String, sol_amount: u64) -> Result<String, String> {
+    let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
+    let caller = msg_caller()?;
+    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let (_, signed_tx) =
+        store::state::build_sol_transfer_tx(&caller, &to_addr, sol_amount, now_ms).await?;
+    let data = bincode::serialize(&signed_tx)
+        .map_err(|err| format!("failed to serialize signed tx: {}", err))?;
+    Ok(ByteBufB64::from(data).to_base64())
 }
 
 #[ic_cdk::update]

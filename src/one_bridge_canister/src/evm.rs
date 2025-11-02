@@ -1,37 +1,22 @@
-use alloy_primitives::{Address, TxHash, U256, hex::FromHex};
+use alloy_primitives::{U256, hex::FromHex};
 use alloy_rpc_types_eth::TransactionReceipt;
 use ic_cdk::management_canister::{HttpHeader, HttpMethod, HttpRequestArgs};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::outcall::HttpOutcall;
+use crate::{
+    helper::APP_AGENT,
+    outcall::HttpOutcall,
+    types::{RPCRequest, RPCResponse},
+};
 
-pub static APP_AGENT: &str = concat!(
-    "Mozilla/5.0 ICP canister ",
-    env!("CARGO_PKG_NAME"),
-    "/",
-    env!("CARGO_PKG_VERSION"),
-);
+pub use alloy_primitives::{Address, TxHash};
 
 pub struct EvmClient<T: HttpOutcall> {
     pub providers: Vec<String>,
     pub max_confirmations: u64,
     pub api_token: Option<String>,
     outcall: T,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RPCRequest<'a> {
-    jsonrpc: &'a str,
-    method: &'a str,
-    params: &'a [Value],
-    id: u64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RPCResponse<T> {
-    result: Option<T>,
-    error: Option<Value>,
 }
 
 // https://ethereum.org/zh/developers/docs/apis/json-rpc/
@@ -166,6 +151,7 @@ impl<H: HttpOutcall> EvmClient<H> {
     //     decode_abi_string(&res)
     // }
 
+    #[allow(dead_code)]
     pub async fn erc20_symbol(&self, now_ms: u64, contract: &Address) -> Result<String, String> {
         let res = self
             .call_contract(now_ms, contract, "0x95d89b41".to_string())
@@ -303,6 +289,7 @@ fn hex_to_u128(s: &str) -> Result<u128, String> {
     u128::from_str_radix(s, 16).map_err(|err| err.to_string())
 }
 
+#[allow(dead_code)]
 fn decode_abi_string(bytes: &[u8]) -> Result<String, String> {
     if bytes.len() < 64 {
         return Err("abi string result too short".to_string());

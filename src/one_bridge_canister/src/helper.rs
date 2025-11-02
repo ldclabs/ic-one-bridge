@@ -4,6 +4,14 @@ use candid::{
 use std::collections::BTreeSet;
 
 const ANONYMOUS: Principal = Principal::anonymous();
+
+pub static APP_AGENT: &str = concat!(
+    "Mozilla/5.0 ICP canister ",
+    env!("CARGO_PKG_NAME"),
+    "/",
+    env!("CARGO_PKG_VERSION"),
+);
+
 pub fn msg_caller() -> Result<Principal, String> {
     let caller = ic_cdk::api::msg_caller();
     check_auth(&caller)?;

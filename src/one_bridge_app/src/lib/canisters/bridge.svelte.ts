@@ -13,9 +13,11 @@ import {
 } from '$lib/types/bridge'
 import { unwrapResult } from '$lib/types/result'
 import { EvmRpc } from '$lib/utils/evmrpc'
+import { SvmRpc } from '$lib/utils/svmrpc'
 import { TokenDisplay, type TokenInfo } from '$lib/utils/token'
 import { Principal } from '@dfinity/principal'
 import { bytesToHex } from '@ldclabs/cose-ts/utils'
+import { getBase58Codec } from '@solana/kit'
 import { tick } from 'svelte'
 import { SvelteMap } from 'svelte/reactivity'
 import { createActor } from './actors'
@@ -27,6 +29,8 @@ export {
   type BridgeTx,
   type StateInfo
 } from '$declarations/one_bridge_canister/one_bridge_canister.did.js'
+
+const base58 = getBase58Codec()
 
 export class BridgeCanisterAPI {
   static #bridges: SvelteMap<string, BridgeCanisterAPI> = new SvelteMap()
@@ -47,6 +51,7 @@ export class BridgeCanisterAPI {
   #token: TokenInfo | null = null
   #tokenDisplay: TokenDisplay | null = null
   #tokenLedger: TokenLedgerAPI | null = null
+  #svmRpc: SvmRpc | null = null
   #evmRPC: Map<string, EvmRpc> = new Map()
   #state = $state<StateInfo | null>(null)
 
@@ -76,6 +81,10 @@ export class BridgeCanisterAPI {
       const token = this.#state.token_ledger.toText()
       return [token, `https://dashboard.internetcomputer.org/canister/${token}`]
     }
+    if (chain === 'SOL') {
+      const token = this.#state.svm_token_address[0]
+      return [token, `https://solscan.io/token/${token}`]
+    }
     const contract = this.#state.evm_token_contracts.find(
       ([name, _]) => name === chain
     )?.[1][0]
@@ -88,7 +97,7 @@ export class BridgeCanisterAPI {
     }
   }
 
-  toIcpAmount(chain: string, evmBalance: bigint): bigint {
+  evmToIcpAmount(chain: string, evmBalance: bigint): bigint {
     if (!this.#state) return evmBalance
     const evmDecimals = this.#state.evm_token_contracts.find(
       ([name, _]) => name === chain
@@ -100,6 +109,18 @@ export class BridgeCanisterAPI {
     }
     const diff = evmDecimals - this.#state.token_decimals
     return evmBalance / 10n ** BigInt(diff)
+  }
+
+  svmToIcpAmount(svmBalance: bigint): bigint {
+    if (!this.#state) return svmBalance
+    const svmDecimals = this.#state.svm_token_address[1]
+    if (!svmDecimals) return svmBalance
+    if (this.#state.token_decimals > svmDecimals) {
+      const diff = this.#state.token_decimals - svmDecimals
+      return svmBalance * 10n ** BigInt(diff)
+    }
+    const diff = svmDecimals - this.#state.token_decimals
+    return svmBalance / 10n ** BigInt(diff)
   }
 
   parseAmount(amount: string | number): bigint {
@@ -114,7 +135,14 @@ export class BridgeCanisterAPI {
 
   parseNativeAmount(chain: string, amount: string | number): bigint {
     let decimals = 8
-    if (chain !== 'ICP') decimals = 18
+    if (chain === 'ICP') {
+      decimals = 8
+    } else if (chain === 'SOL') {
+      decimals = 9
+    } else {
+      decimals = 18
+    }
+
     const token: TokenInfo = {
       name: chain,
       symbol: chain,
@@ -130,7 +158,14 @@ export class BridgeCanisterAPI {
 
   displayNativeAmount(chain: string, balance: bigint): string {
     let decimals = 8
-    if (chain !== 'ICP') decimals = 18
+    if (chain === 'ICP') {
+      decimals = 8
+    } else if (chain === 'SOL') {
+      decimals = 9
+    } else {
+      decimals = 18
+    }
+
     const token: TokenInfo = {
       name: chain,
       symbol: chain,
@@ -194,9 +229,14 @@ export class BridgeCanisterAPI {
 
   async supportChains(): Promise<Chain[]> {
     const state = await this.loadState()
-    return ['ICP', ...state.evm_token_contracts.map(([name, _]) => name)].map(
-      getChain
-    )
+    const chains = ['ICP']
+    if (state.svm_token_address[0] !== '11111111111111111111111111111111') {
+      chains.push('SOL')
+    }
+    return [
+      ...chains,
+      ...state.evm_token_contracts.map(([name, _]) => name)
+    ].map(getChain)
   }
 
   async loadICPTokenAPI(): Promise<TokenLedgerAPI> {
@@ -213,6 +253,25 @@ export class BridgeCanisterAPI {
     }
 
     return this.#tokenLedger
+  }
+
+  async loadSvmTokenAPI(): Promise<SvmRpc | null> {
+    if (!this.#svmRpc) {
+      const state = await this.loadState()
+      if (
+        state.svm_providers.length > 0 &&
+        state.svm_token_address[0] !== '11111111111111111111111111111111'
+      ) {
+        this.#svmRpc = new SvmRpc(
+          state.svm_providers,
+          state.svm_token_address[0],
+          state.svm_token_address[2]
+        )
+        this.#svmRpc.selectProvider()
+      }
+    }
+
+    return this.#svmRpc
   }
 
   async loadEVMTokenAPI(chain: string): Promise<EvmRpc> {
@@ -245,6 +304,11 @@ export class BridgeCanisterAPI {
   async myEvmAddress(): Promise<string> {
     const res = await this.#actor.evm_address([])
     return unwrapResult(res, 'call evm_address failed')
+  }
+
+  async mySvmAddress(): Promise<string> {
+    const res = await this.#actor.svm_address([])
+    return unwrapResult(res, 'call svm_address failed')
   }
 
   async getMyBridgeLog(fromTx: BridgeTx): Promise<BridgeLog> {
@@ -314,6 +378,18 @@ export class BridgeCanisterAPI {
   ): Promise<string> {
     const tx = await this.#actor.evm_transfer_tx(chain, toAddr, evmAmount)
     return unwrapResult(tx, 'call evm_transfer_tx failed')
+  }
+
+  // return signed erc20 transfer transaction
+  async buildSplTransferTx(toAddr: string, icpAmount: bigint): Promise<string> {
+    const tx = await this.#actor.spl_transfer_tx(toAddr, icpAmount)
+    return unwrapResult(tx, 'call spl_transfer_tx failed')
+  }
+
+  // return signed evm transfer transaction
+  async buildSolTransferTx(toAddr: string, solAmount: bigint): Promise<string> {
+    const tx = await this.#actor.sol_transfer_tx(toAddr, solAmount)
+    return unwrapResult(tx, 'call sol_transfer_tx failed')
   }
 
   toBridgeLogInfo(log: BridgeLog): BridgeLogInfo {
@@ -403,6 +479,7 @@ export type TransferTxInfo = {
   isFinalized: boolean
   Icp?: bigint
   Evm?: string
+  Sol?: string
 }
 
 export class TransferingProgress {
@@ -427,14 +504,25 @@ export class TransferingProgress {
     if (!this.#tx || this.#tx.isFinalized) return
 
     try {
-      const evm = await this.#api.loadEVMTokenAPI(this.#tx.chain)
       if ('Evm' in this.#tx) {
+        const evm = await this.#api.loadEVMTokenAPI(this.#tx.chain)
         const receipt = await evm.getTransactionReceipt(this.#tx.Evm)
         if (receipt && receipt.status === '0x1') {
           this.#tx.isFinalized = true
           return
         }
         setTimeout(() => this.#refreshLog(), 2000)
+      } else if ('Sol' in this.#tx) {
+        const sol = await this.#api.loadSvmTokenAPI()
+        if (sol) {
+          const status = await sol.getTransactionStatuse(this.#tx.Sol)
+          if (status === 'finalized') {
+            this.#tx.isFinalized = true
+            return
+          }
+
+          setTimeout(() => this.#refreshLog(), 2000)
+        }
       }
     } catch (error) {
       console.error(`Error refreshing log ${this.#tx}:`, error)
@@ -461,6 +549,8 @@ export class TransferingProgress {
 
     if ('Evm' in this.#tx) {
       return this.#tx.Evm
+    } else if ('Sol' in this.#tx) {
+      return this.#tx.Sol
     } else if ('Icp' in this.#tx) {
       return this.#tx.Icp.toString()
     }
@@ -476,6 +566,11 @@ export class TransferingProgress {
       case 'BNB':
         if ('Evm' in this.#tx) {
           return `https://bscscan.com/tx/${this.#tx.Evm}`
+        }
+        return ''
+      case 'SOL':
+        if ('Sol' in this.#tx) {
+          return `https://solscan.io/tx/${this.#tx.Sol}`
         }
         return ''
       default:
@@ -513,6 +608,16 @@ function getChain(chain: string): Chain {
         logo: '/_assets/bnb.png',
         averageFinalitySeconds: 11
       }
+    case 'SOL':
+      return {
+        id: 0,
+        name: 'SOL',
+        fullName: 'Solana',
+        nativeToken: 'SOL',
+        explorerUrl: 'https://solscan.io',
+        logo: '/_assets/sol.webp',
+        averageFinalitySeconds: 11
+      }
     default:
       throw new Error(`unsupported chain ${chain}`)
   }
@@ -534,6 +639,11 @@ function getTxUrl(
       if (!hash) return undefined
       return `https://bscscan.com/tx/${hash}`
     }
+    case 'SOL': {
+      const hash = getTx(tx)
+      if (!hash) return undefined
+      return `https://solscan.io/tx/${hash}`
+    }
     default:
       return undefined
   }
@@ -542,6 +652,8 @@ function getTxUrl(
 function getChainName(target: BridgeTarget): string {
   if ('Evm' in target) {
     return target.Evm
+  } else if ('Sol' in target) {
+    return 'SOL'
   } else if ('Icp' in target) {
     return 'ICP'
   }
@@ -553,6 +665,10 @@ function getTx(tx: BridgeTx): string {
     const [_isFinalized, rawTx] = tx.Evm
     const bytes = rawTx instanceof Uint8Array ? rawTx : Uint8Array.from(rawTx)
     return '0x' + bytesToHex(bytes)
+  } else if ('Sol' in tx) {
+    const [_isFinalized, rawTx] = tx.Sol
+    const bytes = rawTx instanceof Uint8Array ? rawTx : Uint8Array.from(rawTx)
+    return base58.decode(bytes)
   }
 
   return tx.Icp[1].toString()
@@ -575,6 +691,8 @@ function isFinalized(tx?: BridgeTx): boolean {
   if (!tx) return false
   if ('Evm' in tx) {
     return tx.Evm[0]
+  } else if ('Sol' in tx) {
+    return tx.Sol[0]
   } else if ('Icp' in tx) {
     return tx.Icp[0]
   }

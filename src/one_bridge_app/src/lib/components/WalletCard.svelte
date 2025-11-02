@@ -38,6 +38,7 @@
     'ICP'
 
   let myIcpAddress = $state<string>('')
+  let mySolAddress = $state<string>('')
   let myEvmAddress = $state<string>('')
   let bridges = $state<BridgeCanisterAPI[]>([])
   let selectedBridge = $state<BridgeCanisterAPI>(mainBridge)
@@ -64,10 +65,13 @@
 
   $effect(() => {
     myIcpAddress = authStore.identity.getPrincipal().toText()
-    mainBridge.myEvmAddress().then((addr) => {
-      myEvmAddress = addr
-      refreshMyTokenInfo()
-    })
+    Promise.all([mainBridge.mySvmAddress(), mainBridge.myEvmAddress()]).then(
+      ([svmAddr, evmAddr]) => {
+        mySolAddress = svmAddr
+        myEvmAddress = evmAddr
+        refreshMyTokenInfo()
+      }
+    )
   })
 
   $effect(() => {
@@ -198,6 +202,7 @@
       !selectedBridge ||
       !fromChain ||
       !myIcpAddress ||
+      !mySolAddress ||
       !myEvmAddress
     ) {
       fromBalanceIcp = 0n
@@ -228,11 +233,19 @@
           )
           gasFee = nativeToken ? 10000n : selectedBridge.token!.fee
           break
+        case 'SOL':
+          fromAddress = mySolAddress
+          const svm = await selectedBridge.loadSvmTokenAPI()
+          const splBalance = await svm!.getSplBalance(mySolAddress)
+          fromBalanceIcp = selectedBridge.svmToIcpAmount(splBalance)
+          fromBalanceNative = await svm!.getBalance(mySolAddress)
+          gasFee = 10000n
+          break
         default:
           const evm = await selectedBridge.loadEVMTokenAPI(fromChain.name)
           fromAddress = myEvmAddress
           const v = await evm.getErc20Balance(myEvmAddress)
-          fromBalanceIcp = selectedBridge.toIcpAmount(fromChain.name, v)
+          fromBalanceIcp = selectedBridge.evmToIcpAmount(fromChain.name, v)
           fromBalanceNative = await evm.getBalance(myEvmAddress)
           gasFee = await evm.gasFeeEstimation()
       }
@@ -292,6 +305,18 @@
             isFinalized: true,
             Icp: idx
           })
+        } else if (fromChain.name === 'SOL') {
+          const svm = await selectedBridge.loadSvmTokenAPI()
+          const signedTx = nativeToken
+            ? await selectedBridge.buildSolTransferTx(thirdAddress, amount)
+            : await selectedBridge.buildSplTransferTx(thirdAddress, amount)
+          const tx = await svm!.sendRawTransaction(signedTx)
+          transferingProgress = TransferingProgress.track(selectedBridge, {
+            chain: 'SOL',
+            native: nativeToken,
+            isFinalized: false,
+            Sol: tx
+          })
         } else {
           const evm = await selectedBridge.loadEVMTokenAPI(fromChain.name)
           const signedTx = nativeToken
@@ -350,6 +375,15 @@
             <span>ICP: {pruneAddress(myIcpAddress, true)}</span>
             <TextClipboardButton
               value={myIcpAddress}
+              class="text-white/60 *:size-5 hover:text-white/80"
+            />
+          {/key}
+        </p>
+        <p class="flex items-center gap-1">
+          {#key mySolAddress}
+            <span>SOL: {pruneAddress(mySolAddress, true)}</span>
+            <TextClipboardButton
+              value={mySolAddress}
               class="text-white/60 *:size-5 hover:text-white/80"
             />
           {/key}
@@ -464,7 +498,7 @@
           <span
             >Your balance: {selectedBridge.displayAmount(fromBalanceIcp)}</span
           >
-          <span
+          <span class:text-white={nativeToken}
             >Native {fromChain?.name} balance: {selectedBridge.displayNativeAmount(
               fromChain?.name!,
               fromBalanceNative

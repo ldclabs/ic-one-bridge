@@ -103,6 +103,10 @@ fn post_upgrade(args: Option<CanisterArgs>) {
     });
     store::state::init_http_certified_data();
     ic_cdk_timers::set_timer(
+        Duration::from_secs(0),
+        store::state::try_init_ed25519_public_key(),
+    );
+    ic_cdk_timers::set_timer(
         Duration::from_secs(3),
         store::state::finalize_bridging(round),
     );

@@ -1,4 +1,5 @@
 import { Principal } from '@dfinity/principal'
+import { isAddress } from '@solana/kit'
 
 export function pruneCanister(canisterId: string, long?: boolean) {
   if (long ?? window.innerWidth >= 640) return canisterId
@@ -20,6 +21,8 @@ export function validateAddress(chain: string, address: string): boolean {
         return true
       } catch (_) {}
       return false
+    case 'SOL':
+      return isAddress(address)
     default:
       return /^0x[a-fA-F0-9]{40}$/.test(address)
   }

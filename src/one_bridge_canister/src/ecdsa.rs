@@ -1,15 +1,7 @@
-use candid::CandidType;
 use ic_cdk::management_canister as mgt;
-use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
-use crate::helper::format_error;
-
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct PublicKeyOutput {
-    pub public_key: ByteBuf,
-    pub chain_code: ByteBuf,
-}
+use crate::{helper::format_error, types::PublicKeyOutput};
 
 /// Returns a valid extended BIP-32 derivation path from an Account (Principal + subaccount)
 pub fn derive_public_key(

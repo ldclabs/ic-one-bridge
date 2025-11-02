@@ -142,8 +142,8 @@
             class="mx-auto w-full max-w-xl text-center text-base text-white/70 sm:text-lg"
           >
             Enables seamless multi-chain token transfers across the Internet
-            Computer, Ethereum, BNB Chain, and other EVM-compatible networks
-            through a fully on-chain bridge.
+            Computer, Ethereum, BNB Chain, Solana and other EVM-compatible
+            networks through a fully on-chain bridge.
           </p>
 
           <div class="mx-auto flex flex-wrap items-center gap-8 pt-2">

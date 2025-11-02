@@ -21,6 +21,7 @@ alloy-primitives = { workspace = true }
 alloy-rpc-types-eth = { workspace = true }
 alloy-signer = { workspace = true }
 base64 = { workspace = true }
+bincode = { workspace = true }
 candid = { workspace = true }
 ciborium = { workspace = true }
 futures = { workspace = true }
@@ -30,6 +31,7 @@ ic-stable-structures = { workspace = true }
 ic-http-certification = { workspace = true }
 ic_auth_types = { workspace = true }
 ic-secp256k1 = { workspace = true }
+ic-ed25519 = { workspace = true }
 icrc-ledger-types = { workspace = true }
 lazy_static = { workspace = true }
 once_cell = { workspace = true }
@@ -38,5 +40,11 @@ url = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_json = { workspace = true }
+solana-program = { workspace = true }
+solana-transaction = { workspace = true, features = ["bincode"] }
+solana-instruction = { workspace = true }
+solana-account-decoder-client-types = { workspace = true }
+solana-system-interface = { workspace = true, features = ["bincode"] }
+spl-associated-token-account-interface = { workspace = true }
 k256 = { workspace = true, features = ["ecdsa"] }
 ic-dummy-getrandom-for-wasm = { workspace = true }
