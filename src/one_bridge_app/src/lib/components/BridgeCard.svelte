@@ -17,6 +17,7 @@
   } from '$lib/utils/helper'
   import { type TokenInfo } from '$lib/utils/token'
   import { tick } from 'svelte'
+  import { innerWidth } from 'svelte/reactivity/window'
   import Spinner from '../ui/Spinner.svelte'
   import TextClipboardButton from '../ui/TextClipboardButton.svelte'
   import NetworkSelector from './ChainSelector.svelte'
@@ -466,11 +467,13 @@
       </div>
     </div>
 
-    <div class="grid grid-cols-[1fr_32px_1fr] items-center gap-0">
+    <div class="relative grid grid-cols-2 items-center gap-0">
       <!-- From Section -->
-      <div class="">
+      <div class="relative">
         <p class="mb-1 flex items-center gap-2 text-sm text-white/60">
-          <span>From</span>
+          {#if (innerWidth.current || 0) >= 640}
+            <span>From</span>
+          {/if}
           {#if selectedBridge && fromChain}
             {@const [token, tokenUrl] = selectedBridge.getTokenUrl(
               fromChain.name
@@ -494,27 +497,16 @@
           disabledChainName={''}
           onSelectChain={onSelectFromChain}
           chains={supportChains}
-          containerClass="rounded-xl border border-white/40 shrink-0"
+          containerClass="rounded-xl border border-white/40 shrink-0 mr-2 pr-1"
         />
-      </div>
-
-      <!-- Swap Button -->
-      <div class="relative">
-        <p class="collapse mb-1 text-center text-sm">-</p>
-        <button
-          onclick={onSwapChains}
-          disabled={isLoading || isBridging}
-          title="Swap from and to"
-          class="flex size-8 items-center justify-center text-white/50 transition-all duration-500 hover:text-white/90"
-        >
-          <ArrowLeftRightLine />
-        </button>
       </div>
 
       <!-- To Section -->
       <div class="relative">
-        <p class="mb-1 flex items-center gap-2 text-sm text-white/60">
-          <span>To</span>
+        <p class="mb-1 ml-2 flex items-center gap-2 text-sm text-white/60">
+          {#if (innerWidth.current || 0) >= 640}
+            <span>To</span>
+          {/if}
           {#if selectedBridge && toChain}
             {@const [token, tokenUrl] = selectedBridge.getTokenUrl(
               toChain.name
@@ -538,8 +530,21 @@
           disabledChainName={fromChain?.name ?? ''}
           onSelectChain={onSelectToChain}
           chains={supportChains}
-          containerClass="rounded-xl border border-white/40 shrink-0"
+          containerClass="rounded-xl border border-white/40 shrink-0 ml-2 pl-1"
         />
+      </div>
+
+      <!-- Swap Button -->
+      <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
+        <p class="collapse mb-1 text-center text-sm">-</p>
+        <button
+          onclick={onSwapChains}
+          disabled={isLoading || isBridging}
+          title="Swap from and to"
+          class="hover:bg-gray flex size-8 items-center justify-center rounded-full border border-white/40 bg-black/90 text-white/50 shadow transition-all duration-500 hover:border-white/60 hover:text-white/90"
+        >
+          <span class="*:size-5"><ArrowLeftRightLine /></span>
+        </button>
       </div>
     </div>
 
@@ -620,7 +625,7 @@
             name="confirmAddress"
             disabled={isLoading || isBridging}
             bind:checked={confirmAddress}
-            class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0 disabled:cursor-not-allowed"
+            class="text-primary-600 me-2 size-4 shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0 disabled:cursor-not-allowed"
           />
           I confirmed the address is correct and not an exchange or contract address.
           Any tokens sent to an incorrect address will be unrecoverable.</label

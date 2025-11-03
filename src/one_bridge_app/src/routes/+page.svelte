@@ -97,9 +97,9 @@
   })
 </script>
 
-<div class="min-h-screen bg-[var(--color-bg)] pb-24">
+<div class="min-h-screen bg-(--color-bg) pb-24">
   <section
-    class="relative isolate overflow-hidden bg-gradient-to-br from-[#10121a] via-[#111520] to-[#050608]"
+    class="relative isolate overflow-hidden bg-linear-to-br from-[#10121a] via-[#111520] to-[#050608]"
   >
     <div class="absolute inset-0 -z-10 opacity-80">
       <div
@@ -142,7 +142,7 @@
             class="mx-auto w-full max-w-xl text-center text-base text-white/70 sm:text-lg"
           >
             Enables seamless multi-chain token transfers across the Internet
-            Computer, Ethereum, BNB Chain, Solana and other EVM-compatible
+            Computer, Solana, Ethereum, BNB Chain and other EVM-compatible
             networks through a fully on-chain bridge.
           </p>
 
@@ -154,7 +154,7 @@
               rel="noreferrer"
             >
               <span class="*:size-6"><GithubFill /></span>
-              <span class="">Source code</span>
+              <span class="">Open source</span>
               <span class="*:size-5"><ArrowRightUpLine /></span>
             </a>
             <a
@@ -172,7 +172,7 @@
 
         {#key principal + isAuthenticated}
           <div class="relative" data-1p-ignore>
-            <div class="mx-6 -mb-[1px] flex items-center justify-between">
+            <div class="mx-6 -mb-px flex items-center justify-between">
               <div class="flex items-center">
                 <button
                   class="rounded-t-xl px-6 py-2 transition-colors {activeTab ===

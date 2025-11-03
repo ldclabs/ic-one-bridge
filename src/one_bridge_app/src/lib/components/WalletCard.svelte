@@ -467,7 +467,7 @@
             name="nativeToken"
             disabled={isLoading || isTransfering}
             bind:checked={nativeToken}
-            class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0 disabled:cursor-not-allowed"
+            class="text-primary-600 me-2 size-4 shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0 disabled:cursor-not-allowed"
           />Native Token</label
         >
       </div>
@@ -536,7 +536,7 @@
           name="confirmAddress"
           disabled={isLoading || isTransfering}
           bind:checked={confirmAddress}
-          class="text-primary-600 me-2 size-4 flex-shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0 disabled:cursor-not-allowed"
+          class="text-primary-600 me-2 size-4 shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0 disabled:cursor-not-allowed"
         />
         I confirmed the address is correct and not an exchange or contract address.
         Any tokens sent to an incorrect address will be unrecoverable.</label

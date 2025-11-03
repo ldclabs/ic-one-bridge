@@ -67,7 +67,7 @@
         </td>
         <td class="px-4 py-4">
           <span
-            class="rounded-full border border-[var(--color-accent)]/30 bg-[var(--color-accent)]/10 px-3 py-1 text-xs font-medium text-[var(--color-accent)] uppercase"
+            class="rounded-full border border-(--color-accent)/30 bg-(--color-accent)/10 px-3 py-1 text-xs font-medium text-(--color-accent) uppercase"
           >
             {log.status}
           </span>
