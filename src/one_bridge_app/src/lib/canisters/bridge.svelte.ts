@@ -515,7 +515,7 @@ export class TransferingProgress {
       } else if ('Sol' in this.#tx) {
         const sol = await this.#api.loadSvmTokenAPI()
         if (sol) {
-          const status = await sol.getTransactionStatuse(this.#tx.Sol)
+          const status = await sol.getTransactionStatus(this.#tx.Sol)
           if (status === 'finalized') {
             this.#tx.isFinalized = true
             return

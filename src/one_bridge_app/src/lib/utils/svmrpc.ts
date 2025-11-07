@@ -78,7 +78,7 @@ export class SvmRpc {
   }
 
   // 'processed', 'confirmed', 'finalized', ''
-  async getTransactionStatuse(sig: string): Promise<string> {
+  async getTransactionStatus(sig: string): Promise<string> {
     const { value } = await this.#rpc
       .getSignatureStatuses([sig as Signature])
       .send()
