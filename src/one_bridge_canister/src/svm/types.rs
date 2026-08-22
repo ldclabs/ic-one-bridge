@@ -88,3 +88,48 @@ mod tests {
         assert!(!failed.is_finalized());
     }
 }
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::svm::instruction;
+
+    /// `solana-transaction` dropped its `bincode` feature, so the crate now enables
+    /// `serde` instead. Both give `Transaction` the same short-vec wire encoding,
+    /// and this pins that down: a wrong layout here would mean signing and
+    /// broadcasting malformed transactions.
+    #[test]
+    fn transaction_bincode_layout_matches_solana_wire_format() {
+        let from = Pubkey::new_from_array([1u8; 32]);
+        let to = Pubkey::new_from_array([2u8; 32]);
+        let blockhash = Hash::new_from_array([3u8; 32]);
+
+        let ix = instruction::transfer(&from, &to, 1_000);
+        let message = Message::new_with_blockhash(&[ix], Some(&from), &blockhash);
+        let tx = Transaction {
+            message,
+            signatures: vec![Signature::from([7u8; 64])],
+        };
+
+        let bytes = bincode::serialize(&tx).unwrap();
+
+        // compact-u16 signature count, then the signature itself
+        assert_eq!(bytes[0], 1);
+        assert_eq!(&bytes[1..65], &[7u8; 64]);
+
+        // message header: 1 required signature, 0 readonly signed, 1 readonly
+        // unsigned (the system program), then a compact-u16 account count
+        assert_eq!(&bytes[65..68], &[1, 0, 1]);
+        assert_eq!(bytes[68], 3);
+        assert_eq!(&bytes[69..101], &[1u8; 32]); // payer
+        assert_eq!(&bytes[101..133], &[2u8; 32]); // recipient
+        assert_eq!(&bytes[133..165], &[0u8; 32]); // system program
+        assert_eq!(&bytes[165..197], &[3u8; 32]); // recent blockhash
+
+        // one instruction: program index 2, accounts [0, 1], 12 bytes of data
+        // holding SystemInstruction::Transfer (2) and 1000 lamports little-endian
+        assert_eq!(&bytes[197..203], &[1, 2, 2, 0, 1, 12]);
+        assert_eq!(&bytes[203..215], &[2, 0, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(bytes.len(), 215);
+    }
+}

@@ -1,5 +1,5 @@
 use candid::Principal;
-use ic_cdk::management_canister::{
+use ic_cdk_management_canister::{
     HttpRequestArgs, HttpRequestResult, TransformArgs, TransformContext, TransformFunc,
     http_request,
 };

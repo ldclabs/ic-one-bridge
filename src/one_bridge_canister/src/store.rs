@@ -2,7 +2,7 @@ use alloy_consensus::{SignableTransaction, Signed, TxEip1559};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, Signature, TxHash, U256, hex};
 use candid::{CandidType, Nat, Principal};
-use ciborium::{from_reader, into_writer};
+use cbor2::{from_slice, to_vec};
 use ic_http_certification::{
     HttpCertification, HttpCertificationPath, HttpCertificationTree, HttpCertificationTreeEntry,
     cel::{DefaultCelBuilder, create_cel_expr},
@@ -367,19 +367,15 @@ impl Storable for BridgeLogLocal {
     const BOUND: Bound = Bound::Unbounded;
 
     fn into_bytes(self) -> Vec<u8> {
-        let mut buf = vec![];
-        into_writer(&self, &mut buf).expect("failed to encode BridgeLogLocal data");
-        buf
+        to_vec(&self).expect("failed to encode BridgeLogLocal data")
     }
 
     fn to_bytes(&self) -> Cow<'_, [u8]> {
-        let mut buf = vec![];
-        into_writer(&self, &mut buf).expect("failed to encode BridgeLogLocal data");
-        Cow::Owned(buf)
+        Cow::Owned(to_vec(self).expect("failed to encode BridgeLogLocal data"))
     }
 
     fn from_bytes(bytes: Cow<'_, [u8]>) -> Self {
-        from_reader(&bytes[..]).expect("failed to decode BridgeLogLocal data")
+        from_slice(&bytes).expect("failed to decode BridgeLogLocal data")
     }
 }
 
@@ -392,19 +388,15 @@ impl Storable for UserLogs {
     const BOUND: Bound = Bound::Unbounded;
 
     fn into_bytes(self) -> Vec<u8> {
-        let mut buf = vec![];
-        into_writer(&self, &mut buf).expect("failed to encode UserLogs data");
-        buf
+        to_vec(&self).expect("failed to encode UserLogs data")
     }
 
     fn to_bytes(&self) -> Cow<'_, [u8]> {
-        let mut buf = vec![];
-        into_writer(&self, &mut buf).expect("failed to encode UserLogs data");
-        Cow::Owned(buf)
+        Cow::Owned(to_vec(self).expect("failed to encode UserLogs data"))
     }
 
     fn from_bytes(bytes: Cow<'_, [u8]>) -> Self {
-        from_reader(&bytes[..]).expect("failed to decode UserLogs data")
+        from_slice(&bytes).expect("failed to decode UserLogs data")
     }
 }
 
@@ -638,7 +630,7 @@ pub mod state {
                 if bytes.is_empty() {
                     return;
                 }
-                let v: State = from_reader(&bytes[..]).expect("failed to decode STATE_STORE data");
+                let v: State = from_slice(bytes).expect("failed to decode STATE_STORE data");
                 *h = v;
             });
         });
@@ -647,8 +639,7 @@ pub mod state {
     pub fn save() {
         STATE.with_borrow(|h| {
             STATE_STORE.with_borrow_mut(|r| {
-                let mut buf = vec![];
-                into_writer(h, &mut buf).expect("failed to encode STATE_STORE data");
+                let buf = to_vec(h).expect("failed to encode STATE_STORE data");
                 r.set(buf);
             });
         });

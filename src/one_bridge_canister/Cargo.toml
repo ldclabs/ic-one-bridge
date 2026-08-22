@@ -23,10 +23,11 @@ alloy-signer = { workspace = true }
 base64 = { workspace = true }
 bincode = { workspace = true }
 candid = { workspace = true }
-ciborium = { workspace = true }
+cbor2 = { workspace = true }
 futures = { workspace = true }
 ic-cdk = { workspace = true }
 ic-cdk-timers = { workspace = true }
+ic-cdk-management-canister = { workspace = true }
 ic-stable-structures = { workspace = true }
 ic-http-certification = { workspace = true }
 ic_auth_types = { workspace = true }
@@ -41,9 +42,11 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 solana-program = { workspace = true }
-solana-transaction = { workspace = true, features = ["bincode"] }
+solana-transaction = { workspace = true, features = ["serde"] }
 solana-instruction = { workspace = true }
-solana-account-decoder-client-types = { workspace = true }
+solana-account-decoder-client-types = { workspace = true, features = [
+    "agave-unstable-api",
+] }
 solana-system-interface = { workspace = true, features = ["bincode"] }
 spl-associated-token-account-interface = { workspace = true }
 k256 = { workspace = true, features = ["ecdsa"] }

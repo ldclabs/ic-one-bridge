@@ -1,0 +1,9 @@
+# `k256` 0.14 pulls in `getrandom` 0.4 (through `elliptic-curve` -> `crypto-bigint`),
+# which refuses to compile for wasm32-unknown-unknown unless a backend is chosen.
+# A canister has no OS entropy — randomness comes from the management canister's
+# `raw_rand` — so the right backend is the one that fails at runtime instead of at
+# build time. This is what `ic-dummy-getrandom-for-wasm` already does for the
+# `getrandom` 0.2 that `alloy-signer` still depends on; nothing in this canister
+# draws from `getrandom`, as all signing happens on the threshold-signature API.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"unsupported\""]

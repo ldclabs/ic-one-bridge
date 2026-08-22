@@ -1,6 +1,6 @@
 use alloy_primitives::{U256, hex::FromHex};
 use alloy_rpc_types_eth::TransactionReceipt;
-use ic_cdk::management_canister::{HttpHeader, HttpMethod, HttpRequestArgs};
+use ic_cdk_management_canister::{HttpHeader, HttpMethod, HttpRequestArgs};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -339,7 +339,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use ic_cdk::management_canister::{HttpRequestResult, TransformContext};
+    use ic_cdk_management_canister::{HttpRequestResult, TransformContext};
 
     #[test]
     fn test_encode_erc20_transfer() {
@@ -408,7 +408,7 @@ mod tests {
     impl HttpOutcall for MockHttpOutcall {
         async fn request(
             &self,
-            args: &ic_cdk::management_canister::HttpRequestArgs,
+            args: &ic_cdk_management_canister::HttpRequestArgs,
         ) -> Result<HttpRequestResult, String> {
             self.urls.lock().unwrap().push(args.url.clone());
             self.responses

@@ -1,5 +1,5 @@
 use ic_auth_types::ByteBufB64;
-use ic_cdk::management_canister::{HttpHeader, HttpMethod, HttpRequestArgs};
+use ic_cdk_management_canister::{HttpHeader, HttpMethod, HttpRequestArgs};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
@@ -357,7 +357,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use ic_cdk::management_canister::{HttpRequestResult, TransformContext};
+    use ic_cdk_management_canister::{HttpRequestResult, TransformContext};
 
     #[test]
     fn test_get_latest_blockhash() {
@@ -527,7 +527,7 @@ mod tests {
     impl HttpOutcall for MockHttpOutcall {
         async fn request(
             &self,
-            args: &ic_cdk::management_canister::HttpRequestArgs,
+            args: &ic_cdk_management_canister::HttpRequestArgs,
         ) -> Result<HttpRequestResult, String> {
             self.urls.lock().unwrap().push(args.url.clone());
             self.responses
