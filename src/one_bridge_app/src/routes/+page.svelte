@@ -75,7 +75,6 @@
 
   $effect(() => {
     if (mainBridge && isAuthenticated) {
-      isLoading = false
       tick().then(() => {
         fetchMyRecentLogs()
       })

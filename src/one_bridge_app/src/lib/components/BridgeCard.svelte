@@ -85,22 +85,26 @@
   })
 
   $effect(() => {
-    if (!mainBridge) return
+    const bridge = mainBridge
+    if (!bridge) return
 
-    if (isAuthenticated) {
-      myIcpAddress = authStore.identity.getPrincipal().toText()
-      Promise.all([mainBridge.mySvmAddress(), mainBridge.myEvmAddress()]).then(
-        ([svmAddr, evmAddr]) => {
-          mySolAddress = svmAddr
-          myEvmAddress = evmAddr
-          refreshMyTokenInfo()
-        }
-      )
-    } else {
+    if (!isAuthenticated) {
       myIcpAddress = ''
       mySolAddress = ''
       myEvmAddress = ''
+      return
     }
+
+    myIcpAddress = authStore.identity.getPrincipal().toText()
+    return toastRun(async (_signal) => {
+      const [svmAddr, evmAddr] = await Promise.all([
+        bridge.mySvmAddress(),
+        bridge.myEvmAddress()
+      ])
+      mySolAddress = svmAddr
+      myEvmAddress = evmAddr
+      await refreshMyTokenInfo()
+    }).abort
   })
 
   $effect(() => {
@@ -109,7 +113,7 @@
     selectedBridge = mainBridge
     mainBridge.loadSubBridges().then((subBridges) => {
       bridges = [mainBridge, ...subBridges]
-      supportTokens = bridges.map((b) => b.token!)
+      supportTokens = bridges.map((b) => b.token).filter((t) => t !== null)
       if (selectedBridge?.token?.symbol != defaultToken) {
         selectedBridge =
           bridges.find((b) => b.token?.symbol === defaultToken) || mainBridge
@@ -133,14 +137,18 @@
       selectedToken = selectedBridge.token!
       supportChains = await selectedBridge.supportChains()
       await tick()
+      // keep the current selection when it is still supported, this effect also
+      // reruns whenever the bridge state is refreshed
+      const fromName = fromChain?.name || defaultFrom
+      const toName = toChain?.name || defaultTo
       fromChain =
-        supportChains.find((c) => c.name === defaultFrom) ||
+        supportChains.find((c) => c.name === fromName) ||
         supportChains[0] ||
         null
-      if (defaultFrom != defaultTo) {
+      if (fromChain?.name !== toName) {
         toChain =
-          supportChains.find((c) => c.name === defaultTo) ||
-          supportChains[1] ||
+          supportChains.find((c) => c.name === toName) ||
+          supportChains.find((c) => c.name !== fromChain?.name) ||
           null
       }
 
@@ -168,6 +176,20 @@
       target.setCustomValidity('')
       error = null
     }
+  }
+
+  // full check used on submit: the amount and the destination address share the
+  // `error` slot, so editing one field must not drop the other one's error
+  function _validateBridge(): [bigint, string] {
+    const [amount, err] = _validateSendAmount()
+    if (err) return [amount, err]
+
+    const addr = thirdAddress.trim()
+    if (addr && toChain && !validateAddress(toChain.name, addr)) {
+      return [amount, `Invalid ${toChain.name} address format`]
+    }
+
+    return [amount, '']
   }
 
   function _validateSendAmount(): [bigint, string] {
@@ -251,7 +273,7 @@
 
         const subBridges = await mainBridge.loadSubBridges()
         bridges = [mainBridge, ...subBridges]
-        supportTokens = bridges.map((b) => b.token!)
+        supportTokens = bridges.map((b) => b.token).filter((t) => t !== null)
       }
 
       const icp = await selectedBridge.loadICPTokenAPI()
@@ -340,13 +362,9 @@
   }
 
   async function onBridge() {
-    const [amount, err] = _validateSendAmount()
-    if (err) {
-      error = err
-    } else {
-      error = null
-    }
-    if (isBridging || amount <= 0n) return
+    const [amount, err] = _validateBridge()
+    error = err || null
+    if (isBridging || err || amount <= 0n) return
 
     isBridging = true
     toastRun(async () => {

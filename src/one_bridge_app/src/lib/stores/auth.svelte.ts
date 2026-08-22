@@ -36,39 +36,42 @@ class AuthStore {
     return this.#identity
   }
 
-  signIn(identityProvider = IDENTITY_PROVIDER) {
-    return new Promise<void>(async (resolve, reject) => {
-      // Important: authClientPromise should be resolved here
-      // https://ffan0811.medium.com/window-open-returns-null-in-safari-and-firefox-after-allowing-pop-up-on-the-browser-4e4e45e7d926
-      const authClient = await authClientPromise
-      await authClient.login({
-        maxTimeToLive: BigInt(EXPIRATION_MS) * 1000000n,
-        identityProvider,
-        onSuccess: (msg) => {
-          const authnMethod = msg.authnMethod
-          const authnOrigin = location.origin
-          console.log(
-            `Login successful using ${authnMethod} from ${authnOrigin}`
-          )
+  async signIn(identityProvider = IDENTITY_PROVIDER): Promise<void> {
+    // Important: authClientPromise should be resolved here
+    // https://ffan0811.medium.com/window-open-returns-null-in-safari-and-firefox-after-allowing-pop-up-on-the-browser-4e4e45e7d926
+    const authClient = await authClientPromise
+    return new Promise<void>((resolve, reject) => {
+      authClient
+        .login({
+          maxTimeToLive: BigInt(EXPIRATION_MS) * 1000000n,
+          identityProvider,
+          onSuccess: (msg) => {
+            const authnMethod = msg.authnMethod
+            const authnOrigin = location.origin
+            console.log(
+              `Login successful using ${authnMethod} from ${authnOrigin}`
+            )
 
-          const identity = new IdentityEx(
-            authClient.getIdentity(),
-            Date.now() + EXPIRATION_MS
-          )
-          identity.expiredHook = () => this.logout()
-          this.#identity = identity
-          dynAgent.setIdentity(identity)
-          resolve()
-        },
-        onError: (err) => {
-          console.error(err)
-          reject(err)
-        },
-        windowOpenerFeatures: popupCenter({
-          width: 576,
-          height: 625
+            const identity = new IdentityEx(
+              authClient.getIdentity(),
+              Date.now() + EXPIRATION_MS
+            )
+            identity.expiredHook = () => this.logout()
+            this.#identity = identity
+            dynAgent.setIdentity(identity)
+            resolve()
+          },
+          onError: (err) => {
+            console.error(err)
+            reject(err)
+          },
+          windowOpenerFeatures: popupCenter({
+            width: 576,
+            height: 625
+          })
         })
-      })
+        // login() itself may reject, without this the promise never settles
+        .catch(reject)
     })
   }
 

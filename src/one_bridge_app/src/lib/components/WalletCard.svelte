@@ -65,20 +65,22 @@
 
   $effect(() => {
     myIcpAddress = authStore.identity.getPrincipal().toText()
-    Promise.all([mainBridge.mySvmAddress(), mainBridge.myEvmAddress()]).then(
-      ([svmAddr, evmAddr]) => {
-        mySolAddress = svmAddr
-        myEvmAddress = evmAddr
-        refreshMyTokenInfo()
-      }
-    )
+    return toastRun(async (_signal) => {
+      const [svmAddr, evmAddr] = await Promise.all([
+        mainBridge.mySvmAddress(),
+        mainBridge.myEvmAddress()
+      ])
+      mySolAddress = svmAddr
+      myEvmAddress = evmAddr
+      await refreshMyTokenInfo()
+    }).abort
   })
 
   $effect(() => {
     selectedBridge = mainBridge
     mainBridge.loadSubBridges().then((subBridges) => {
       bridges = [mainBridge, ...subBridges]
-      supportTokens = bridges.map((b) => b.token!)
+      supportTokens = bridges.map((b) => b.token).filter((t) => t !== null)
       if (selectedBridge.token?.symbol != defaultToken) {
         selectedBridge =
           bridges.find((b) => b.token?.symbol === defaultToken) || mainBridge
@@ -95,8 +97,12 @@
       selectedToken = selectedBridge.token!
       supportChains = await selectedBridge.supportChains()
       await tick()
+      // keep the current selection when it is still supported, this effect also
+      // reruns whenever the bridge state is refreshed
       fromChain =
-        supportChains.find((c) => c.name === defaultFrom) ||
+        supportChains.find(
+          (c) => c.name === (fromChain?.name || defaultFrom)
+        ) ||
         supportChains[0] ||
         null
 
@@ -125,6 +131,29 @@
       target.setCustomValidity('')
       error = null
     }
+  }
+
+  // full check used on submit: the amount and the destination address share the
+  // `error` slot, so editing one field must not drop the other one's error
+  function _validateTransfer(): [bigint, string] {
+    const [amount, err] = _validateSendAmount()
+    if (err) return [amount, err]
+
+    const addr = thirdAddress.trim()
+    if (!addr) {
+      return [amount, 'Destination address is required']
+    }
+    if (addr === fromAddress) {
+      return [
+        amount,
+        'The destination address cannot be the same as the source address'
+      ]
+    }
+    if (fromChain && !validateAddress(fromChain.name, addr)) {
+      return [amount, `Invalid ${fromChain.name} address format`]
+    }
+
+    return [amount, '']
   }
 
   function _validateSendAmount(): [bigint, string] {
@@ -220,7 +249,7 @@
 
         const subBridges = await mainBridge.loadSubBridges()
         bridges = [mainBridge, ...subBridges]
-        supportTokens = bridges.map((b) => b.token!)
+        supportTokens = bridges.map((b) => b.token).filter((t) => t !== null)
       }
 
       const icp = await selectedBridge.loadICPTokenAPI()
@@ -257,6 +286,12 @@
     }
   }
 
+  function onSelectNativeToken() {
+    // the gas fee and the amount unit depend on it, refresh before validating again
+    error = null
+    refreshMyTokenInfo()
+  }
+
   function onSelectToken(token: TokenInfo) {
     const bridge = bridges.find((b) => b.token?.name === token.name)
     nativeToken = false
@@ -273,13 +308,9 @@
   }
 
   async function onTransfer() {
-    const [amount, err] = _validateSendAmount()
-    if (err) {
-      error = err
-    } else {
-      error = null
-    }
-    if (isTransfering || amount <= 0n) return
+    const [amount, err] = _validateTransfer()
+    error = err || null
+    if (isTransfering || err || amount <= 0n) return
 
     isTransfering = true
     toastRun(async () => {
@@ -467,6 +498,7 @@
             name="nativeToken"
             disabled={isLoading || isTransfering}
             bind:checked={nativeToken}
+            onchange={onSelectNativeToken}
             class="text-primary-600 me-2 size-4 shrink-0 rounded-sm border-gray-300 bg-gray-100 ring-0 disabled:cursor-not-allowed"
           />Native Token</label
         >
@@ -574,11 +606,13 @@
       {#if transferingProgress}
         <PrimaryButton
           onclick={resetTransfer}
-          disabled={!transferingProgress.isComplete}
-          isLoading={!transferingProgress.isComplete}
+          disabled={!transferingProgress.isSettled}
+          isLoading={!transferingProgress.isSettled}
         >
           {#if transferingProgress.isComplete}
             <span class="text-green-500">Transfer completed, start again</span>
+          {:else if transferingProgress.isSettled}
+            <span class="text-red-400">Transfer failed, start again</span>
           {:else}
             <span>Transfering...</span>
           {/if}

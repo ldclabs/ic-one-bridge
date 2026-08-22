@@ -31,7 +31,7 @@ export function validateAddress(chain: string, address: string): boolean {
 export function formatTimeAgo(timestamp: number) {
   const delta = Date.now() - new Date(timestamp).getTime()
   const minutes = Math.max(Math.round(delta / (60 * 1000)), 1)
-  if (minutes > 60 * 24 * 36) {
+  if (minutes > 60 * 24) {
     const days = Math.round(minutes / (60 * 24))
     return `${days} days ago`
   } else if (minutes > 60) {

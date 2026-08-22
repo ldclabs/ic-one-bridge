@@ -34,16 +34,30 @@ const base58 = getBase58Codec()
 
 export class BridgeCanisterAPI {
   static #bridges: SvelteMap<string, BridgeCanisterAPI> = new SvelteMap()
+  static #loading: Map<string, Promise<BridgeCanisterAPI>> = new Map()
 
   static async loadBridge(canisterId: string): Promise<BridgeCanisterAPI> {
-    if (this.#bridges.has(canisterId)) {
-      return this.#bridges.get(canisterId) as BridgeCanisterAPI
+    const loaded = this.#bridges.get(canisterId)
+    if (loaded) {
+      return loaded
     }
 
-    const bridge = new BridgeCanisterAPI(canisterId)
-    this.#bridges.set(canisterId, bridge)
-    await bridge.loadState()
-    return bridge
+    // share one in-flight load, and only cache the bridge once its state is
+    // loaded, so concurrent callers never get a stateless bridge and a failed
+    // load is not cached forever
+    let loading = this.#loading.get(canisterId)
+    if (!loading) {
+      loading = (async () => {
+        const bridge = new BridgeCanisterAPI(canisterId)
+        await bridge.loadState()
+        this.#bridges.set(canisterId, bridge)
+        return bridge
+      })()
+      this.#loading.set(canisterId, loading)
+      loading.finally(() => this.#loading.delete(canisterId)).catch(() => {})
+    }
+
+    return loading
   }
 
   readonly canisterId: Principal
@@ -441,6 +455,8 @@ export class BridgingProgress {
       }
     } catch (error) {
       console.error(`Error refreshing log ${this.#tx}:`, error)
+      // keep polling: a transient failure must not strand the UI in "Bridging..."
+      setTimeout(() => this.#refreshLog(), 5000)
     }
   }
 
@@ -485,6 +501,7 @@ export type TransferTxInfo = {
 export class TransferingProgress {
   #api: BridgeCanisterAPI
   #tx = $state<TransferTxInfo | null>(null)
+  #error = $state<string | null>(null)
 
   static track(
     api: BridgeCanisterAPI,
@@ -501,35 +518,43 @@ export class TransferingProgress {
   }
 
   #refreshLog = async (): Promise<void> => {
-    if (!this.#tx || this.#tx.isFinalized) return
+    if (!this.#tx || this.#tx.isFinalized || this.#error) return
 
     try {
       if ('Evm' in this.#tx) {
         const evm = await this.#api.loadEVMTokenAPI(this.#tx.chain)
         const receipt = await evm.getTransactionReceipt(this.#tx.Evm)
-        if (receipt && receipt.status === '0x1') {
-          this.#tx.isFinalized = true
+        if (receipt) {
+          if (receipt.status === '0x1') {
+            this.#tx.isFinalized = true
+          } else {
+            // the transaction was mined but reverted, it will never finalize
+            this.#error = `transaction reverted on ${this.#tx.chain}`
+          }
           return
         }
         setTimeout(() => this.#refreshLog(), 2000)
       } else if ('Sol' in this.#tx) {
         const sol = await this.#api.loadSvmTokenAPI()
-        if (sol) {
-          const status = await sol.getTransactionStatus(this.#tx.Sol)
-          if (status === 'finalized') {
-            this.#tx.isFinalized = true
-            return
-          }
-
-          setTimeout(() => this.#refreshLog(), 2000)
+        const status = sol ? await sol.getTransactionStatus(this.#tx.Sol) : ''
+        if (status === 'finalized') {
+          this.#tx.isFinalized = true
+          return
         }
+
+        setTimeout(() => this.#refreshLog(), 2000)
       }
     } catch (error) {
       console.error(`Error refreshing log ${this.#tx}:`, error)
+      // keep polling: a transient failure must not strand the UI in "Transfering..."
+      setTimeout(() => this.#refreshLog(), 5000)
     }
   }
 
   get status(): BridgingStatus {
+    if (this.#error) {
+      return 'Error'
+    }
     if (this.#tx?.isFinalized) {
       return 'Completed'
     }
@@ -538,6 +563,12 @@ export class TransferingProgress {
 
   get isComplete(): boolean {
     return this.#tx?.isFinalized || false
+  }
+
+  // the progress is settled once the transaction finalized or failed, only then
+  // the UI may be reset for a new transfer
+  get isSettled(): boolean {
+    return this.isComplete || !!this.#error
   }
 
   get chain(): string {
@@ -579,6 +610,9 @@ export class TransferingProgress {
   }
 
   get message(): string {
+    if (this.#error) {
+      return this.#error
+    }
     if (this.isComplete) {
       return ''
     }
