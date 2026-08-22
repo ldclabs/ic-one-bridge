@@ -21,7 +21,7 @@ fn info() -> Result<store::StateInfo, String> {
 fn evm_address(user: Option<Principal>) -> Result<String, String> {
     let user = user.unwrap_or_else(ic_cdk::api::msg_caller);
     check_auth(&user)?;
-    let addr = store::state::evm_address(&user);
+    let addr = store::state::evm_address(&user)?;
     Ok(addr.to_string())
 }
 
@@ -29,7 +29,7 @@ fn evm_address(user: Option<Principal>) -> Result<String, String> {
 fn svm_address(user: Option<Principal>) -> Result<String, String> {
     let user = user.unwrap_or_else(ic_cdk::api::msg_caller);
     check_auth(&user)?;
-    let addr = store::state::svm_address(&user);
+    let addr = store::state::svm_address(&user)?;
     Ok(addr.to_string())
 }
 

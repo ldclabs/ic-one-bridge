@@ -223,26 +223,34 @@ fn validate_admin_set_svm_providers(providers: Vec<String>) -> Result<String, St
 
 #[ic_cdk::update(guard = "is_controller")]
 async fn admin_collect_fees(to: Principal, icp_amount: u128) -> Result<store::BridgeTx, String> {
-    let ledger = store::state::with(|s| {
+    let ledger = store::state::with_mut(|s| {
         if icp_amount == 0 {
             return Err("amount must be greater than 0".to_string());
         }
-        if icp_amount + s.total_withdrawn_fees > s.total_collected_fees {
+        let available = available_fees(s)?;
+        if icp_amount > available {
             return Err(format!(
                 "amount {} exceeds available fees {}",
-                icp_amount,
-                s.total_collected_fees - s.total_withdrawn_fees
+                icp_amount, available
             ));
         }
+        s.total_withdrawn_fees = s
+            .total_withdrawn_fees
+            .checked_add(icp_amount)
+            .ok_or_else(|| "total_withdrawn_fees overflow".to_string())?;
 
         Ok(s.token_ledger)
     })?;
 
-    let tx = store::state::to_icp(ledger, to, icp_amount).await?;
-    store::state::with_mut(|s| {
-        s.total_withdrawn_fees += icp_amount;
-    });
-    Ok(tx)
+    match store::state::to_icp(ledger, to, icp_amount).await {
+        Ok(tx) => Ok(tx),
+        Err(err) => {
+            store::state::with_mut(|s| {
+                s.total_withdrawn_fees = s.total_withdrawn_fees.saturating_sub(icp_amount);
+            });
+            Err(err)
+        }
+    }
 }
 
 #[ic_cdk::update]
@@ -251,16 +259,22 @@ async fn validate_admin_collect_fees(to: Principal, icp_amount: u128) -> Result<
         if icp_amount == 0 {
             return Err("icp_amount must be greater than 0".to_string());
         }
-        if icp_amount > s.total_collected_fees - s.total_withdrawn_fees {
+        let available = available_fees(s)?;
+        if icp_amount > available {
             return Err(format!(
                 "icp_amount {} exceeds available fees {}",
-                icp_amount,
-                s.total_collected_fees - s.total_withdrawn_fees
+                icp_amount, available
             ));
         }
         Ok(())
     })?;
     pretty_format(&(to, icp_amount))
+}
+
+fn available_fees(s: &store::State) -> Result<u128, String> {
+    s.total_collected_fees
+        .checked_sub(s.total_withdrawn_fees)
+        .ok_or_else(|| "total_withdrawn_fees exceeds total_collected_fees".to_string())
 }
 
 fn is_controller() -> Result<(), String> {

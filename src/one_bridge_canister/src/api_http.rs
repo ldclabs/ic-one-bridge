@@ -116,7 +116,36 @@ fn parse_url(s: &str) -> Result<Url, String> {
 }
 
 fn supports_cbor(headers: &[HeaderField]) -> bool {
-    headers
-        .iter()
-        .any(|(name, value)| (name == "accept" || name == "content-type") && value.contains(CBOR))
+    headers.iter().any(|(name, value)| {
+        (name.eq_ignore_ascii_case("accept") || name.eq_ignore_ascii_case("content-type"))
+            && value.split(',').any(|part| {
+                part.trim()
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case(CBOR)
+            })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supports_cbor_matches_header_names_and_values_case_insensitively() {
+        assert!(supports_cbor(&[(
+            "Accept".to_string(),
+            "Application/CBOR".to_string()
+        )]));
+        assert!(supports_cbor(&[(
+            "CONTENT-TYPE".to_string(),
+            "application/cbor; charset=binary".to_string()
+        )]));
+        assert!(!supports_cbor(&[(
+            "accept".to_string(),
+            "application/json".to_string()
+        )]));
+    }
 }

@@ -93,15 +93,17 @@ impl<H: HttpOutcall> SvmClient<H> {
             }),
         ];
 
-        let mut res: RpcContextValue<Vec<Option<SignatureStatus>>> = self
+        let res: RpcContextValue<Vec<Option<SignatureStatus>>> = self
             .call(
                 format!("getSignatureStatuses-{now_ms}"),
                 "getSignatureStatuses",
                 params.as_slice(),
             )
             .await?;
-        let status = res.value.remove(0);
-        Ok(status)
+        res.value
+            .into_iter()
+            .next()
+            .ok_or_else(|| "missing signature status".to_string())
     }
 
     #[allow(dead_code)]
@@ -456,6 +458,24 @@ mod tests {
             futures::executor::block_on(client.get_transaction(1_000, "sig", None, None)).unwrap();
 
         assert!(tx.is_none());
+    }
+
+    #[test]
+    fn test_get_signature_statuses_rejects_empty_status_array() {
+        let mock = MockHttpOutcall::new(vec![success_response(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "context": {"slot": 321},
+                "value": []
+            }
+        }))]);
+
+        let client = SvmClient::new(vec!["https://sol".to_string()], None, None, mock);
+        let err = futures::executor::block_on(client.get_signature_statuses(1_111, "signature"))
+            .unwrap_err();
+
+        assert!(err.contains("missing signature status"));
     }
 
     #[test]

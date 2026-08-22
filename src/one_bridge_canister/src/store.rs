@@ -30,7 +30,7 @@ use std::{
 use crate::{
     ecdsa::{cost_sign_with_ecdsa, derive_public_key, ecdsa_public_key, sign_with_ecdsa},
     evm::{EvmClient, encode_erc20_transfer},
-    helper::{call, convert_amount, format_error},
+    helper::{bridge_amount_after_fee, call, convert_amount, format_error},
     outcall::DefaultHttpOutcall,
     schnorr::{derive_schnorr_public_key, schnorr_public_key, sign_with_schnorr},
     svm::{
@@ -403,6 +403,7 @@ const BRIDGE_LOGS_DATA_MEMORY_ID: MemoryId = MemoryId::new(3);
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::new());
     static HTTP_TREE: RefCell<HttpCertificationTree> = RefCell::new(HttpCertificationTree::default());
+    static ACTIVE_BRIDGE_USERS: RefCell<BTreeSet<Principal>> = const { RefCell::new(BTreeSet::new()) };
 
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
         RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
@@ -428,6 +429,42 @@ thread_local! {
     );
 }
 
+struct ActiveBridgeUserGuard(Principal);
+
+impl Drop for ActiveBridgeUserGuard {
+    fn drop(&mut self) {
+        ACTIVE_BRIDGE_USERS.with_borrow_mut(|users| {
+            users.remove(&self.0);
+        });
+    }
+}
+
+fn acquire_active_bridge_user(user: Principal) -> Result<ActiveBridgeUserGuard, String> {
+    ACTIVE_BRIDGE_USERS.with_borrow_mut(|users| {
+        if users.insert(user) {
+            Ok(ActiveBridgeUserGuard(user))
+        } else {
+            Err("there is already a bridge request in progress for this user".to_string())
+        }
+    })
+}
+
+fn bump_priority_fee(value: u128) -> Result<u128, String> {
+    value
+        .checked_add(value / 5)
+        .ok_or_else(|| "max_priority_fee_per_gas overflow".to_string())
+}
+
+fn calculate_max_fee_per_gas(
+    gas_price: u128,
+    max_priority_fee_per_gas: u128,
+) -> Result<u128, String> {
+    gas_price
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(max_priority_fee_per_gas))
+        .ok_or_else(|| "max_fee_per_gas overflow".to_string())
+}
+
 pub mod state {
     use std::str::FromStr;
 
@@ -451,13 +488,19 @@ pub mod state {
         let key_name = STATE.with_borrow(|r| r.key_name.clone());
         match ecdsa_public_key(key_name.clone(), vec![]).await {
             Ok(root_pk) => {
-                STATE.with_borrow_mut(|s| {
-                    let self_pk =
-                        derive_public_key(&root_pk, vec![s.icp_address.as_slice().to_vec()])
-                            .expect("derive_public_key failed");
-                    s.ecdsa_public_key = root_pk;
-                    s.evm_address = self_pk.to_evm_adress().unwrap();
+                let evm_address = STATE.with_borrow(|s| {
+                    derive_evm_address(&root_pk, &s.icp_address)
+                        .map_err(|err| format!("failed to derive EVM address: {err}"))
                 });
+                match evm_address {
+                    Ok(evm_address) => {
+                        STATE.with_borrow_mut(|s| {
+                            s.ecdsa_public_key = root_pk;
+                            s.evm_address = evm_address;
+                        });
+                    }
+                    Err(err) => ic_cdk::api::debug_print(err),
+                }
             }
             Err(err) => {
                 ic_cdk::api::debug_print(format!("failed to retrieve ECDSA public key: {err}"));
@@ -466,17 +509,19 @@ pub mod state {
 
         match schnorr_public_key(key_name, vec![], None).await {
             Ok(root_pk) => {
-                STATE.with_borrow_mut(|s| {
-                    let self_pk = derive_schnorr_public_key(
-                        &root_pk,
-                        vec![s.icp_address.as_slice().to_vec()],
-                        None,
-                    )
-                    .expect("derive_schnorr_public_key failed");
-
-                    s.ed25519_public_key = root_pk;
-                    s.svm_address = self_pk.to_svm_pubkey().unwrap();
+                let svm_address = STATE.with_borrow(|s| {
+                    derive_svm_address(&root_pk, &s.icp_address)
+                        .map_err(|err| format!("failed to derive SVM address: {err}"))
                 });
+                match svm_address {
+                    Ok(svm_address) => {
+                        STATE.with_borrow_mut(|s| {
+                            s.ed25519_public_key = root_pk;
+                            s.svm_address = svm_address;
+                        });
+                    }
+                    Err(err) => ic_cdk::api::debug_print(err),
+                }
             }
             Err(err) => {
                 ic_cdk::api::debug_print(format!("failed to retrieve Schnorr public key: {err}"));
@@ -498,17 +543,19 @@ pub mod state {
 
         match schnorr_public_key(key_name, vec![], None).await {
             Ok(root_pk) => {
-                STATE.with_borrow_mut(|s| {
-                    let self_pk = derive_schnorr_public_key(
-                        &root_pk,
-                        vec![s.icp_address.as_slice().to_vec()],
-                        None,
-                    )
-                    .expect("derive_schnorr_public_key failed");
-
-                    s.ed25519_public_key = root_pk;
-                    s.svm_address = self_pk.to_svm_pubkey().unwrap();
+                let svm_address = STATE.with_borrow(|s| {
+                    derive_svm_address(&root_pk, &s.icp_address)
+                        .map_err(|err| format!("failed to derive SVM address: {err}"))
                 });
+                match svm_address {
+                    Ok(svm_address) => {
+                        STATE.with_borrow_mut(|s| {
+                            s.ed25519_public_key = root_pk;
+                            s.svm_address = svm_address;
+                        });
+                    }
+                    Err(err) => ic_cdk::api::debug_print(err),
+                }
             }
             Err(err) => {
                 ic_cdk::api::debug_print(format!("failed to retrieve Schnorr public key: {err}"));
@@ -565,12 +612,17 @@ pub mod state {
         info
     }
 
-    pub fn evm_address(user: &Principal) -> Address {
-        STATE.with_borrow(|s| {
-            let pk = derive_public_key(&s.ecdsa_public_key, vec![user.as_slice().to_vec()])
-                .expect("derive_public_key failed");
-            pk.to_evm_adress().unwrap()
-        })
+    fn derive_evm_address(
+        public_key: &PublicKeyOutput,
+        user: &Principal,
+    ) -> Result<Address, String> {
+        let pk = derive_public_key(public_key, vec![user.as_slice().to_vec()])
+            .map_err(|err| format!("derive_public_key failed: {err}"))?;
+        pk.to_evm_adress()
+    }
+
+    pub fn evm_address(user: &Principal) -> Result<Address, String> {
+        STATE.with_borrow(|s| derive_evm_address(&s.ecdsa_public_key, user))
     }
 
     pub fn evm_client(chain: &str) -> EvmClient<DefaultHttpOutcall> {
@@ -613,16 +665,17 @@ pub mod state {
         sign_with_ecdsa(key_name, derivation_path, message_hash).await
     }
 
-    pub fn svm_address(user: &Principal) -> Pubkey {
-        STATE.with_borrow(|s| {
-            let pk = derive_schnorr_public_key(
-                &s.ed25519_public_key,
-                vec![user.as_slice().to_vec()],
-                None,
-            )
-            .expect("derive_schnorr_public_key failed");
-            pk.to_svm_pubkey().unwrap()
-        })
+    fn derive_svm_address(
+        public_key: &PublicKeyOutput,
+        user: &Principal,
+    ) -> Result<Pubkey, String> {
+        let pk = derive_schnorr_public_key(public_key, vec![user.as_slice().to_vec()], None)
+            .map_err(|err| format!("derive_schnorr_public_key failed: {err}"))?;
+        pk.to_svm_pubkey()
+    }
+
+    pub fn svm_address(user: &Principal) -> Result<Pubkey, String> {
+        STATE.with_borrow(|s| derive_svm_address(&s.ed25519_public_key, user))
     }
 
     pub fn svm_client() -> SvmClient<DefaultHttpOutcall> {
@@ -647,6 +700,7 @@ pub mod state {
         if from_chain == to_chain {
             return Err("from_chain and to_chain cannot be the same".to_string());
         }
+        let _active_bridge_user = acquire_active_bridge_user(user)?;
 
         let (from, to, token_ledger, token_bridge_fee) = STATE.with_borrow(|s| {
             if s.error_rounds >= MAX_ERROR_ROUNDS {
@@ -669,6 +723,7 @@ pub mod state {
                     icp_amount, s.min_threshold_to_bridge
                 ));
             }
+            bridge_amount_after_fee(icp_amount, s.token_bridge_fee)?;
             let from = if from_chain == "ICP" {
                 BridgeTarget::Icp
             } else if from_chain == "SOL" {
@@ -908,16 +963,19 @@ pub mod state {
                 }
 
                 s.pending.retain(|t| !t.is_finalized());
-                s.finalize_bridging_round = (s.finalize_bridging_round.0 + 1, false);
+                s.finalize_bridging_round = (s.finalize_bridging_round.0.saturating_add(1), false);
 
                 if s.pending.is_empty() {
                     None
                 } else if has_error {
-                    s.error_rounds += 1;
+                    s.error_rounds = s.error_rounds.saturating_add(1);
                     if s.error_rounds >= MAX_ERROR_ROUNDS {
                         None
                     } else {
-                        Some((5 * s.error_rounds, s.finalize_bridging_round.0))
+                        Some((
+                            5_u64.saturating_mul(s.error_rounds),
+                            s.finalize_bridging_round.0,
+                        ))
                     }
                 } else {
                     s.error_rounds = 0;
@@ -968,12 +1026,8 @@ pub mod state {
                         } else {
                             task.user
                         };
-                        let to_tx = to_icp(
-                            token_ledger,
-                            to_addr,
-                            task.icp_amount.saturating_sub(task.fee),
-                        )
-                        .await?;
+                        let to_amount = bridge_amount_after_fee(task.icp_amount, task.fee)?;
+                        let to_tx = to_icp(token_ledger, to_addr, to_amount).await?;
                         task.to_tx = Some(to_tx);
                     }
                     (BridgeTarget::Evm(chain), None) => {
@@ -981,16 +1035,16 @@ pub mod state {
                             addr.parse::<Address>()
                                 .map_err(|_| format!("EVM: invalid to_addr address: {}", addr))?
                         } else {
-                            state::evm_address(&task.user)
+                            state::evm_address(&task.user)?
                         };
-                        let to_tx = to_evm(
-                            chain,
-                            to_addr,
-                            task.icp_amount.saturating_sub(task.fee),
-                            now_ms,
-                        )
-                        .await?;
-                        task.to_tx = Some(to_tx);
+                        let to_amount = bridge_amount_after_fee(task.icp_amount, task.fee)?;
+                        match to_evm(chain, to_addr, to_amount, now_ms).await {
+                            Ok(to_tx) => task.to_tx = Some(to_tx),
+                            Err((sent_tx, err)) => {
+                                task.to_tx = sent_tx;
+                                return Err(err);
+                            }
+                        }
                     }
                     (BridgeTarget::Evm(chain), Some(BridgeTx::Evm(finalized, tx_hash)))
                         if !*finalized =>
@@ -1006,21 +1060,32 @@ pub mod state {
                             Pubkey::from_str(addr)
                                 .map_err(|_| format!("SOL: invalid to_addr address: {}", addr))?
                         } else {
-                            state::svm_address(&task.user)
+                            state::svm_address(&task.user)?
                         };
-                        let to_tx =
-                            to_svm(to_addr, task.icp_amount.saturating_sub(task.fee), now_ms)
-                                .await?;
-                        task.to_tx = Some(to_tx);
+                        let to_amount = bridge_amount_after_fee(task.icp_amount, task.fee)?;
+                        match to_svm(to_addr, to_amount, now_ms).await {
+                            Ok(to_tx) => task.to_tx = Some(to_tx),
+                            Err((sent_tx, err)) => {
+                                task.to_tx = sent_tx;
+                                return Err(err);
+                            }
+                        }
                     }
                     (BridgeTarget::Sol, Some(BridgeTx::Sol(finalized, tx_hash))) if !*finalized => {
-                        let status = check_sol_tx_finalized(tx_hash, now_ms).await?;
-                        let from_finalized = status.as_ref().is_some_and(|f| f.is_finalized());
-                        if from_finalized {
-                            *finalized = true;
-                        } else if status.as_ref().is_none_or(|f| f.is_error()) {
-                            task.to_tx = None; // reset to_tx to retry
-                            return Err("SOL: transaction failed".to_string());
+                        match check_sol_tx_finalized(tx_hash, now_ms).await? {
+                            // The transaction was rejected on chain, so it moved no
+                            // funds and a fresh one can safely be built next round.
+                            Some(status) if status.is_error() => {
+                                task.to_tx = None; // reset to_tx to retry
+                                return Err(format!("SOL: transaction failed: {:?}", status.err));
+                            }
+                            Some(status) if status.is_finalized() => {
+                                *finalized = true;
+                            }
+                            // Either still confirming, or the RPC node has not indexed the
+                            // signature yet. Keep waiting: dropping to_tx here would send a
+                            // second transfer and pay the recipient twice.
+                            _ => {}
                         }
                     }
                     _ => {}
@@ -1079,6 +1144,10 @@ pub mod state {
         to_addr: Principal,
         icp_amount: u128,
     ) -> Result<BridgeTx, String> {
+        if icp_amount == 0 {
+            return Err("ICP: amount must be greater than 0".to_string());
+        }
+
         let res: Result<Nat, TransferFromError> = call(
             token_ledger,
             "icrc1_transfer",
@@ -1126,12 +1195,21 @@ pub mod state {
         Ok(BridgeTx::Evm(false, tx_hash.into()))
     }
 
+    /// Broadcasts an outgoing payout transaction.
+    ///
+    /// On failure the returned `Option<BridgeTx>` carries the transaction that was
+    /// already signed and handed to the provider, if any: the provider may have
+    /// accepted and propagated it even though the RPC call itself failed, so the
+    /// caller must record it and poll for its receipt instead of building and
+    /// sending a second transaction.
+    type BroadcastResult = Result<BridgeTx, (Option<BridgeTx>, String)>;
+
     async fn to_evm(
         chain: &str,
         to_addr: Address,
         icp_amount: u128,
         now_ms: u64,
-    ) -> Result<BridgeTx, String> {
+    ) -> BroadcastResult {
         // let to_addr = evm_address(&user);
         let (client, signed_tx) = build_erc20_transfer_tx(
             chain,
@@ -1141,16 +1219,17 @@ pub mod state {
             now_ms,
         )
         .await
-        .map_err(|err| format!("{chain}: {err}"))?;
+        .map_err(|err| (None, format!("{chain}: {err}")))?;
 
         let tx_hash: [u8; 32] = (*signed_tx.hash()).into();
+        let tx = BridgeTx::Evm(false, tx_hash.into());
         let data = signed_tx.encoded_2718();
 
-        let _ = client
+        client
             .send_raw_transaction(now_ms, Bytes::from(data).to_string())
             .await
-            .map_err(|err| format!("{chain}: {err}"))?;
-        Ok(BridgeTx::Evm(false, tx_hash.into()))
+            .map_err(|err| (Some(tx.clone()), format!("{chain}: {err}")))?;
+        Ok(tx)
     }
 
     async fn from_svm(user: Principal, icp_amount: u128, now_ms: u64) -> Result<BridgeTx, String> {
@@ -1168,21 +1247,22 @@ pub mod state {
         Ok(BridgeTx::Sol(false, tx_hash.into()))
     }
 
-    async fn to_svm(to_addr: Pubkey, icp_amount: u128, now_ms: u64) -> Result<BridgeTx, String> {
+    async fn to_svm(to_addr: Pubkey, icp_amount: u128, now_ms: u64) -> BroadcastResult {
         // let to_addr = evm_address(&user);
         let (client, signed_tx) =
             build_spl_transfer_tx(&ic_cdk::api::canister_self(), &to_addr, icp_amount, now_ms)
                 .await
-                .map_err(|err| format!("SOL: {err}"))?;
+                .map_err(|err| (None, format!("SOL: {err}")))?;
 
         let tx_hash: [u8; 64] = signed_tx.signatures[0].into();
-        let data = bincode::serialize(&signed_tx).map_err(|err| format!("SOL: {err}"))?;
+        let tx = BridgeTx::Sol(false, tx_hash.into());
+        let data = bincode::serialize(&signed_tx).map_err(|err| (None, format!("SOL: {err}")))?;
 
-        let _ = client
+        client
             .send_transaction(now_ms, data.into(), true)
             .await
-            .map_err(|err| format!("SOL: {err}"))?;
-        Ok(BridgeTx::Sol(false, tx_hash.into()))
+            .map_err(|err| (Some(tx.clone()), format!("SOL: {err}")))?;
+        Ok(tx)
     }
 
     pub async fn build_erc20_transfer_tx(
@@ -1200,13 +1280,19 @@ pub mod state {
                 .ok_or_else(|| format!("chain {chain} not found"))?;
 
             let value = convert_amount(icp_amount, s.token_decimals, decimals)?;
+            if value == 0 {
+                return Err(format!(
+                    "{chain}: amount {icp_amount} is too small for target token decimals {decimals}"
+                ));
+            }
             let from_pk = derive_public_key(&s.ecdsa_public_key, vec![from.as_slice().to_vec()])
                 .map_err(|_e| format!("{chain}: derive_public_key failed"))?;
 
             let input = encode_erc20_transfer(to_addr, value);
             let (gas_updated_at, gas_price, max_priority_fee_per_gas) =
                 s.evm_latest_gas.get(chain).cloned().unwrap_or_default();
-            let max_priority_fee_per_gas = max_priority_fee_per_gas + max_priority_fee_per_gas / 5;
+            let max_priority_fee_per_gas = bump_priority_fee(max_priority_fee_per_gas)?;
+            let max_fee_per_gas = calculate_max_fee_per_gas(gas_price, max_priority_fee_per_gas)?;
             Ok::<_, String>((
                 s.key_name.clone(),
                 from_pk,
@@ -1214,7 +1300,7 @@ pub mod state {
                     chain_id,
                     nonce: 0u64,
                     gas_limit: 84_000u64, // sample: ~53,696
-                    max_fee_per_gas: gas_price * 2 + max_priority_fee_per_gas,
+                    max_fee_per_gas,
                     max_priority_fee_per_gas,
                     to: contract.into(),
                     input: input.into(),
@@ -1230,7 +1316,7 @@ pub mod state {
         }
 
         let client = evm_client(chain);
-        if gas_updated_at + 120_000 >= now_ms {
+        if gas_updated_at.saturating_add(120_000) >= now_ms {
             let nonce = client.get_transaction_count(now_ms, &from_addr).await?;
             tx.nonce = nonce;
         } else {
@@ -1241,8 +1327,8 @@ pub mod state {
             )
             .await?;
             tx.nonce = nonce;
-            tx.max_priority_fee_per_gas = max_priority_fee_per_gas + max_priority_fee_per_gas / 5;
-            tx.max_fee_per_gas = gas_price * 2 + tx.max_priority_fee_per_gas;
+            tx.max_priority_fee_per_gas = bump_priority_fee(max_priority_fee_per_gas)?;
+            tx.max_fee_per_gas = calculate_max_fee_per_gas(gas_price, tx.max_priority_fee_per_gas)?;
             STATE.with_borrow_mut(|s| {
                 s.evm_latest_gas.insert(
                     chain.to_string(),
@@ -1254,6 +1340,9 @@ pub mod state {
         let msg_hash = tx.signature_hash();
         let sig =
             sign_with_ecdsa(key_name, vec![from.as_slice().to_vec()], msg_hash.to_vec()).await?;
+        if sig.len() != 64 {
+            return Err(format!("invalid ECDSA signature length: {}", sig.len()));
+        }
         let signature = Signature::new(
             U256::from_be_slice(&sig[0..32]),  // r
             U256::from_be_slice(&sig[32..64]), // s
@@ -1277,12 +1366,16 @@ pub mod state {
                 .get(chain)
                 .map(|(_, _, chain_id)| *chain_id)
                 .ok_or_else(|| "chain not found".to_string())?;
+            if amount == 0 {
+                return Err("amount must be greater than 0".to_string());
+            }
 
             let from_pk = derive_public_key(&s.ecdsa_public_key, vec![from.as_slice().to_vec()])
-                .expect("derive_public_key failed");
+                .map_err(|err| format!("derive_public_key failed: {err}"))?;
             let (gas_updated_at, gas_price, max_priority_fee_per_gas) =
                 s.evm_latest_gas.get(chain).cloned().unwrap_or_default();
-            let max_priority_fee_per_gas = max_priority_fee_per_gas + max_priority_fee_per_gas / 5;
+            let max_priority_fee_per_gas = bump_priority_fee(max_priority_fee_per_gas)?;
+            let max_fee_per_gas = calculate_max_fee_per_gas(gas_price, max_priority_fee_per_gas)?;
             Ok::<_, String>((
                 s.key_name.clone(),
                 from_pk,
@@ -1290,7 +1383,7 @@ pub mod state {
                     chain_id,
                     nonce: 0u64,
                     gas_limit: 32_000u64, // sample: ~21,000
-                    max_fee_per_gas: gas_price * 2 + max_priority_fee_per_gas,
+                    max_fee_per_gas,
                     max_priority_fee_per_gas,
                     to: (*to_addr).into(),
                     value: amount
@@ -1308,7 +1401,7 @@ pub mod state {
         }
 
         let client = evm_client(chain);
-        if gas_updated_at + 120_000 >= now_ms {
+        if gas_updated_at.saturating_add(120_000) >= now_ms {
             let nonce = client.get_transaction_count(now_ms, &from_addr).await?;
             tx.nonce = nonce;
         } else {
@@ -1319,8 +1412,8 @@ pub mod state {
             )
             .await?;
             tx.nonce = nonce;
-            tx.max_priority_fee_per_gas = max_priority_fee_per_gas + max_priority_fee_per_gas / 5;
-            tx.max_fee_per_gas = gas_price * 2 + tx.max_priority_fee_per_gas;
+            tx.max_priority_fee_per_gas = bump_priority_fee(max_priority_fee_per_gas)?;
+            tx.max_fee_per_gas = calculate_max_fee_per_gas(gas_price, tx.max_priority_fee_per_gas)?;
             STATE.with_borrow_mut(|s| {
                 s.evm_latest_gas.insert(
                     chain.to_string(),
@@ -1332,6 +1425,9 @@ pub mod state {
         let msg_hash = tx.signature_hash();
         let sig =
             sign_with_ecdsa(key_name, vec![from.as_slice().to_vec()], msg_hash.to_vec()).await?;
+        if sig.len() != 64 {
+            return Err(format!("invalid ECDSA signature length: {}", sig.len()));
+        }
         let signature = Signature::new(
             U256::from_be_slice(&sig[0..32]),  // r
             U256::from_be_slice(&sig[32..64]), // s
@@ -1357,7 +1453,7 @@ pub mod state {
             (Ok(latest), Ok(Some(receipt))) => {
                 if let Some(block_number) = receipt.block_number
                     && *tx_hash == receipt.transaction_hash
-                    && latest >= block_number + client.max_confirmations
+                    && latest.saturating_sub(block_number) >= client.max_confirmations
                 {
                     // We don't need to check the logs here.
                     // log.address == 代币合约地址
@@ -1365,7 +1461,12 @@ pub mod state {
                     // log.topics[1] == from 地址（32 字节左填充）
                     // log.topics[2] == to 地址（32 字节左填充）
                     // log.data 为 uint256 的转账数量（ABI 编码）
-                    return Ok(receipt.status());
+                    if !receipt.status() {
+                        // The transaction is mined and reverted: it will never finalize,
+                        // so report it instead of polling this receipt forever.
+                        return Err(format!("{chain}: transaction {tx_hash} reverted on chain"));
+                    }
+                    return Ok(true);
                 }
                 Ok(false)
             }
@@ -1399,6 +1500,11 @@ pub mod state {
             let (mint_pubkey, decimals, token_program_id) = s.svm_token_address;
 
             let amount = convert_amount(icp_amount, s.token_decimals, decimals)?;
+            if amount == 0 {
+                return Err(format!(
+                    "amount {icp_amount} is too small for target token decimals {decimals}"
+                ));
+            }
             let amount: u64 = amount
                 .try_into()
                 .map_err(|_| format!("amount is too large: {}", amount))?;
@@ -1460,6 +1566,10 @@ pub mod state {
         sol_amount: u64,
         now_ms: u64,
     ) -> Result<(SvmClient<DefaultHttpOutcall>, Transaction), String> {
+        if sol_amount == 0 {
+            return Err("amount must be greater than 0".to_string());
+        }
+
         let (key_name, from_addr, ixs) = STATE.with_borrow(|s| {
             let from_pk = derive_schnorr_public_key(
                 &s.ed25519_public_key,

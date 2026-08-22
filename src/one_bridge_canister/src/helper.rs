@@ -65,6 +65,13 @@ pub fn convert_amount(
     }
 }
 
+pub fn bridge_amount_after_fee(amount: u128, fee: u128) -> Result<u128, String> {
+    amount
+        .checked_sub(fee)
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| format!("amount {amount} must be greater than bridge fee {fee}"))
+}
+
 pub async fn call<In, Out>(
     id: Principal,
     method: &str,
@@ -79,11 +86,11 @@ where
         .with_args(&args)
         .with_cycles(cycles)
         .await
-        .map_err(|err| format!("failed to call {} on {:?}, error: {:?}", method, &id, err))?;
+        .map_err(|err| format!("failed to call {} on {:?}, error: {:?}", method, id, err))?;
     res.candid().map_err(|err| {
         format!(
             "failed to decode response from {} on {:?}, error: {:?}",
-            method, &id, err
+            method, id, err
         )
     })
 }
@@ -96,4 +103,22 @@ where
     let doc = pp_value(7, &val);
 
     Ok(format!("{}", doc.pretty(120)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_amount_after_fee_requires_positive_net_amount() {
+        assert_eq!(bridge_amount_after_fee(100, 1), Ok(99));
+        assert!(bridge_amount_after_fee(100, 100).is_err());
+        assert!(bridge_amount_after_fee(100, 101).is_err());
+    }
+
+    #[test]
+    fn convert_amount_downscales_with_flooring() {
+        assert_eq!(convert_amount(123_456_789, 8, 6), Ok(1_234_567));
+        assert_eq!(convert_amount(99, 8, 6), Ok(0));
+    }
 }

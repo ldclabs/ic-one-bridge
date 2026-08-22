@@ -33,11 +33,16 @@ pub struct SignatureStatus {
 }
 
 impl SignatureStatus {
+    /// A transaction only counts as finalized when it also succeeded: a failed
+    /// transaction still reaches the `finalized` commitment level, but it moved
+    /// no funds and must never be treated as a completed transfer.
     pub fn is_finalized(&self) -> bool {
-        self.confirmation_status
-            .as_deref()
-            .map(|s| s == "finalized")
-            .unwrap_or(false)
+        !self.is_error()
+            && self
+                .confirmation_status
+                .as_deref()
+                .map(|s| s == "finalized")
+                .unwrap_or(false)
     }
 
     pub fn is_error(&self) -> bool {
@@ -53,5 +58,33 @@ pub fn get_token_account(val: UiAccount) -> Result<TokenAccountType, String> {
             Ok(account)
         }
         _ => Err("UiAccount data is not in JSON format".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn status(confirmation_status: &str, err: Option<Value>) -> SignatureStatus {
+        SignatureStatus {
+            slot: 1,
+            confirmations: None,
+            confirmation_status: Some(confirmation_status.to_string()),
+            err,
+        }
+    }
+
+    #[test]
+    fn finalized_but_failed_transaction_is_not_finalized() {
+        assert!(status("finalized", None).is_finalized());
+        assert!(!status("confirmed", None).is_finalized());
+
+        let failed = status(
+            "finalized",
+            Some(json!({"InstructionError": [0, "Custom"]})),
+        );
+        assert!(failed.is_error());
+        assert!(!failed.is_finalized());
     }
 }

@@ -296,18 +296,24 @@ fn decode_abi_string(bytes: &[u8]) -> Result<String, String> {
     }
 
     let offset = U256::try_from_be_slice(&bytes[0..32]).unwrap();
-    let offset = usize::try_from(offset).unwrap_or(isize::MAX as usize);
-    if bytes.len() < offset + 32 {
+    let offset = usize::try_from(offset).map_err(|_| "abi string offset too large".to_string())?;
+    let offset_end = offset
+        .checked_add(32)
+        .ok_or_else(|| "abi string offset out of bounds".to_string())?;
+    if bytes.len() < offset_end {
         return Err("abi string length out of bounds".to_string());
     }
 
-    let len = U256::try_from_be_slice(&bytes[offset..offset + 32]).unwrap();
-    let len = usize::try_from(len).unwrap_or(isize::MAX as usize);
-    if bytes.len() < offset + 32 + len {
+    let len = U256::try_from_be_slice(&bytes[offset..offset_end]).unwrap();
+    let len = usize::try_from(len).map_err(|_| "abi string length too large".to_string())?;
+    let data_end = offset_end
+        .checked_add(len)
+        .ok_or_else(|| "abi string data out of bounds".to_string())?;
+    if bytes.len() < data_end {
         return Err("abi string data out of bounds".to_string());
     }
 
-    let data = &bytes[offset + 32..offset + 32 + len];
+    let data = &bytes[offset_end..data_end];
     String::from_utf8(data.to_vec()).map_err(|err| err.to_string())
 }
 
@@ -367,6 +373,10 @@ mod tests {
         assert_eq!(decode_abi_string(&payload).unwrap(), "hello world");
 
         assert!(decode_abi_string(&payload[..60]).is_err());
+
+        let mut huge_offset = vec![0xff; 32];
+        huge_offset.extend(vec![0; 32]);
+        assert!(decode_abi_string(&huge_offset).is_err());
     }
 
     #[test]
