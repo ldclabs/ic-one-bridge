@@ -37,17 +37,19 @@ export interface InitArgs {
 }
 export type Result = { 'Ok' : null } |
   { 'Err' : string };
-export type Result_1 = { 'Ok' : BridgeTx } |
+export type Result_1 = { 'Ok' : BridgeLog } |
   { 'Err' : string };
-export type Result_2 = { 'Ok' : string } |
+export type Result_2 = { 'Ok' : BridgeTx } |
   { 'Err' : string };
-export type Result_3 = { 'Ok' : Uint8Array | number[] } |
+export type Result_3 = { 'Ok' : bigint } |
   { 'Err' : string };
-export type Result_4 = { 'Ok' : Array<BridgeLog> } |
+export type Result_4 = { 'Ok' : string } |
   { 'Err' : string };
-export type Result_5 = { 'Ok' : StateInfo } |
+export type Result_5 = { 'Ok' : Uint8Array | number[] } |
   { 'Err' : string };
-export type Result_6 = { 'Ok' : BridgeLog } |
+export type Result_6 = { 'Ok' : Array<BridgeLog> } |
+  { 'Err' : string };
+export type Result_7 = { 'Ok' : StateInfo } |
   { 'Err' : string };
 export interface StateInfo {
   'total_withdrawn_fees' : bigint,
@@ -88,41 +90,70 @@ export interface _SERVICE {
   'admin_add_bridges' : ActorMethod<[Array<Principal>], Result>,
   'admin_add_evm_contract' : ActorMethod<[string, bigint, string], Result>,
   'admin_add_svm_contract' : ActorMethod<[string], Result>,
-  'admin_collect_fees' : ActorMethod<[Principal, bigint], Result_1>,
+  /**
+   * Removes a stuck bridging task from the pending queue and archives it with its
+   * error preserved, unblocking the chains it references.
+   * 
+   * The task is recorded as not bridged: the amount and the fee are left out of
+   * the totals, and settling with the user is up to the administrator.
+   */
+  'admin_close_bridging_task' : ActorMethod<[BridgeTx], Result_1>,
+  'admin_collect_fees' : ActorMethod<[Principal, bigint], Result_2>,
   'admin_remove_bridges' : ActorMethod<[Array<Principal>], Result>,
+  /**
+   * Resets the error circuit breaker and re-arms the finalization timer chain.
+   * 
+   * Finalization stops scheduling itself once `error_rounds` reaches its limit,
+   * which disables bridging until someone intervenes. Use this once the cause of
+   * the failures has been dealt with.
+   */
+  'admin_restart_bridging' : ActorMethod<[], Result_3>,
+  /**
+   * Drops the outgoing transaction of a stuck bridging task so the next
+   * finalization round builds and broadcasts a fresh one.
+   * 
+   * Only use this after verifying on chain that the recorded outgoing
+   * transaction moved no funds (an EVM transaction that reverted, or a Solana
+   * transaction whose blockhash expired without landing). Retrying a payout that
+   * did go through pays the recipient twice.
+   */
+  'admin_retry_bridging_task' : ActorMethod<[BridgeTx], Result_1>,
   'admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
     Result
   >,
   'admin_set_svm_providers' : ActorMethod<[Array<string>], Result>,
-  'bridge' : ActorMethod<[string, string, bigint, [] | [string]], Result_1>,
-  'erc20_transfer' : ActorMethod<[string, string, bigint], Result_2>,
-  'erc20_transfer_tx' : ActorMethod<[string, string, bigint], Result_2>,
-  'evm_address' : ActorMethod<[[] | [Principal]], Result_2>,
-  'evm_sign' : ActorMethod<[Uint8Array | number[]], Result_3>,
-  'evm_transfer_tx' : ActorMethod<[string, string, bigint], Result_2>,
-  'finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_4>,
-  'info' : ActorMethod<[], Result_5>,
-  'my_bridge_log' : ActorMethod<[BridgeTx], Result_6>,
-  'my_finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_4>,
-  'my_pending_logs' : ActorMethod<[], Result_4>,
-  'pending_logs' : ActorMethod<[], Result_4>,
-  'sol_transfer_tx' : ActorMethod<[string, bigint], Result_2>,
-  'spl_transfer_tx' : ActorMethod<[string, bigint], Result_2>,
-  'svm_address' : ActorMethod<[[] | [Principal]], Result_2>,
-  'validate_admin_add_bridges' : ActorMethod<[Array<Principal>], Result_2>,
+  'bridge' : ActorMethod<[string, string, bigint, [] | [string]], Result_2>,
+  'erc20_transfer' : ActorMethod<[string, string, bigint], Result_4>,
+  'erc20_transfer_tx' : ActorMethod<[string, string, bigint], Result_4>,
+  'evm_address' : ActorMethod<[[] | [Principal]], Result_4>,
+  'evm_sign' : ActorMethod<[Uint8Array | number[]], Result_5>,
+  'evm_transfer_tx' : ActorMethod<[string, string, bigint], Result_4>,
+  'finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_6>,
+  'info' : ActorMethod<[], Result_7>,
+  'my_bridge_log' : ActorMethod<[BridgeTx], Result_1>,
+  'my_finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_6>,
+  'my_pending_logs' : ActorMethod<[], Result_6>,
+  'pending_logs' : ActorMethod<[], Result_6>,
+  'sol_transfer_tx' : ActorMethod<[string, bigint], Result_4>,
+  'spl_transfer_tx' : ActorMethod<[string, bigint], Result_4>,
+  'svm_address' : ActorMethod<[[] | [Principal]], Result_4>,
+  'validate_admin_add_bridges' : ActorMethod<[Array<Principal>], Result_4>,
   'validate_admin_add_evm_contract' : ActorMethod<
     [string, bigint, string],
-    Result_2
+    Result_4
   >,
-  'validate_admin_add_svm_contract' : ActorMethod<[string], Result_2>,
-  'validate_admin_collect_fees' : ActorMethod<[Principal, bigint], Result_2>,
-  'validate_admin_remove_bridges' : ActorMethod<[Array<Principal>], Result_2>,
+  'validate_admin_add_svm_contract' : ActorMethod<[string], Result_4>,
+  'validate_admin_close_bridging_task' : ActorMethod<[BridgeTx], Result_4>,
+  'validate_admin_collect_fees' : ActorMethod<[Principal, bigint], Result_4>,
+  'validate_admin_remove_bridges' : ActorMethod<[Array<Principal>], Result_4>,
+  'validate_admin_restart_bridging' : ActorMethod<[], Result_4>,
+  'validate_admin_retry_bridging_task' : ActorMethod<[BridgeTx], Result_4>,
   'validate_admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
-    Result_2
+    Result_4
   >,
-  'validate_admin_set_svm_providers' : ActorMethod<[Array<string>], Result_2>,
+  'validate_admin_set_svm_providers' : ActorMethod<[Array<string>], Result_4>,
 }
 export declare const idlFactory: IDL.InterfaceFactory;
 export declare const init: (args: { IDL: typeof IDL }) => IDL.Type[];

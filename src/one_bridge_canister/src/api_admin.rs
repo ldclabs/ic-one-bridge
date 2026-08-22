@@ -271,6 +271,71 @@ async fn validate_admin_collect_fees(to: Principal, icp_amount: u128) -> Result<
     pretty_format(&(to, icp_amount))
 }
 
+/// Resets the error circuit breaker and re-arms the finalization timer chain.
+///
+/// Finalization stops scheduling itself once `error_rounds` reaches its limit,
+/// which disables bridging until someone intervenes. Use this once the cause of
+/// the failures has been dealt with.
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_restart_bridging() -> Result<u64, String> {
+    Ok(store::state::restart_finalize_bridging())
+}
+
+#[ic_cdk::update]
+fn validate_admin_restart_bridging() -> Result<String, String> {
+    let (round, error_rounds, pending) = store::state::with(|s| {
+        (
+            s.finalize_bridging_round,
+            s.error_rounds,
+            s.pending.len() as u64,
+        )
+    });
+    pretty_format(&(round, error_rounds, pending))
+}
+
+/// Drops the outgoing transaction of a stuck bridging task so the next
+/// finalization round builds and broadcasts a fresh one.
+///
+/// Only use this after verifying on chain that the recorded outgoing
+/// transaction moved no funds (an EVM transaction that reverted, or a Solana
+/// transaction whose blockhash expired without landing). Retrying a payout that
+/// did go through pays the recipient twice.
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_retry_bridging_task(from_tx: store::BridgeTx) -> Result<store::BridgeLog, String> {
+    store::state::retry_pending_task(&from_tx)
+}
+
+#[ic_cdk::update]
+fn validate_admin_retry_bridging_task(from_tx: store::BridgeTx) -> Result<String, String> {
+    let log = store::state::pending_task(&from_tx)?;
+    if log.to_tx.as_ref().is_some_and(|tx| tx.is_finalized()) {
+        return Err("the outgoing transaction is already finalized, nothing to retry".to_string());
+    }
+    pretty_format(&(log,))
+}
+
+/// Removes a stuck bridging task from the pending queue and archives it with its
+/// error preserved, unblocking the chains it references.
+///
+/// The task is recorded as not bridged: the amount and the fee are left out of
+/// the totals, and settling with the user is up to the administrator.
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_close_bridging_task(from_tx: store::BridgeTx) -> Result<store::BridgeLog, String> {
+    let now_ms = ic_cdk::api::time() / 1_000_000;
+    store::state::close_pending_task(&from_tx, now_ms)
+}
+
+#[ic_cdk::update]
+fn validate_admin_close_bridging_task(from_tx: store::BridgeTx) -> Result<String, String> {
+    let log = store::state::pending_task(&from_tx)?;
+    if log.is_finalized() {
+        return Err(
+            "the bridging task is already finalized and will be archived automatically".to_string(),
+        );
+    }
+    pretty_format(&(log,))
+}
+
 fn available_fees(s: &store::State) -> Result<u128, String> {
     s.total_collected_fees
         .checked_sub(s.total_withdrawn_fees)

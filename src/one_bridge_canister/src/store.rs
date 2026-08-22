@@ -45,6 +45,11 @@ type Memory = VirtualMemory<DefaultMemoryImpl>;
 
 const MAX_ERROR_ROUNDS: u64 = 42;
 
+/// A finalization round that traps can never clear `finalize_bridging_round.1`,
+/// which would stop finalization forever. A lock held for longer than any round
+/// can plausibly take is therefore treated as stale and taken over.
+const FINALIZE_BRIDGING_LOCK_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
     pub key_name: String,
@@ -78,6 +83,9 @@ pub struct State {
     pub pending: VecDeque<BridgeLog>,
     // (round, running)
     pub finalize_bridging_round: (u64, bool),
+    // when the running round took the lock, in ms; 0 when no round is running
+    #[serde(default)]
+    pub finalize_bridging_started_at: u64,
     #[serde(default)]
     pub total_bridged_tokens: u128,
     #[serde(default)]
@@ -190,6 +198,7 @@ impl State {
             governance_canister: None,
             pending: VecDeque::new(),
             finalize_bridging_round: (0, false),
+            finalize_bridging_started_at: 0,
             total_bridged_tokens: 0,
             total_collected_fees: 0,
             total_withdrawn_fees: 0,
@@ -447,6 +456,14 @@ fn acquire_active_bridge_user(user: Principal) -> Result<ActiveBridgeUserGuard, 
             Err("there is already a bridge request in progress for this user".to_string())
         }
     })
+}
+
+/// Whether a new finalization round may take the lock.
+///
+/// A round that trapped leaves `running` set forever, so a lock held for longer
+/// than `FINALIZE_BRIDGING_LOCK_TIMEOUT_MS` is considered abandoned.
+fn finalize_lock_available(running: bool, started_at: u64, now_ms: u64) -> bool {
+    !running || now_ms.saturating_sub(started_at) >= FINALIZE_BRIDGING_LOCK_TIMEOUT_MS
 }
 
 fn bump_priority_fee(value: u128) -> Result<u128, String> {
@@ -899,8 +916,14 @@ pub mod state {
     }
 
     pub async fn finalize_bridging(round: u64) {
+        let started_at = ic_cdk::api::time() / 1_000_000;
         let tasks = STATE.with_borrow_mut(|s| {
-            if s.finalize_bridging_round.1 || round < s.finalize_bridging_round.0 {
+            if !finalize_lock_available(
+                s.finalize_bridging_round.1,
+                s.finalize_bridging_started_at,
+                started_at,
+            ) || round < s.finalize_bridging_round.0
+            {
                 // already running or old round
                 return None;
             }
@@ -910,6 +933,7 @@ pub mod state {
             }
 
             s.finalize_bridging_round.1 = true;
+            s.finalize_bridging_started_at = started_at;
             // take up to 3 pending tasks to process in parallel
             let mut tasks = Vec::with_capacity(3);
             // 针对 EVM 出口，按链互斥，避免同一 from 地址的 nonce 冲突
@@ -964,6 +988,7 @@ pub mod state {
 
                 s.pending.retain(|t| !t.is_finalized());
                 s.finalize_bridging_round = (s.finalize_bridging_round.0.saturating_add(1), false);
+                s.finalize_bridging_started_at = 0;
 
                 if s.pending.is_empty() {
                     None
@@ -987,6 +1012,139 @@ pub mod state {
                 ic_cdk_timers::set_timer(Duration::from_secs(delay), finalize_bridging(round));
             }
         }
+    }
+
+    /// Re-arms the finalization timer chain and clears the error circuit breaker.
+    ///
+    /// The chain stops scheduling itself once `error_rounds` reaches
+    /// `MAX_ERROR_ROUNDS`, so without this the canister has to be upgraded to
+    /// resume bridging after a task got stuck.
+    ///
+    /// The in-progress flag is deliberately left alone: forcing it would let two
+    /// rounds process the same task and pay a recipient twice. A flag left set by
+    /// a round that trapped clears itself after
+    /// `FINALIZE_BRIDGING_LOCK_TIMEOUT_MS`.
+    pub fn restart_finalize_bridging() -> u64 {
+        let round = STATE.with_borrow_mut(|s| {
+            s.error_rounds = 0;
+            s.finalize_bridging_round.0
+        });
+
+        ic_cdk_timers::set_timer(Duration::from_secs(0), finalize_bridging(round));
+        round
+    }
+
+    /// Rejects manual edits to `pending` while a finalization round is in flight.
+    ///
+    /// A round works on clones and writes them back when it completes, so an edit
+    /// made in the meantime is silently overwritten — or, worse, would undo a
+    /// payout the round has already broadcast. A lock that looks abandoned is not
+    /// a reason to refuse: recovering from exactly that case is the point.
+    fn ensure_finalize_bridging_idle() -> Result<(), String> {
+        let now_ms = ic_cdk::api::time() / 1_000_000;
+        STATE.with_borrow(|s| {
+            if finalize_lock_available(
+                s.finalize_bridging_round.1,
+                s.finalize_bridging_started_at,
+                now_ms,
+            ) {
+                Ok(())
+            } else {
+                Err("a finalization round is in progress, please retry in a moment".to_string())
+            }
+        })
+    }
+
+    /// Returns the pending task whose incoming transaction matches `from_tx`.
+    pub fn pending_task(from_tx: &BridgeTx) -> Result<BridgeLog, String> {
+        STATE.with_borrow(|s| {
+            s.pending
+                .iter()
+                .find(|t| t.from_tx.same_with(from_tx))
+                .cloned()
+                .ok_or_else(|| "no pending bridging task matches the given from_tx".to_string())
+        })
+    }
+
+    /// Clears the outgoing transaction of a stuck task so that the next
+    /// finalization round builds and broadcasts a fresh one.
+    ///
+    /// The caller must have verified on chain that the recorded outgoing
+    /// transaction moved no funds — a reverted EVM transaction, or a Solana
+    /// transaction whose blockhash expired without landing. Retrying a payout
+    /// that did go through pays the recipient twice.
+    pub fn retry_pending_task(from_tx: &BridgeTx) -> Result<BridgeLog, String> {
+        ensure_finalize_bridging_idle()?;
+
+        let log = STATE.with_borrow_mut(|s| {
+            let task = s
+                .pending
+                .iter_mut()
+                .find(|t| t.from_tx.same_with(from_tx))
+                .ok_or_else(|| "no pending bridging task matches the given from_tx".to_string())?;
+
+            if task.to_tx.as_ref().is_some_and(|tx| tx.is_finalized()) {
+                return Err(
+                    "the outgoing transaction is already finalized, nothing to retry".to_string(),
+                );
+            }
+
+            task.to_tx = None;
+            task.error = None;
+            Ok(task.clone())
+        })?;
+
+        restart_finalize_bridging();
+        Ok(log)
+    }
+
+    /// Removes a stuck task from the pending queue and archives it with its
+    /// error preserved, so the user can still find it through `my_bridge_log`.
+    ///
+    /// The bridging did not complete, so the amount and the fee are not added to
+    /// `total_bridged_tokens` / `total_collected_fees`. Settling with the user is
+    /// left to the administrator.
+    pub fn close_pending_task(from_tx: &BridgeTx, now_ms: u64) -> Result<BridgeLog, String> {
+        ensure_finalize_bridging_idle()?;
+
+        let log = STATE.with_borrow_mut(|s| {
+            let idx = s
+                .pending
+                .iter()
+                .position(|t| t.from_tx.same_with(from_tx))
+                .ok_or_else(|| "no pending bridging task matches the given from_tx".to_string())?;
+
+            if s.pending[idx].is_finalized() {
+                return Err(
+                    "the bridging task is already finalized and will be archived automatically"
+                        .to_string(),
+                );
+            }
+
+            let mut log = s.pending[idx].clone();
+            log.finalized_at = now_ms;
+            if log.error.is_none() {
+                log.error = Some("closed by the administrator".to_string());
+            }
+
+            // Archive before removing: an update method that returns an error still
+            // commits its state changes, so dropping the task first could lose it.
+            let log_id = BRIDGE_LOGS
+                .with_borrow_mut(|r| r.append(&log.clone().into()))
+                .map_err(|err| format!("failed to append to BRIDGE_LOGS: {}", format_error(err)))?;
+            USER_LOGS.with_borrow_mut(|r| {
+                let mut logs = r.get(&log.user).unwrap_or_default();
+                logs.logs.insert(log_id);
+                r.insert(log.user, logs);
+            });
+
+            s.pending.remove(idx);
+            log.id = Some(log_id);
+            Ok(log)
+        })?;
+
+        restart_finalize_bridging();
+        Ok(log)
     }
 
     async fn try_finalize_tasks(tasks: Vec<BridgeLog>) -> Vec<BridgeLog> {
@@ -1626,4 +1784,33 @@ fn y_parity(prehash: &[u8], sig: &[u8], pubkey: &[u8]) -> Result<bool, String> {
         hex::encode(sig),
         hex::encode(pubkey)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalize_lock_is_taken_over_only_once_it_looks_abandoned() {
+        // free lock
+        assert!(finalize_lock_available(false, 0, 1_000));
+
+        // a round that is still plausibly running keeps the lock
+        assert!(!finalize_lock_available(true, 1_000, 1_000));
+        assert!(!finalize_lock_available(
+            true,
+            1_000,
+            1_000 + FINALIZE_BRIDGING_LOCK_TIMEOUT_MS - 1
+        ));
+
+        // a round that trapped can never release it, so it is taken over
+        assert!(finalize_lock_available(
+            true,
+            1_000,
+            1_000 + FINALIZE_BRIDGING_LOCK_TIMEOUT_MS
+        ));
+
+        // state upgraded from a version without the timestamp
+        assert!(finalize_lock_available(true, 0, 1_700_000_000_000));
+    }
 }

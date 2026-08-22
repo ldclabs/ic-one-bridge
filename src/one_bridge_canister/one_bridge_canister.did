@@ -31,12 +31,13 @@ type InitArgs = record {
   token_name : text;
 };
 type Result = variant { Ok; Err : text };
-type Result_1 = variant { Ok : BridgeTx; Err : text };
-type Result_2 = variant { Ok : text; Err : text };
-type Result_3 = variant { Ok : blob; Err : text };
-type Result_4 = variant { Ok : vec BridgeLog; Err : text };
-type Result_5 = variant { Ok : StateInfo; Err : text };
-type Result_6 = variant { Ok : BridgeLog; Err : text };
+type Result_1 = variant { Ok : BridgeLog; Err : text };
+type Result_2 = variant { Ok : BridgeTx; Err : text };
+type Result_3 = variant { Ok : nat64; Err : text };
+type Result_4 = variant { Ok : text; Err : text };
+type Result_5 = variant { Ok : blob; Err : text };
+type Result_6 = variant { Ok : vec BridgeLog; Err : text };
+type Result_7 = variant { Ok : StateInfo; Err : text };
 type StateInfo = record {
   total_withdrawn_fees : nat;
   error_rounds : nat64;
@@ -76,30 +77,53 @@ service : (opt CanisterArgs) -> {
   admin_add_bridges : (vec principal) -> (Result);
   admin_add_evm_contract : (text, nat64, text) -> (Result);
   admin_add_svm_contract : (text) -> (Result);
-  admin_collect_fees : (principal, nat) -> (Result_1);
+  // Removes a stuck bridging task from the pending queue and archives it with its
+  // error preserved, unblocking the chains it references.
+  // 
+  // The task is recorded as not bridged: the amount and the fee are left out of
+  // the totals, and settling with the user is up to the administrator.
+  admin_close_bridging_task : (BridgeTx) -> (Result_1);
+  admin_collect_fees : (principal, nat) -> (Result_2);
   admin_remove_bridges : (vec principal) -> (Result);
+  // Resets the error circuit breaker and re-arms the finalization timer chain.
+  // 
+  // Finalization stops scheduling itself once `error_rounds` reaches its limit,
+  // which disables bridging until someone intervenes. Use this once the cause of
+  // the failures has been dealt with.
+  admin_restart_bridging : () -> (Result_3);
+  // Drops the outgoing transaction of a stuck bridging task so the next
+  // finalization round builds and broadcasts a fresh one.
+  // 
+  // Only use this after verifying on chain that the recorded outgoing
+  // transaction moved no funds (an EVM transaction that reverted, or a Solana
+  // transaction whose blockhash expired without landing). Retrying a payout that
+  // did go through pays the recipient twice.
+  admin_retry_bridging_task : (BridgeTx) -> (Result_1);
   admin_set_evm_providers : (text, nat64, vec text) -> (Result);
   admin_set_svm_providers : (vec text) -> (Result);
-  bridge : (text, text, nat, opt text) -> (Result_1);
-  erc20_transfer : (text, text, nat) -> (Result_2);
-  erc20_transfer_tx : (text, text, nat) -> (Result_2);
-  evm_address : (opt principal) -> (Result_2) query;
-  evm_sign : (blob) -> (Result_3);
-  evm_transfer_tx : (text, text, nat) -> (Result_2);
-  finalized_logs : (nat32, opt nat64) -> (Result_4) query;
-  info : () -> (Result_5) query;
-  my_bridge_log : (BridgeTx) -> (Result_6) query;
-  my_finalized_logs : (nat32, opt nat64) -> (Result_4) query;
-  my_pending_logs : () -> (Result_4) query;
-  pending_logs : () -> (Result_4) query;
-  sol_transfer_tx : (text, nat64) -> (Result_2);
-  spl_transfer_tx : (text, nat) -> (Result_2);
-  svm_address : (opt principal) -> (Result_2) query;
-  validate_admin_add_bridges : (vec principal) -> (Result_2);
-  validate_admin_add_evm_contract : (text, nat64, text) -> (Result_2);
-  validate_admin_add_svm_contract : (text) -> (Result_2);
-  validate_admin_collect_fees : (principal, nat) -> (Result_2);
-  validate_admin_remove_bridges : (vec principal) -> (Result_2);
-  validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_2);
-  validate_admin_set_svm_providers : (vec text) -> (Result_2);
+  bridge : (text, text, nat, opt text) -> (Result_2);
+  erc20_transfer : (text, text, nat) -> (Result_4);
+  erc20_transfer_tx : (text, text, nat) -> (Result_4);
+  evm_address : (opt principal) -> (Result_4) query;
+  evm_sign : (blob) -> (Result_5);
+  evm_transfer_tx : (text, text, nat) -> (Result_4);
+  finalized_logs : (nat32, opt nat64) -> (Result_6) query;
+  info : () -> (Result_7) query;
+  my_bridge_log : (BridgeTx) -> (Result_1) query;
+  my_finalized_logs : (nat32, opt nat64) -> (Result_6) query;
+  my_pending_logs : () -> (Result_6) query;
+  pending_logs : () -> (Result_6) query;
+  sol_transfer_tx : (text, nat64) -> (Result_4);
+  spl_transfer_tx : (text, nat) -> (Result_4);
+  svm_address : (opt principal) -> (Result_4) query;
+  validate_admin_add_bridges : (vec principal) -> (Result_4);
+  validate_admin_add_evm_contract : (text, nat64, text) -> (Result_4);
+  validate_admin_add_svm_contract : (text) -> (Result_4);
+  validate_admin_close_bridging_task : (BridgeTx) -> (Result_4);
+  validate_admin_collect_fees : (principal, nat) -> (Result_4);
+  validate_admin_remove_bridges : (vec principal) -> (Result_4);
+  validate_admin_restart_bridging : () -> (Result_4);
+  validate_admin_retry_bridging_task : (BridgeTx) -> (Result_4);
+  validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_4);
+  validate_admin_set_svm_providers : (vec text) -> (Result_4);
 }

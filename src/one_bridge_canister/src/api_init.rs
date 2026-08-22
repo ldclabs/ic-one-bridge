@@ -99,6 +99,7 @@ fn post_upgrade(args: Option<CanisterArgs>) {
 
     let round = store::state::with_mut(|s| {
         s.finalize_bridging_round.1 = false; // reset the in-progress flag for edge case
+        s.finalize_bridging_started_at = 0;
         s.finalize_bridging_round.0
     });
     store::state::init_http_certified_data();
