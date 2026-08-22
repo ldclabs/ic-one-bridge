@@ -1,4 +1,4 @@
-import { Principal } from '@dfinity/principal'
+import { Principal } from '@icp-sdk/core/principal'
 import { isAddress } from '@solana/kit'
 
 export function pruneCanister(canisterId: string, long?: boolean) {

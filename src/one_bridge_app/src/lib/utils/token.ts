@@ -1,8 +1,120 @@
-import { TokenAmountV2 as TokenAmount, type Token } from '@dfinity/utils'
-
-export { TokenAmountV2 as TokenAmount } from '@dfinity/utils'
-
 const locale = new Intl.Locale(globalThis?.navigator.language || 'en')
+
+export interface Token {
+  symbol: string
+  name: string
+  decimals: number
+}
+
+// vendored from the deprecated @dfinity/utils TokenAmountV2
+export class TokenAmount {
+  private constructor(
+    protected ulps: bigint,
+    public token: Token
+  ) {}
+
+  static fromUlps({
+    amount,
+    token
+  }: {
+    amount: bigint
+    token: Token
+  }): TokenAmount {
+    return new TokenAmount(amount, token)
+  }
+
+  static fromString({
+    amount,
+    token
+  }: {
+    amount: string
+    token: Token
+  }): TokenAmount | FromStringToTokenError {
+    const ulps = convertStringToUlps({ amount, decimals: token.decimals })
+
+    if (typeof ulps === 'bigint') {
+      return new TokenAmount(ulps, token)
+    }
+    return ulps
+  }
+
+  // 1 integer is considered 10^{token.decimals} ulps
+  static fromNumber({
+    amount,
+    token
+  }: {
+    amount: number
+    token: Token
+  }): TokenAmount {
+    const tokenAmount = TokenAmount.fromString({
+      amount: amount.toFixed(token.decimals),
+      token
+    })
+    if (tokenAmount instanceof TokenAmount) {
+      return tokenAmount
+    }
+    if (tokenAmount === FromStringToTokenError.FractionalTooManyDecimals) {
+      throw new Error(
+        `Number ${amount} has more than ${token.decimals} decimals`
+      )
+    }
+
+    // This should never happen
+    throw new Error(`Invalid number ${amount}`)
+  }
+
+  toUlps(): bigint {
+    return this.ulps
+  }
+}
+
+export enum FromStringToTokenError {
+  InvalidFormat,
+  FractionalTooManyDecimals
+}
+
+function convertStringToUlps({
+  amount,
+  decimals
+}: {
+  amount: string
+  decimals: number
+}): bigint | FromStringToTokenError {
+  // Remove all instances of "," and "'".
+  amount = amount.trim().replace(/[,']/g, '')
+
+  // Verify that the string is of the format 1234.5678
+  const regexMatch = amount.match(/\d*(\.\d*)?/)
+  if (!regexMatch || regexMatch[0] !== amount) {
+    return FromStringToTokenError.InvalidFormat
+  }
+
+  const [integral, fractional] = amount.split('.')
+
+  let ulps = 0n
+  const ulpsPerToken = 10n ** BigInt(decimals)
+
+  if (integral) {
+    try {
+      ulps += BigInt(integral) * ulpsPerToken
+    } catch {
+      return FromStringToTokenError.InvalidFormat
+    }
+  }
+
+  if (fractional) {
+    if (fractional.length > decimals) {
+      return FromStringToTokenError.FractionalTooManyDecimals
+    }
+    try {
+      ulps += BigInt(fractional.padEnd(decimals, '0'))
+    } catch {
+      return FromStringToTokenError.InvalidFormat
+    }
+  }
+
+  return ulps
+}
 
 export interface TokenInfo extends Token {
   fee: bigint

@@ -15,7 +15,7 @@
     validateAddress
   } from '$lib/utils/helper'
   import { type TokenInfo } from '$lib/utils/token'
-  import { tick } from 'svelte'
+  import { tick, untrack } from 'svelte'
   import Spinner from '../ui/Spinner.svelte'
   import TextClipboardButton from '../ui/TextClipboardButton.svelte'
   import NetworkSelector from './ChainSelector.svelte'
@@ -41,7 +41,8 @@
   let mySolAddress = $state<string>('')
   let myEvmAddress = $state<string>('')
   let bridges = $state<BridgeCanisterAPI[]>([])
-  let selectedBridge = $state<BridgeCanisterAPI>(mainBridge)
+  // the effect below keeps it in sync, only the initial value is read here
+  let selectedBridge = $state<BridgeCanisterAPI>(untrack(() => mainBridge))
   let supportChains = $state<Chain[]>([])
   let supportTokens = $state<TokenInfo[]>([])
   let bridgeCanister = $derived(selectedBridge.canisterId.toText())

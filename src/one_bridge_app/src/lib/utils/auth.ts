@@ -1,14 +1,15 @@
 import { IS_LOCAL } from '$lib/constants'
+import { AuthClient, type AuthClientCreateOptions } from '@icp-sdk/auth/client'
 import {
   AnonymousIdentity,
   HttpAgent,
   type HttpAgentOptions,
   type HttpAgentRequest,
   type Identity
-} from '@dfinity/agent'
-import { AuthClient, IdbStorage } from '@dfinity/auth-client'
-import { DelegationChain } from '@dfinity/identity'
-import type { Principal } from '@dfinity/principal'
+} from '@icp-sdk/core/agent'
+import { DelegationChain, DelegationIdentity } from '@icp-sdk/core/identity'
+import type { Principal } from '@icp-sdk/core/principal'
+import { isWindowDefined } from './window'
 
 export const EXPIRATION_MS = 1000 * 60 * 60 // 1 hour
 
@@ -28,7 +29,7 @@ export class IdentityEx implements Identity {
   }
 
   get isExpired() {
-    return Date.now() >= this.expiration - 1000 * 60 * 5 // 3 minutes before expiration
+    return Date.now() >= this.expiration - 1000 * 60 * 5 // 5 minutes before expiration
   }
 
   get isAuthenticated() {
@@ -51,16 +52,25 @@ export class IdentityEx implements Identity {
 
 export const anonymousIdentity = new IdentityEx(new AnonymousIdentity(), 0)
 
-// II auth storage
-const storage = new IdbStorage()
+// should create a new authClient for each login: the identity provider and the
+// popup geometry are constructor options in @icp-sdk/auth, and the constructor
+// is synchronous so `signIn()` can open the window inside the click's call stack
+export function createAuthClient(
+  options: AuthClientCreateOptions = {}
+): AuthClient {
+  // the SSR build imports this module in Node, where the default IndexedDB
+  // storage has nothing to open, and nothing calls into the client there
+  if (!isWindowDefined) {
+    return {} as AuthClient
+  }
 
-// should create a new authClient for each login
-export function createAuthClient(): Promise<AuthClient> {
-  return AuthClient.create({
+  return new AuthClient({
     keyType: 'Ed25519',
+    ...options,
     idleOptions: {
       disableIdle: true,
-      disableDefaultIdleCallback: true
+      disableDefaultIdleCallback: true,
+      ...options.idleOptions
     }
   })
 }
@@ -68,31 +78,23 @@ export function createAuthClient(): Promise<AuthClient> {
 export async function loadIdentity(
   client?: AuthClient
 ): Promise<IdentityEx | null> {
-  const authClient = client || (await createAuthClient())
-  const authenticated = await authClient.isAuthenticated()
+  const authClient = client || createAuthClient()
 
   // Not authenticated therefore we provide no identity as a result
-  if (authenticated) {
-    const expiration = await tryGetDelegationExpiration()
-    return new IdentityEx(authClient.getIdentity(), expiration)
+  if (!authClient.isAuthenticated?.()) {
+    return null
   }
 
-  return null
+  const identity = await authClient.getIdentity()
+  return new IdentityEx(identity, expirationOf(identity))
 }
 
-const KEY_STORAGE_DELEGATION = 'delegation'
-async function tryGetDelegationExpiration(): Promise<number> {
-  let expiration = Date.now() + EXPIRATION_MS
-
-  try {
-    const delegation = await storage.get(KEY_STORAGE_DELEGATION)
-    if (delegation) {
-      const chain = DelegationChain.fromJSON(delegation)
-      expiration = getDelegationExpiration(chain)
-    }
-  } catch (e) {}
-
-  return expiration
+// II may grant less than EXPIRATION_MS, never more, so the expiration is read
+// from the delegation chain instead of being assumed
+export function expirationOf(identity: Identity): number {
+  const chain =
+    identity instanceof DelegationIdentity ? identity.getDelegation() : null
+  return chain ? getDelegationExpiration(chain) : Date.now() + EXPIRATION_MS
 }
 
 function getDelegationExpiration(chain: DelegationChain): number {

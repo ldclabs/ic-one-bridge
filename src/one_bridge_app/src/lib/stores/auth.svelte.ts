@@ -1,19 +1,22 @@
-import { IS_LOCAL } from '$lib/constants'
+import { INTERNET_IDENTITY_CANISTER_ID, IS_LOCAL } from '$lib/constants'
 import {
   anonymousIdentity,
   createAuthClient,
   dynAgent,
+  expirationOf,
   EXPIRATION_MS,
   IdentityEx,
   loadIdentity
 } from '$lib/utils/auth'
 import { popupCenter } from '$lib/utils/window'
 
+// the URL is used verbatim by @icp-sdk/auth, it appends no route of its own,
+// which is why it carries `/authorize` and the local one `#authorize`
 const IDENTITY_PROVIDER = IS_LOCAL
-  ? 'http://rdmx6-jaaaa-aaaaa-aaadq-cai.localhost:4943'
-  : 'https://id.ai'
+  ? `http://${INTERNET_IDENTITY_CANISTER_ID}.localhost:4943/#authorize`
+  : 'https://id.ai/authorize'
 
-const authClientPromise = createAuthClient()
+const authClient = createAuthClient()
 
 class AuthStore {
   static async init() {
@@ -21,12 +24,9 @@ class AuthStore {
     if (IS_LOCAL) {
       await Promise.all([dynAgent.fetchRootKey(), dynAgent.syncTime()])
     }
-    const authClient = await authClientPromise
     const identity = await loadIdentity(authClient)
     if (identity) {
-      identity.expiredHook = () => authStore.logout()
-      dynAgent.setIdentity(identity)
-      authStore.#identity = identity
+      authStore.#login(identity)
     }
   }
 
@@ -36,50 +36,35 @@ class AuthStore {
     return this.#identity
   }
 
-  async signIn(identityProvider = IDENTITY_PROVIDER): Promise<void> {
-    // Important: authClientPromise should be resolved here
-    // https://ffan0811.medium.com/window-open-returns-null-in-safari-and-firefox-after-allowing-pop-up-on-the-browser-4e4e45e7d926
-    const authClient = await authClientPromise
-    return new Promise<void>((resolve, reject) => {
-      authClient
-        .login({
-          maxTimeToLive: BigInt(EXPIRATION_MS) * 1000000n,
-          identityProvider,
-          onSuccess: (msg) => {
-            const authnMethod = msg.authnMethod
-            const authnOrigin = location.origin
-            console.log(
-              `Login successful using ${authnMethod} from ${authnOrigin}`
-            )
+  #login(identity: IdentityEx) {
+    identity.expiredHook = () => this.logout()
+    this.#identity = identity
+    dynAgent.setIdentity(identity)
+  }
 
-            const identity = new IdentityEx(
-              authClient.getIdentity(),
-              Date.now() + EXPIRATION_MS
-            )
-            identity.expiredHook = () => this.logout()
-            this.#identity = identity
-            dynAgent.setIdentity(identity)
-            resolve()
-          },
-          onError: (err) => {
-            console.error(err)
-            reject(err)
-          },
-          windowOpenerFeatures: popupCenter({
-            width: 576,
-            height: 625
-          })
-        })
-        // login() itself may reject, without this the promise never settles
-        .catch(reject)
+  async signIn(identityProvider = IDENTITY_PROVIDER): Promise<void> {
+    // Important: createAuthClient is synchronous so that window.open runs inside
+    // the click's call stack
+    // https://ffan0811.medium.com/window-open-returns-null-in-safari-and-firefox-after-allowing-pop-up-on-the-browser-4e4e45e7d926
+    const signInClient = createAuthClient({
+      identityProvider,
+      windowOpenerFeatures: popupCenter({
+        width: 576,
+        height: 625
+      })
     })
+
+    const identity = await signInClient.signIn({
+      maxTimeToLive: BigInt(EXPIRATION_MS) * 1000000n
+    })
+    console.log(`Login successful from ${location.origin}`)
+    this.#login(new IdentityEx(identity, expirationOf(identity)))
   }
 
   async logout(url?: string) {
     this.#identity = anonymousIdentity
     dynAgent.setIdentity(anonymousIdentity)
-    const authClient = await authClientPromise
-    await authClient.logout()
+    await authClient.signOut()
     url && window.location.assign(url) // force reload to clear all auth state!!
   }
 }
