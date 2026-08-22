@@ -86,6 +86,9 @@ pub struct State {
     // when the running round took the lock, in ms; 0 when no round is running
     #[serde(default)]
     pub finalize_bridging_started_at: u64,
+    // consecutive finalization rounds in which no pending task advanced
+    #[serde(default)]
+    pub idle_rounds: u64,
     #[serde(default)]
     pub total_bridged_tokens: u128,
     #[serde(default)]
@@ -199,6 +202,7 @@ impl State {
             pending: VecDeque::new(),
             finalize_bridging_round: (0, false),
             finalize_bridging_started_at: 0,
+            idle_rounds: 0,
             total_bridged_tokens: 0,
             total_collected_fees: 0,
             total_withdrawn_fees: 0,
@@ -464,6 +468,33 @@ fn acquire_active_bridge_user(user: Principal) -> Result<ActiveBridgeUserGuard, 
 /// than `FINALIZE_BRIDGING_LOCK_TIMEOUT_MS` is considered abandoned.
 fn finalize_lock_available(running: bool, started_at: u64, now_ms: u64) -> bool {
     !running || now_ms.saturating_sub(started_at) >= FINALIZE_BRIDGING_LOCK_TIMEOUT_MS
+}
+
+/// How far a task has got, used to tell a round that advanced something from one
+/// that only re-polled the same unchanged transactions.
+fn task_progress(log: &BridgeLog) -> (bool, bool, bool) {
+    (
+        log.from_tx.is_finalized(),
+        log.to_tx.is_some(),
+        log.to_tx.as_ref().is_some_and(|tx| tx.is_finalized()),
+    )
+}
+
+/// Delay before the next finalization round, given how many consecutive rounds
+/// have left every pending task unchanged.
+///
+/// A transaction that was dropped or replaced never produces a receipt, and
+/// polling for one is not an error, so without a backoff the chain re-queries
+/// the RPC providers every second forever — enough to spend a canister's entire
+/// cycle balance on a single abandoned task. The first tier still covers normal
+/// finality on every supported chain, so healthy bridging is unaffected.
+fn finalize_poll_delay_secs(idle_rounds: u64) -> u64 {
+    match idle_rounds {
+        0..=9 => 1,    // ~10s: normal EVM/Solana finality lands here
+        10..=39 => 5,  // ~2.5min
+        40..=99 => 30, // ~30min
+        _ => 300,
+    }
 }
 
 fn bump_priority_fee(value: u128) -> Result<u128, String> {
@@ -809,6 +840,7 @@ pub mod state {
 
         let delay = if from == BridgeTarget::Icp { 0 } else { 5 };
         let round = STATE.with_borrow_mut(|s| {
+            s.idle_rounds = 0;
             s.pending.push_back(BridgeLog {
                 id: None,
                 user,
@@ -959,10 +991,12 @@ pub mod state {
             let now_ms = ic_cdk::api::time() / 1_000_000;
             let next = STATE.with_borrow_mut(|s| {
                 let mut has_error = false;
+                let mut has_progress = false;
                 for task in tasks {
                     has_error = has_error || task.error.is_some();
                     for t in s.pending.iter_mut() {
                         if t.same_with(&task) {
+                            has_progress = has_progress || task_progress(t) != task_progress(&task);
                             *t = task;
                             if t.to_tx.as_ref().is_some_and(|tx| tx.is_finalized()) {
                                 t.error = None;
@@ -993,6 +1027,7 @@ pub mod state {
                 if s.pending.is_empty() {
                     None
                 } else if has_error {
+                    s.idle_rounds = 0;
                     s.error_rounds = s.error_rounds.saturating_add(1);
                     if s.error_rounds >= MAX_ERROR_ROUNDS {
                         None
@@ -1004,7 +1039,15 @@ pub mod state {
                     }
                 } else {
                     s.error_rounds = 0;
-                    Some((1, s.finalize_bridging_round.0))
+                    s.idle_rounds = if has_progress {
+                        0
+                    } else {
+                        s.idle_rounds.saturating_add(1)
+                    };
+                    Some((
+                        finalize_poll_delay_secs(s.idle_rounds),
+                        s.finalize_bridging_round.0,
+                    ))
                 }
             });
 
@@ -1027,6 +1070,7 @@ pub mod state {
     pub fn restart_finalize_bridging() -> u64 {
         let round = STATE.with_borrow_mut(|s| {
             s.error_rounds = 0;
+            s.idle_rounds = 0;
             s.finalize_bridging_round.0
         });
 
@@ -1789,6 +1833,22 @@ fn y_parity(prehash: &[u8], sig: &[u8], pubkey: &[u8]) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalize_poll_backs_off_once_nothing_advances() {
+        // healthy bridging: normal finality resolves inside the tight tier
+        assert_eq!(finalize_poll_delay_secs(0), 1);
+        assert_eq!(finalize_poll_delay_secs(9), 1);
+
+        // a task that stopped advancing is polled progressively less often
+        assert_eq!(finalize_poll_delay_secs(10), 5);
+        assert_eq!(finalize_poll_delay_secs(40), 30);
+        assert_eq!(finalize_poll_delay_secs(100), 300);
+        assert_eq!(finalize_poll_delay_secs(u64::MAX), 300);
+
+        // an abandoned task must not cost more than a few hundred rounds a day
+        assert!(86_400 / finalize_poll_delay_secs(u64::MAX) < 500);
+    }
 
     #[test]
     fn finalize_lock_is_taken_over_only_once_it_looks_abandoned() {
