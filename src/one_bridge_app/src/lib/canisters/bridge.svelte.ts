@@ -137,6 +137,53 @@ export class BridgeCanisterAPI {
     return svmBalance / 10n ** BigInt(diff)
   }
 
+  // decimals the token uses on the given chain, or undefined when the chain is
+  // not configured on this bridge
+  #chainDecimals(chain: string): number | undefined {
+    if (!this.#state) return undefined
+    if (chain === 'ICP') return this.#state.token_decimals
+    if (chain === 'SOL') return this.#state.svm_token_address[1]
+    return this.#state.evm_token_contracts.find(
+      ([name, _]) => name === chain
+    )?.[1][1]
+  }
+
+  chainToIcpAmount(chain: string, chainAmount: bigint): bigint {
+    if (chain === 'SOL') return this.svmToIcpAmount(chainAmount)
+    if (chain !== 'ICP') return this.evmToIcpAmount(chain, chainAmount)
+    return chainAmount
+  }
+
+  // the conversion the canister applies before it signs the transfer
+  icpToChainAmount(chain: string, icpAmount: bigint): bigint {
+    const decimals = this.#chainDecimals(chain)
+    if (!this.#state || decimals == undefined) return icpAmount
+    const tokenDecimals = this.#state.token_decimals
+    if (decimals >= tokenDecimals) {
+      return icpAmount * 10n ** BigInt(decimals - tokenDecimals)
+    }
+    return icpAmount / 10n ** BigInt(tokenDecimals - decimals)
+  }
+
+  // balance the bridge would draw from on the source chain, in that chain's units
+  async sourceChainBalance(fromChain: string): Promise<bigint> {
+    switch (fromChain) {
+      case 'ICP': {
+        const icp = await this.loadICPTokenAPI()
+        return await icp.balance()
+      }
+      case 'SOL': {
+        const svm = await this.loadSvmTokenAPI()
+        if (!svm) throw new Error('SOL is not supported by this bridge')
+        return await svm.getSplBalance(await this.mySvmAddress())
+      }
+      default: {
+        const evm = await this.loadEVMTokenAPI(fromChain)
+        return await evm.getErc20Balance(await this.myEvmAddress())
+      }
+    }
+  }
+
   parseAmount(amount: string | number): bigint {
     if (!this.#tokenDisplay) return 0n
     return this.#tokenDisplay.parseAmount(amount)
@@ -358,12 +405,58 @@ export class BridgeCanisterAPI {
     return logs.map((log) => this.toBridgeLogInfo(log))
   }
 
+  /**
+   * Re-reads the source chain balance right before submitting.
+   *
+   * The canister signs and broadcasts the incoming transfer without checking
+   * any balance, so an amount the source address cannot cover turns into a
+   * transaction that reverts on chain: the gas is spent for nothing, and the
+   * failed task sits in the bridge's pending queue. The form validates against
+   * a balance read when the chain was picked, which can be stale by the time
+   * Bridge is pressed, so check again here — in the chain's own units, the same
+   * way the canister converts them.
+   *
+   * This is a usability guard, not a safety one: if the balance cannot be read
+   * the bridge request still goes through, because the canister is what
+   * actually protects funds.
+   */
+  async #assertSufficientSourceBalance(
+    fromChain: string,
+    icpAmount: bigint
+  ): Promise<void> {
+    let required = this.icpToChainAmount(fromChain, icpAmount)
+    if (fromChain === 'ICP') {
+      // ICP deposits go through icrc2_transfer_from, so the ledger takes its fee
+      // from the user's account on top of the amount
+      required += this.#token?.fee ?? 0n
+    }
+
+    let balance: bigint
+    try {
+      balance = await this.sourceChainBalance(fromChain)
+    } catch (err) {
+      console.error(`Failed to read ${fromChain} balance before bridging:`, err)
+      return
+    }
+
+    if (balance < required) {
+      const symbol = this.#token?.symbol ?? 'token'
+      throw new Error(
+        `Insufficient ${symbol} balance on ${fromChain}: ` +
+          `need ${this.displayAmount(icpAmount)}, ` +
+          `have ${this.displayAmount(this.chainToIcpAmount(fromChain, balance))}`
+      )
+    }
+  }
+
   async bridge(
     fromChain: string,
     toChain: string,
     icpAmount: bigint,
     toAddr?: string
   ): Promise<BridgingProgress> {
+    await this.#assertSufficientSourceBalance(fromChain, icpAmount)
+
     const res = await this.#actor.bridge(
       fromChain,
       toChain,

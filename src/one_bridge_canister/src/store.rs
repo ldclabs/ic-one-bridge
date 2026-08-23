@@ -462,6 +462,34 @@ fn finalize_lock_available(running: bool, started_at: u64, now_ms: u64) -> bool 
     !running || now_ms.saturating_sub(started_at) >= FINALIZE_BRIDGING_LOCK_TIMEOUT_MS
 }
 
+/// The state of an EVM transaction the canister is waiting on.
+enum EvmTxStatus {
+    /// Not mined yet, or not yet confirmed deeply enough.
+    Pending,
+    /// Mined, succeeded, and confirmed.
+    Confirmed,
+    /// Mined and reverted. It will never finalize, and it moved no funds.
+    Reverted,
+}
+
+/// What a finalization round decided to do with a pending task.
+enum TaskOutcome {
+    /// Keep working on it: write the updated task back into the queue.
+    Retained(BridgeLog),
+    /// Its incoming transfer provably failed on chain, so the bridge received
+    /// nothing and owes nothing. Archive it and drop it from the queue, rather
+    /// than leaving an error behind that blocks every other user of that chain.
+    Abandoned(BridgeLog),
+}
+
+impl TaskOutcome {
+    fn into_log(self) -> BridgeLog {
+        match self {
+            Self::Retained(log) | Self::Abandoned(log) => log,
+        }
+    }
+}
+
 /// How far a task has got, used to tell a round that advanced something from one
 /// that only re-polled the same unchanged transactions.
 fn task_progress(log: &BridgeLog) -> (bool, bool, bool) {
@@ -983,7 +1011,25 @@ pub mod state {
             let next = STATE.with_borrow_mut(|s| {
                 let mut has_error = false;
                 let mut has_progress = false;
-                for task in tasks {
+                let mut abandoned: Vec<BridgeTx> = Vec::new();
+
+                for outcome in tasks {
+                    if let TaskOutcome::Abandoned(task) = outcome {
+                        // The deposit failed on chain: nothing arrived, so nothing is
+                        // owed. Archiving instead of erroring keeps the queue — and
+                        // therefore the whole chain — clear for everyone else. The
+                        // amount and the fee stay out of the totals: nothing bridged.
+                        archive_bridge_log(&task).expect("failed to append to BRIDGE_LOGS");
+                        ic_cdk::api::debug_print(format!(
+                            "abandoned bridging task: {}",
+                            task.error.as_deref().unwrap_or_default()
+                        ));
+                        abandoned.push(task.from_tx);
+                        has_progress = true;
+                        continue;
+                    }
+
+                    let task = outcome.into_log();
                     has_error = has_error || task.error.is_some();
                     for t in s.pending.iter_mut() {
                         if t.same_with(&task) {
@@ -997,20 +1043,15 @@ pub mod state {
                                 s.total_collected_fees =
                                     s.total_collected_fees.saturating_add(t.fee);
 
-                                let idx = BRIDGE_LOGS
-                                    .with_borrow_mut(|r| r.append(&t.clone().into()))
-                                    .expect("failed to append to BRIDGE_LOGS");
-                                USER_LOGS.with_borrow_mut(|r| {
-                                    let mut logs = r.get(&t.user).unwrap_or_default();
-                                    logs.logs.insert(idx);
-                                    r.insert(t.user, logs);
-                                });
+                                archive_bridge_log(t).expect("failed to append to BRIDGE_LOGS");
                             }
                             break;
                         }
                     }
                 }
 
+                s.pending
+                    .retain(|t| !abandoned.iter().any(|tx| t.from_tx.same_with(tx)));
                 s.pending.retain(|t| !t.is_finalized());
                 s.finalize_bridging_round = (s.finalize_bridging_round.0.saturating_add(1), false);
                 s.finalize_bridging_started_at = 0;
@@ -1046,6 +1087,20 @@ pub mod state {
                 ic_cdk_timers::set_timer(Duration::from_secs(delay), finalize_bridging(round));
             }
         }
+    }
+
+    /// Moves a log into the permanent store and indexes it under its user,
+    /// returning the id it was stored under.
+    fn archive_bridge_log(log: &BridgeLog) -> Result<u64, String> {
+        let log_id = BRIDGE_LOGS
+            .with_borrow_mut(|r| r.append(&log.clone().into()))
+            .map_err(|err| format!("failed to append to BRIDGE_LOGS: {}", format_error(err)))?;
+        USER_LOGS.with_borrow_mut(|r| {
+            let mut logs = r.get(&log.user).unwrap_or_default();
+            logs.logs.insert(log_id);
+            r.insert(log.user, logs);
+        });
+        Ok(log_id)
     }
 
     /// Re-arms the finalization timer chain and clears the error circuit breaker.
@@ -1164,14 +1219,7 @@ pub mod state {
 
             // Archive before removing: an update method that returns an error still
             // commits its state changes, so dropping the task first could lose it.
-            let log_id = BRIDGE_LOGS
-                .with_borrow_mut(|r| r.append(&log.clone().into()))
-                .map_err(|err| format!("failed to append to BRIDGE_LOGS: {}", format_error(err)))?;
-            USER_LOGS.with_borrow_mut(|r| {
-                let mut logs = r.get(&log.user).unwrap_or_default();
-                logs.logs.insert(log_id);
-                r.insert(log.user, logs);
-            });
+            let log_id = archive_bridge_log(&log)?;
 
             s.pending.remove(idx);
             log.id = Some(log_id);
@@ -1182,29 +1230,52 @@ pub mod state {
         Ok(log)
     }
 
-    async fn try_finalize_tasks(tasks: Vec<BridgeLog>) -> Vec<BridgeLog> {
+    async fn try_finalize_tasks(tasks: Vec<BridgeLog>) -> Vec<TaskOutcome> {
         let now_ms = ic_cdk::api::time() / 1_000_000;
         futures::future::join_all(tasks.into_iter().map(|task| process_task(task, now_ms))).await
     }
 
-    async fn process_task(mut task: BridgeLog, now_ms: u64) -> BridgeLog {
+    async fn process_task(mut task: BridgeLog, now_ms: u64) -> TaskOutcome {
+        // Set when the incoming transfer failed on chain. Nothing reached the
+        // bridge, so the task is finished — unsuccessfully — and must not be left
+        // in the queue holding an error against its chain.
+        let mut incoming_failed = false;
+
         let rt = async {
             let from_finalized = match (&task.from, &mut task.from_tx) {
                 (BridgeTarget::Evm(chain), BridgeTx::Evm(finalized, tx_hash)) if !*finalized => {
                     let tx_hash: TxHash = (**tx_hash).into();
-                    let from_finalized = check_evm_tx_finalized(chain, &tx_hash, now_ms).await?;
-                    if from_finalized {
-                        *finalized = true;
+                    match check_evm_tx_finalized(chain, &tx_hash, now_ms).await? {
+                        EvmTxStatus::Confirmed => {
+                            *finalized = true;
+                            true
+                        }
+                        EvmTxStatus::Pending => false,
+                        EvmTxStatus::Reverted => {
+                            incoming_failed = true;
+                            return Err(format!(
+                                "{chain}: incoming transaction {tx_hash} reverted on chain, \
+                                 nothing was received"
+                            ));
+                        }
                     }
-                    from_finalized
                 }
                 (BridgeTarget::Sol, BridgeTx::Sol(finalized, tx_hash)) if !*finalized => {
-                    let status = check_sol_tx_finalized(tx_hash, now_ms).await?;
-                    let from_finalized = status.is_some_and(|f| f.is_finalized());
-                    if from_finalized {
-                        *finalized = true;
+                    match check_sol_tx_finalized(tx_hash, now_ms).await? {
+                        Some(status) if status.is_error() => {
+                            incoming_failed = true;
+                            return Err(format!(
+                                "SOL: incoming transaction failed on chain, \
+                                 nothing was received: {:?}",
+                                status.err
+                            ));
+                        }
+                        Some(status) if status.is_finalized() => {
+                            *finalized = true;
+                            true
+                        }
+                        _ => false,
                     }
-                    from_finalized
                 }
                 _ => true,
             };
@@ -1243,9 +1314,18 @@ pub mod state {
                         if !*finalized =>
                     {
                         let tx_hash: TxHash = (**tx_hash).into();
-                        let to_finalized = check_evm_tx_finalized(chain, &tx_hash, now_ms).await?;
-                        if to_finalized {
-                            *finalized = true;
+                        match check_evm_tx_finalized(chain, &tx_hash, now_ms).await? {
+                            EvmTxStatus::Confirmed => *finalized = true,
+                            EvmTxStatus::Pending => {}
+                            // Unlike a failed deposit, a failed payout leaves the bridge
+                            // owing the user, and rebuilding it automatically would burn
+                            // gas on every attempt. Leave it for an administrator.
+                            EvmTxStatus::Reverted => {
+                                return Err(format!(
+                                    "{chain}: outgoing transaction {tx_hash} reverted on chain, \
+                                     an administrator must retry or close this task"
+                                ));
+                            }
                         }
                     }
                     (BridgeTarget::Sol, None) => {
@@ -1294,7 +1374,12 @@ pub mod state {
             ic_cdk::api::debug_print(format!("finalize_tasks failed: {err}"));
         }
 
-        task
+        if incoming_failed {
+            task.finalized_at = now_ms;
+            TaskOutcome::Abandoned(task)
+        } else {
+            TaskOutcome::Retained(task)
+        }
     }
 
     async fn from_icp(
@@ -1635,7 +1720,7 @@ pub mod state {
         chain: &str,
         tx_hash: &TxHash,
         now_ms: u64,
-    ) -> Result<bool, String> {
+    ) -> Result<EvmTxStatus, String> {
         let client = evm_client(chain);
         let (latest_block, receipt) = futures::future::join(
             client.block_number(now_ms),
@@ -1654,19 +1739,20 @@ pub mod state {
                     // log.topics[1] == from 地址（32 字节左填充）
                     // log.topics[2] == to 地址（32 字节左填充）
                     // log.data 为 uint256 的转账数量（ABI 编码）
-                    if !receipt.status() {
-                        // The transaction is mined and reverted: it will never finalize,
-                        // so report it instead of polling this receipt forever.
-                        return Err(format!("{chain}: transaction {tx_hash} reverted on chain"));
-                    }
-                    return Ok(true);
+                    // A mined-and-reverted transaction will never finalize, so it must
+                    // not be reported as merely unconfirmed — that polls forever.
+                    return Ok(if receipt.status() {
+                        EvmTxStatus::Confirmed
+                    } else {
+                        EvmTxStatus::Reverted
+                    });
                 }
-                Ok(false)
+                Ok(EvmTxStatus::Pending)
             }
             (Err(err), _) | (_, Err(err)) => Err(format!(
                 "{chain}: failed to check evm tx finalized, error: {err}"
             )),
-            _ => Ok(false),
+            _ => Ok(EvmTxStatus::Pending),
         }
     }
 
