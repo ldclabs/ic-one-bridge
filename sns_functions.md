@@ -6,3 +6,6 @@
 1_305 dpjyw-raaaa-aaaar-qbxlq-cai admin_add_bridges
 1_306 dpjyw-raaaa-aaaar-qbxlq-cai admin_remove_bridges
 1_307 dpjyw-raaaa-aaaar-qbxlq-cai admin_collect_fees
+1_308 dpjyw-raaaa-aaaar-qbxlq-cai admin_restart_bridging
+1_309 dpjyw-raaaa-aaaar-qbxlq-cai admin_retry_bridging_task
+1_310 dpjyw-raaaa-aaaar-qbxlq-cai admin_close_bridging_task
