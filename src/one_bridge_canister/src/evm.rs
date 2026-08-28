@@ -1,5 +1,5 @@
-use alloy_primitives::{U256, hex::FromHex};
-use serde::{Deserialize, Deserializer, de::DeserializeOwned};
+use alloy_primitives::{U64, U256, hex::FromHex};
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::outcall::{HttpOutcall, LARGE_RESPONSE, SMALL_RESPONSE, json_rpc_call};
@@ -12,19 +12,27 @@ pub use alloy_primitives::{Address, TxHash};
 /// deserializing all of that on every poll wastes instructions and heap memory.
 /// Serde ignores those fields while retaining the transaction identity,
 /// inclusion height and execution status needed by the bridge.
+///
+/// The quantity fields are [`U64`], whose deserializer accepts both `"0x1"`
+/// and a bare JSON number — providers disagree on which they send, and a
+/// decode failure here does not fail over (the provider already answered 2xx),
+/// so a stricter parse would wedge the receipt poll on that provider forever.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EvmReceipt {
     pub transaction_hash: TxHash,
-    #[serde(default, deserialize_with = "deserialize_optional_hex_u64")]
-    pub block_number: Option<u64>,
-    #[serde(deserialize_with = "deserialize_hex_u64")]
-    status: u64,
+    #[serde(default)]
+    block_number: Option<U64>,
+    status: U64,
 }
 
 impl EvmReceipt {
+    pub fn block_number(&self) -> Option<u64> {
+        self.block_number.map(|value| value.to::<u64>())
+    }
+
     pub fn succeeded(&self) -> bool {
-        self.status == 1
+        self.status == U64::from(1)
     }
 }
 
@@ -220,23 +228,6 @@ fn hex_to_u128(s: &str) -> Result<u128, String> {
     u128::from_str_radix(s, 16).map_err(|err| err.to_string())
 }
 
-fn deserialize_hex_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    hex_to_u64(&value).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_optional_hex_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer)?
-        .map(|value| hex_to_u64(&value).map_err(serde::de::Error::custom))
-        .transpose()
-}
-
 fn decode_abi_uint(bytes: &[u8]) -> Result<U256, String> {
     if bytes.len() != 32 {
         return Err("abi uint result must be 32 bytes".to_string());
@@ -398,7 +389,7 @@ mod tests {
         let result =
             futures::executor::block_on(client.get_transaction_receipt(1000, &tx_hash)).unwrap();
         let receipt = result.unwrap();
-        assert_eq!(receipt.block_number, Some(0x418f472));
+        assert_eq!(receipt.block_number(), Some(0x418f472));
         assert!(receipt.succeeded());
 
         // a real receipt, bloom filter and logs included, has to fit in the
@@ -418,7 +409,32 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(receipt.block_number, Some(42));
+        assert_eq!(receipt.block_number(), Some(42));
         assert!(!receipt.succeeded());
+    }
+
+    #[test]
+    fn receipt_accepts_numeric_quantities() {
+        // Some providers serialize receipt quantities as bare JSON numbers
+        // rather than hex strings; both forms must decode, since a decode
+        // failure after a 2xx does not fail over to another provider.
+        let receipt: EvmReceipt = serde_json::from_value(serde_json::json!({
+            "transactionHash": "0xbbded599a5f088cb82d9b439043ff691857ebff4f480225d5d563aed4ef11aaa",
+            "blockNumber": 68_680_818,
+            "status": 1
+        }))
+        .unwrap();
+
+        assert_eq!(receipt.block_number(), Some(68_680_818));
+        assert!(receipt.succeeded());
+
+        let receipt: EvmReceipt = serde_json::from_value(serde_json::json!({
+            "transactionHash": "0xbbded599a5f088cb82d9b439043ff691857ebff4f480225d5d563aed4ef11aaa",
+            "status": "0x1"
+        }))
+        .unwrap();
+
+        assert_eq!(receipt.block_number(), None);
+        assert!(receipt.succeeded());
     }
 }

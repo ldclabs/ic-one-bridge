@@ -236,7 +236,7 @@ async fn admin_collect_fees(to: Principal, icp_amount: u128) -> Result<store::Br
         Ok(s.token_ledger)
     })?;
 
-    match store::state::to_icp(ledger, to, icp_amount).await {
+    match store::state::to_icp(ledger, to, icp_amount, None).await {
         Ok(tx) => Ok(tx),
         Err(err) => {
             store::state::with_mut(|s| {

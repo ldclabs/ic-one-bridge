@@ -15,7 +15,7 @@ use ic_stable_structures::{
 use icrc_ledger_types::{
     icrc1::{
         account::Account,
-        transfer::{TransferArg, TransferError},
+        transfer::{Memo, TransferArg, TransferError},
     },
     icrc2::transfer_from::{TransferFromArgs, TransferFromError},
 };
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteArray;
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::RefCell,
     cmp,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     rc::Rc,
@@ -435,7 +435,6 @@ thread_local! {
     static HTTP_TREE: RefCell<HttpCertificationTree> = RefCell::new(HttpCertificationTree::default());
     static ACTIVE_BRIDGE_USERS: RefCell<BTreeSet<Principal>> = const { RefCell::new(BTreeSet::new()) };
     static FINALIZE_TIMER: RefCell<Option<ScheduledFinalize>> = const { RefCell::new(None) };
-    static FINALIZE_TIMER_GENERATION: Cell<u64> = const { Cell::new(0) };
 
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
         RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
@@ -464,7 +463,6 @@ thread_local! {
 struct ScheduledFinalize {
     id: ic_cdk_timers::TimerId,
     deadline_ms: u64,
-    generation: u64,
 }
 
 struct ActiveBridgeUserGuard(Principal);
@@ -530,8 +528,12 @@ enum TaskOutcome {
 /// Several receipts on the same EVM chain need the same latest block height.
 /// Keeping one async slot per chain prevents concurrent tasks from paying for
 /// duplicate `eth_blockNumber` outcalls while still allowing different chains
-/// to progress in parallel.
-type EvmBlockSlot = Rc<futures::lock::Mutex<Option<u64>>>;
+/// to progress in parallel. Errors are cached for the round too: the slot's
+/// lock is held across the fetch, so if the leader's full provider sweep just
+/// failed, the tasks parked behind it inherit that failure instead of each
+/// serially repeating the same sweep — which could otherwise stretch a round
+/// toward the stale-lock takeover.
+type EvmBlockSlot = Rc<futures::lock::Mutex<Option<Result<u64, String>>>>;
 type EvmBlockCache = Rc<RefCell<HashMap<String, EvmBlockSlot>>>;
 
 #[derive(Clone, Default)]
@@ -553,13 +555,13 @@ impl FinalizeContext {
             .or_insert_with(|| Rc::new(futures::lock::Mutex::new(None)))
             .clone();
         let mut cached = slot.lock().await;
-        if let Some(block) = *cached {
-            return Ok(block);
+        if let Some(result) = cached.clone() {
+            return result;
         }
 
-        let block = client.block_number(now_ms).await?;
-        *cached = Some(block);
-        Ok(block)
+        let result = client.block_number(now_ms).await;
+        *cached = Some(result.clone());
+        result
     }
 }
 
@@ -821,7 +823,13 @@ pub mod state {
     /// equal or earlier timer is reused. If a round is currently running, the
     /// timer becomes its stale-lock recovery instead of immediately firing a
     /// self-call that can only observe the lock and return.
-    pub fn schedule_finalize(delay: Duration, round: u64) {
+    ///
+    /// The timer carries no round of its own: `finalize_bridging` reads the
+    /// current round when it fires. A surviving timer scheduled before other
+    /// rounds completed therefore still runs a valid round instead of being
+    /// rejected as stale — which would leave the slot empty and the queue
+    /// unserved until the next deposit or an admin restart.
+    pub fn schedule_finalize(delay: Duration) {
         let now_ms = ic_cdk::api::time() / 1_000_000;
         let (running, started_at) =
             STATE.with_borrow(|s| (s.finalize_bridging_round.1, s.finalize_bridging_started_at));
@@ -840,34 +848,13 @@ pub mod state {
             ic_cdk_timers::clear_timer(scheduled.id);
         }
 
-        let generation = FINALIZE_TIMER_GENERATION.with(|value| {
-            let next = value.get().wrapping_add(1);
-            value.set(next);
-            next
-        });
         let actual_delay = Duration::from_millis(deadline_ms.saturating_sub(now_ms));
         let id = ic_cdk_timers::set_timer(actual_delay, async move {
-            let current = FINALIZE_TIMER.with_borrow_mut(|timer| {
-                if timer
-                    .as_ref()
-                    .is_some_and(|scheduled| scheduled.generation == generation)
-                {
-                    timer.take();
-                    true
-                } else {
-                    false
-                }
-            });
-            if current {
-                finalize_bridging(round).await;
-            }
+            FINALIZE_TIMER.with_borrow_mut(Option::take);
+            finalize_bridging().await;
         });
         FINALIZE_TIMER.with_borrow_mut(|timer| {
-            *timer = Some(ScheduledFinalize {
-                id,
-                deadline_ms,
-                generation,
-            });
+            *timer = Some(ScheduledFinalize { id, deadline_ms });
         });
     }
 
@@ -983,7 +970,7 @@ pub mod state {
         };
 
         let delay = if from == BridgeTarget::Icp { 0 } else { 5 };
-        let round = STATE.with_borrow_mut(|s| {
+        STATE.with_borrow_mut(|s| {
             s.idle_rounds = 0;
             s.pending.push_back(BridgeLog {
                 id: None,
@@ -999,10 +986,9 @@ pub mod state {
                 finalized_at: 0,
                 error: None,
             });
-            s.finalize_bridging_round.0
         });
 
-        schedule_finalize(Duration::from_secs(delay), round);
+        schedule_finalize(Duration::from_secs(delay));
 
         Ok(from_tx)
     }
@@ -1081,16 +1067,15 @@ pub mod state {
         })
     }
 
-    pub async fn finalize_bridging(round: u64) {
+    pub async fn finalize_bridging() {
         let started_at = ic_cdk::api::time() / 1_000_000;
         let tasks = STATE.with_borrow_mut(|s| {
             if !finalize_lock_available(
                 s.finalize_bridging_round.1,
                 s.finalize_bridging_started_at,
                 started_at,
-            ) || round < s.finalize_bridging_round.0
-            {
-                // already running or old round
+            ) {
+                // already running
                 return None;
             }
 
@@ -1179,10 +1164,7 @@ pub mod state {
                     if s.error_rounds >= MAX_ERROR_ROUNDS {
                         None
                     } else {
-                        Some((
-                            5_u64.saturating_mul(s.error_rounds),
-                            s.finalize_bridging_round.0,
-                        ))
+                        Some(5_u64.saturating_mul(s.error_rounds))
                     }
                 } else {
                     s.error_rounds = 0;
@@ -1191,15 +1173,12 @@ pub mod state {
                     } else {
                         s.idle_rounds.saturating_add(1)
                     };
-                    Some((
-                        finalize_poll_delay_secs(s.idle_rounds),
-                        s.finalize_bridging_round.0,
-                    ))
+                    Some(finalize_poll_delay_secs(s.idle_rounds))
                 }
             });
 
-            if let Some((delay, round)) = next {
-                schedule_finalize(Duration::from_secs(delay), round);
+            if let Some(delay) = next {
+                schedule_finalize(Duration::from_secs(delay));
             } else {
                 clear_finalize_timer();
             }
@@ -1237,7 +1216,7 @@ pub mod state {
             s.finalize_bridging_round.0
         });
 
-        schedule_finalize(Duration::from_secs(0), round);
+        schedule_finalize(Duration::from_secs(0));
         round
     }
 
@@ -1306,7 +1285,8 @@ pub mod state {
     }
 
     /// Removes a stuck task from the pending queue and archives it with its
-    /// error preserved, so the user can still find it through `my_bridge_log`.
+    /// error preserved, so the user can still find it through `my_bridge_log`
+    /// (while it is within its lookback) or by paging `my_finalized_logs`.
     ///
     /// The bridging did not complete, so the amount and the fee are not added to
     /// `total_bridged_tokens` / `total_collected_fees`. Settling with the user is
@@ -1418,15 +1398,20 @@ pub mod state {
                             task.user
                         };
                         let to_amount = bridge_amount_after_fee(task.icp_amount, task.fee)?;
-                        let to_tx = to_icp(token_ledger, to_addr, to_amount).await?;
+                        let dedup = (task.created_at, payout_memo(&task.from_tx));
+                        let to_tx = to_icp(token_ledger, to_addr, to_amount, Some(dedup)).await?;
                         task.to_tx = Some(to_tx);
                     }
                     (BridgeTarget::Evm(chain), None) => {
                         let to_addr = if let Some(addr) = &task.to_addr {
                             addr.parse::<Address>()
-                                .map_err(|_| format!("EVM: invalid to_addr address: {}", addr))?
+                                .map_err(|_| format!("{chain}: invalid to_addr address: {}", addr))?
                         } else {
-                            state::evm_address(&task.user)?
+                            // Prefix with the chain name so the stuck-task gate
+                            // in `bridge()` recognizes which chain the error
+                            // belongs to.
+                            state::evm_address(&task.user)
+                                .map_err(|err| format!("{chain}: {err}"))?
                         };
                         let to_amount = bridge_amount_after_fee(task.icp_amount, task.fee)?;
                         match to_evm(chain, to_addr, to_amount, now_ms).await {
@@ -1460,7 +1445,8 @@ pub mod state {
                             Pubkey::from_str(addr)
                                 .map_err(|_| format!("SOL: invalid to_addr address: {}", addr))?
                         } else {
-                            state::svm_address(&task.user)?
+                            state::svm_address(&task.user)
+                                .map_err(|err| format!("SOL: {err}"))?
                         };
                         let to_amount = bridge_amount_after_fee(task.icp_amount, task.fee)?;
                         match to_svm(to_addr, to_amount, now_ms).await {
@@ -1540,15 +1526,43 @@ pub mod state {
         Ok(BridgeTx::Icp(true, idx))
     }
 
+    /// A stable, unique, ≤32-byte identifier of a task's incoming transaction,
+    /// used as the ledger dedup memo for the outgoing ICP payout.
+    fn payout_memo(from_tx: &BridgeTx) -> Memo {
+        match from_tx {
+            BridgeTx::Icp(_, idx) => Memo::from(*idx),
+            BridgeTx::Evm(_, hash) => Memo::from((**hash).to_vec()),
+            BridgeTx::Sol(_, sig) => Memo::from((**sig)[..32].to_vec()),
+        }
+    }
+
+    /// Transfers tokens out of the bridge on the ICP side.
+    ///
+    /// `dedup` carries the task's creation time and the memo derived from its
+    /// incoming transaction. Passing it makes the ledger itself reject a second
+    /// transfer for the same task: a payout re-attempted by a stale-lock
+    /// takeover round while the first call is still in flight — or retried
+    /// after an error whose outcome was unknown — comes back as `Duplicate`
+    /// instead of paying the recipient twice. A task stuck past the ledger's
+    /// ~24h dedup window fails with `TooOld` and is left for an administrator,
+    /// which is the safe direction. `None` (admin fee collection) keeps the
+    /// ledger's default behavior.
     pub async fn to_icp(
         token_ledger: Principal,
         to_addr: Principal,
         icp_amount: u128,
+        dedup: Option<(u64, Memo)>,
     ) -> Result<BridgeTx, String> {
         if icp_amount == 0 {
             return Err("ICP: amount must be greater than 0".to_string());
         }
 
+        let (created_at_time, memo) = match dedup {
+            Some((created_at_ms, memo)) => {
+                (Some(created_at_ms.saturating_mul(1_000_000)), Some(memo))
+            }
+            None => (None, None),
+        };
         let res: Result<Nat, TransferError> = call(
             token_ledger,
             "icrc1_transfer",
@@ -1559,14 +1573,25 @@ pub mod state {
                     subaccount: None,
                 },
                 fee: None,
-                created_at_time: None,
-                memo: None,
+                created_at_time,
+                memo,
                 amount: icp_amount.into(),
             },),
         )
-        .await?;
-        let res =
-            res.map_err(|err| format!("ICP: failed to transfer token to user, error: {:?}", err))?;
+        .await
+        .map_err(|err| format!("ICP: {err}"))?;
+        let res = match res {
+            Ok(idx) => idx,
+            // An identical transfer for this task already landed, so the payout
+            // is done; adopt its block height.
+            Err(TransferError::Duplicate { duplicate_of }) => duplicate_of,
+            Err(err) => {
+                return Err(format!(
+                    "ICP: failed to transfer token to user, error: {:?}",
+                    err
+                ));
+            }
+        };
         let idx = u64::try_from(&res.0).map_err(|_| "ICP: block height too large".to_string())?;
         Ok(BridgeTx::Icp(true, idx))
     }
@@ -1638,7 +1663,7 @@ pub mod state {
         let data = bincode::serialize(&signed_tx).map_err(|err| format!("SOL: {err}"))?;
 
         let _ = client
-            .send_transaction(now_ms, data.into(), true)
+            .send_transaction(now_ms, data.into())
             .await
             .map_err(|err| format!("SOL: {err}"))?;
         Ok(BridgeTx::Sol(false, tx_hash.into()))
@@ -1656,7 +1681,7 @@ pub mod state {
         let data = bincode::serialize(&signed_tx).map_err(|err| (None, format!("SOL: {err}")))?;
 
         client
-            .send_transaction(now_ms, data.into(), true)
+            .send_transaction(now_ms, data.into())
             .await
             .map_err(|err| (Some(tx.clone()), format!("SOL: {err}")))?;
         Ok(tx)
@@ -1835,7 +1860,7 @@ pub mod state {
             Some(receipt) if receipt.transaction_hash == *tx_hash => receipt,
             _ => return Ok(EvmTxStatus::Pending),
         };
-        let Some(block_number) = receipt.block_number else {
+        let Some(block_number) = receipt.block_number() else {
             return Ok(EvmTxStatus::Pending);
         };
 
@@ -2036,6 +2061,24 @@ mod tests {
 
         assert_eq!(first, Ok(42));
         assert_eq!(second, Ok(42));
+        assert_eq!(mock.urls(), vec!["https://rpc".to_string()]);
+    }
+
+    #[test]
+    fn finalization_shares_failed_block_outcalls_per_chain() {
+        // A failed sweep is cached for the round too: tasks parked behind the
+        // leader inherit its error instead of serially repeating the sweep.
+        let mock = MockHttpOutcall::new(vec![Err("all providers down".to_string())]);
+        let client = EvmClient::new(vec!["https://rpc".to_string()], 2, mock.clone());
+        let context = FinalizeContext::default();
+
+        let (first, second) = futures::executor::block_on(futures::future::join(
+            context.evm_block_number("BNB", &client, 1),
+            context.evm_block_number("BNB", &client, 1),
+        ));
+
+        assert!(first.is_err());
+        assert_eq!(first, second);
         assert_eq!(mock.urls(), vec!["https://rpc".to_string()]);
     }
 

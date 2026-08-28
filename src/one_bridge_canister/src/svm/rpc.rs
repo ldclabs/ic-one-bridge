@@ -1,6 +1,6 @@
 use ic_auth_types::ByteBufB64;
 use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use super::types::*;
 use crate::outcall::{HttpOutcall, LARGE_RESPONSE, SMALL_RESPONSE, json_rpc_call};
@@ -36,7 +36,7 @@ impl<H: HttpOutcall> SvmClient<H> {
             .call(
                 format!("getLatestBlockhash-{now_ms}"),
                 "getLatestBlockhash",
-                &[commitment_config()],
+                &[json!({ "commitment": COMMITMENT })],
                 SMALL_RESPONSE,
             )
             .await?;
@@ -66,25 +66,25 @@ impl<H: HttpOutcall> SvmClient<H> {
             .ok_or_else(|| "missing signature status".to_string())
     }
 
+    /// Preflight is always skipped: the canister signs complete transactions
+    /// and polls their status itself, and a preflight simulation would only add
+    /// a second chance for a provider to reject a transaction it has already
+    /// been handed.
     pub async fn send_transaction(
         &self,
         now_ms: u64,
         transaction: ByteBufB64,
-        skip_preflight: bool,
     ) -> Result<String, String> {
-        let mut config = Map::new();
-        config.insert("encoding".to_string(), "base64".into());
-        config.insert("commitment".to_string(), COMMITMENT.into());
-        if skip_preflight {
-            config.insert("skipPreflight".to_string(), Value::Bool(true));
-        }
-
         self.call(
             format!("sendTransaction-{now_ms}"),
             "sendTransaction",
             &[
                 Value::String(transaction.to_base64()),
-                Value::Object(config),
+                json!({
+                    "encoding": "base64",
+                    "commitment": COMMITMENT,
+                    "skipPreflight": true,
+                }),
             ],
             SMALL_RESPONSE,
         )
@@ -128,10 +128,6 @@ impl<H: HttpOutcall> SvmClient<H> {
         )
         .await
     }
-}
-
-fn commitment_config() -> Value {
-    json!({ "commitment": COMMITMENT })
 }
 
 #[cfg(test)]
@@ -222,7 +218,7 @@ mod tests {
 
         let client = SvmClient::new(vec!["https://sol".to_string()], mock);
         let signature =
-            futures::executor::block_on(client.send_transaction(1_234, [1, 2, 3, 4].into(), true))
+            futures::executor::block_on(client.send_transaction(1_234, [1, 2, 3, 4].into()))
                 .unwrap();
 
         assert_eq!(signature, "5N7signature");

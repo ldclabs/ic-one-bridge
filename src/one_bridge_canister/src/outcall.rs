@@ -15,9 +15,10 @@ use crate::{
 ///
 /// An outcall is billed on `max_response_bytes` — the bytes it *reserves*, not
 /// the bytes that come back — and leaving it unset reserves the 2 MB maximum.
-/// On a 13-node subnet that reservation alone costs 10,400 cycles per byte:
-/// ~20.8B cycles a call, against ~134M for the budget below. So every method
-/// names one.
+/// These calls are non-replicated (`is_replicated: false`), which prices the
+/// reservation at ~800 cycles per byte on a 13-node subnet: ~1.7B cycles a
+/// call left unset, against ~10M for the budget below. So every method names
+/// one.
 ///
 /// The budgets are deliberately far larger than the few hundred bytes of JSON
 /// these calls answer with. A response that overruns its budget is rejected

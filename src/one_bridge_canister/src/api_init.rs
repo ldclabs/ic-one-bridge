@@ -97,15 +97,14 @@ fn post_upgrade(args: Option<CanisterArgs>) {
         _ => {}
     }
 
-    let round = store::state::with_mut(|s| {
+    store::state::with_mut(|s| {
         s.finalize_bridging_round.1 = false; // reset the in-progress flag for edge case
         s.finalize_bridging_started_at = 0;
-        s.finalize_bridging_round.0
     });
     store::state::init_http_certified_data();
     ic_cdk_timers::set_timer(
         Duration::from_secs(0),
         store::state::try_init_ed25519_public_key(),
     );
-    store::state::schedule_finalize(Duration::from_secs(3), round);
+    store::state::schedule_finalize(Duration::from_secs(3));
 }

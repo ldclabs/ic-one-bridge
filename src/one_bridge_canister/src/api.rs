@@ -58,7 +58,13 @@ fn my_finalized_logs(take: u32, prev: Option<u64>) -> Result<Vec<store::BridgeLo
 fn my_bridge_log(from_tx: store::BridgeTx) -> Result<store::BridgeLog, String> {
     let caller = msg_caller()?;
     let log = store::state::my_bridge_log(caller, from_tx);
-    log.ok_or_else(|| "tx log not found".to_string())
+    // The archive scan is bounded, so a miss does not prove the transaction was
+    // never bridged — only that it is not among the recent records.
+    log.ok_or_else(|| {
+        "tx log not found in pending tasks or recent archived logs; \
+         page my_finalized_logs for older history"
+            .to_string()
+    })
 }
 
 #[ic_cdk::query]

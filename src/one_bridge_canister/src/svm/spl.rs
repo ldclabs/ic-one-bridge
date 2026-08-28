@@ -133,4 +133,22 @@ mod tests {
             get_associated_token_address(&wallet, &mint, &token_program)
         );
     }
+
+    #[test]
+    fn associated_token_address_matches_known_mainnet_vector() {
+        // Known-answer vector produced by the official
+        // `spl-associated-token-account-interface` crate this module replaced:
+        // any seed reordering in `get_associated_token_address` derives a
+        // different address, which the self-referential test above cannot
+        // catch, and would send every SVM payout to an account no wallet
+        // computes.
+        let wallet = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
+        let usdc_mint = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        let token_program = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+
+        assert_eq!(
+            get_associated_token_address(&wallet, &usdc_mint, &token_program),
+            Pubkey::from_str_const("DHe62eeQVEnNK7vg5xUpDkJm7tuqHadjhvmPRFBG9UPo")
+        );
+    }
 }
