@@ -2,10 +2,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::str::FromStr;
 
-pub use solana_account_decoder_client_types::{
-    UiAccount, UiAccountData,
-    token::{TokenAccountType, UiTokenAmount},
-};
+pub use solana_account_decoder_client_types::{UiAccount, UiAccountData, token::TokenAccountType};
 pub use solana_program::{hash::Hash, pubkey::Pubkey};
 pub use solana_transaction::{Message, Signature, Transaction};
 

@@ -72,19 +72,19 @@ pub fn bridge_amount_after_fee(amount: u128, fee: u128) -> Result<u128, String> 
         .ok_or_else(|| format!("amount {amount} must be greater than bridge fee {fee}"))
 }
 
-pub async fn call<In, Out>(
-    id: Principal,
-    method: &str,
-    args: In,
-    cycles: u128,
-) -> Result<Out, String>
+/// Calls another canister and decodes its reply.
+///
+/// The call waits unbounded on purpose. Every use of this is a ledger transfer,
+/// and a bounded-wait call that times out reports an unknown outcome: the
+/// transfer may still have gone through, and the finalization round would then
+/// retry it and pay the recipient twice.
+pub async fn call<In, Out>(id: Principal, method: &str, args: In) -> Result<Out, String>
 where
     In: ArgumentEncoder + Send,
     Out: candid::CandidType + for<'a> candid::Deserialize<'a>,
 {
-    let res = ic_cdk::call::Call::bounded_wait(id, method)
+    let res = ic_cdk::call::Call::unbounded_wait(id, method)
         .with_args(&args)
-        .with_cycles(cycles)
         .await
         .map_err(|err| format!("failed to call {} on {:?}, error: {:?}", method, id, err))?;
     res.candid().map_err(|err| {

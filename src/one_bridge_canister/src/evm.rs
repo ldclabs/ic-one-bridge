@@ -1,49 +1,48 @@
 use alloy_primitives::{U256, hex::FromHex};
 use alloy_rpc_types_eth::TransactionReceipt;
-use ic_cdk_management_canister::{HttpHeader, HttpMethod, HttpRequestArgs};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::{
-    helper::APP_AGENT,
-    outcall::HttpOutcall,
-    types::{RPCRequest, RPCResponse},
-};
+use crate::outcall::{HttpOutcall, LARGE_RESPONSE, SMALL_RESPONSE, json_rpc_call};
 
 pub use alloy_primitives::{Address, TxHash};
 
 pub struct EvmClient<T: HttpOutcall> {
     pub providers: Vec<String>,
     pub max_confirmations: u64,
-    pub api_token: Option<String>,
     outcall: T,
 }
 
 // https://ethereum.org/zh/developers/docs/apis/json-rpc/
 impl<H: HttpOutcall> EvmClient<H> {
-    pub fn new(
-        providers: Vec<String>,
-        max_confirmations: u64,
-        api_token: Option<String>,
-        outcall: H,
-    ) -> Self {
+    pub fn new(providers: Vec<String>, max_confirmations: u64, outcall: H) -> Self {
         Self {
             providers,
             max_confirmations,
-            api_token,
             outcall,
         }
     }
+
     pub async fn chain_id(&self, now_ms: u64) -> Result<u64, String> {
         let res: String = self
-            .call(format!("eth_chainId-{}", now_ms), "eth_chainId", &[])
+            .call(
+                format!("eth_chainId-{}", now_ms),
+                "eth_chainId",
+                &[],
+                SMALL_RESPONSE,
+            )
             .await?;
         hex_to_u64(&res)
     }
 
     pub async fn gas_price(&self, now_ms: u64) -> Result<u128, String> {
         let res: String = self
-            .call(format!("eth_gasPrice-{}", now_ms), "eth_gasPrice", &[])
+            .call(
+                format!("eth_gasPrice-{}", now_ms),
+                "eth_gasPrice",
+                &[],
+                SMALL_RESPONSE,
+            )
             .await?;
         hex_to_u128(&res)
     }
@@ -54,6 +53,7 @@ impl<H: HttpOutcall> EvmClient<H> {
                 format!("eth_maxPriorityFeePerGas-{}", now_ms),
                 "eth_maxPriorityFeePerGas",
                 &[],
+                SMALL_RESPONSE,
             )
             .await?;
         hex_to_u128(&res)
@@ -65,6 +65,7 @@ impl<H: HttpOutcall> EvmClient<H> {
                 format!("eth_blockNumber-{}", now_ms),
                 "eth_blockNumber",
                 &[],
+                SMALL_RESPONSE,
             )
             .await?;
         hex_to_u64(&res)
@@ -80,21 +81,11 @@ impl<H: HttpOutcall> EvmClient<H> {
                 format!("eth_getTransactionCount-{}", now_ms),
                 "eth_getTransactionCount",
                 &[address.to_string().into(), "latest".into()],
+                SMALL_RESPONSE,
             )
             .await?;
         hex_to_u64(&res)
     }
-
-    // pub async fn get_balance(&self, now_ms: u64, address: &Address) -> Result<u128, String> {
-    //     let res: String = self
-    //         .call(
-    //             format!("eth_getBalance-{}", now_ms),
-    //             "eth_getBalance",
-    //             &[address.to_string().into(), "finalized".into()],
-    //         )
-    //         .await?;
-    //     hex_to_u128(&res)
-    // }
 
     pub async fn get_transaction_receipt(
         &self,
@@ -105,6 +96,7 @@ impl<H: HttpOutcall> EvmClient<H> {
             format!("eth_getTransactionReceipt-{}", now_ms),
             "eth_getTransactionReceipt",
             &[tx_hash.to_string().into()],
+            LARGE_RESPONSE,
         )
         .await
     }
@@ -113,11 +105,12 @@ impl<H: HttpOutcall> EvmClient<H> {
         &self,
         now_ms: u64,
         signed_tx: String,
-    ) -> Result<Value, String> {
+    ) -> Result<String, String> {
         self.call(
             format!("eth_sendRawTransaction-{}", now_ms),
             "eth_sendRawTransaction",
             &[signed_tx.into()],
+            SMALL_RESPONSE,
         )
         .await
     }
@@ -138,25 +131,11 @@ impl<H: HttpOutcall> EvmClient<H> {
                 format!("eth_call-{}", now_ms),
                 "eth_call",
                 &[call_object, "latest".into()],
+                SMALL_RESPONSE,
             )
             .await?;
         let res = res.strip_prefix("0x").unwrap_or(&res);
         <Vec<u8>>::from_hex(res).map_err(|err| err.to_string())
-    }
-
-    // pub async fn erc20_name(&self, now_ms: u64, contract: &Address) -> Result<String, String> {
-    //     let res = self
-    //         .call_contract(now_ms, contract, "0x06fdde03".to_string())
-    //         .await?;
-    //     decode_abi_string(&res)
-    // }
-
-    #[allow(dead_code)]
-    pub async fn erc20_symbol(&self, now_ms: u64, contract: &Address) -> Result<String, String> {
-        let res = self
-            .call_contract(now_ms, contract, "0x95d89b41".to_string())
-            .await?;
-        decode_abi_string(&res)
     }
 
     pub async fn erc20_decimals(&self, now_ms: u64, contract: &Address) -> Result<u8, String> {
@@ -172,94 +151,17 @@ impl<H: HttpOutcall> EvmClient<H> {
         idempotency_key: String,
         method: &str,
         params: &[Value],
+        max_response_bytes: u64,
     ) -> Result<T, String> {
-        if self.providers.is_empty() {
-            return Err("no available provider".to_string());
-        }
-
-        let input = RPCRequest {
-            jsonrpc: "2.0",
+        json_rpc_call(
+            &self.outcall,
+            &self.providers,
+            idempotency_key,
             method,
             params,
-            id: 1,
-        };
-        let input = serde_json::to_vec(&input).map_err(|err| err.to_string())?;
-        let data = self.http_request(idempotency_key, input).await?;
-
-        let output: RPCResponse<T> =
-            serde_json::from_slice(&data).map_err(|err| err.to_string())?;
-
-        if let Some(error) = output.error {
-            return Err(serde_json::to_string(&error).map_err(|err| err.to_string())?);
-        }
-
-        match output.result {
-            Some(result) => Ok(result),
-            None => serde_json::from_value(Value::Null).map_err(|_| "missing result".to_string()),
-        }
-    }
-
-    async fn http_request(
-        &self,
-        idempotency_key: String,
-        body: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
-        let mut request_headers = vec![
-            HttpHeader {
-                name: "content-type".to_string(),
-                value: "application/json".to_string(),
-            },
-            HttpHeader {
-                name: "user-agent".to_string(),
-                value: APP_AGENT.to_string(),
-            },
-            HttpHeader {
-                name: "idempotency-key".to_string(),
-                value: idempotency_key.clone(),
-            },
-        ];
-
-        if let Some(api_token) = &self.api_token {
-            request_headers.push(HttpHeader {
-                name: "authorization".to_string(),
-                value: api_token.clone(),
-            });
-        }
-
-        let mut args = HttpRequestArgs {
-            url: "".to_string(),
-            max_response_bytes: None, //optional for request
-            method: HttpMethod::POST,
-            headers: request_headers,
-            body: Some(body),
-            transform: self.outcall.transform_context(),
-            is_replicated: Some(false),
-        };
-
-        let mut last_err = "No provider succeeded".to_string();
-        for p in &self.providers {
-            args.url = p.clone();
-            match self.outcall.request(&args).await {
-                Ok(res) => {
-                    if res.status >= 200u64 && res.status < 300u64 {
-                        return Ok(res.body);
-                    } else {
-                        last_err = format!(
-                            "request provider: {}, idempotency-key: {}, status: {}, body: {}",
-                            p,
-                            idempotency_key,
-                            res.status,
-                            String::from_utf8(res.body.clone()).unwrap_or_default(),
-                        );
-                    }
-                }
-                Err(err) => {
-                    last_err = format!("failed to request provider: {p}, error: {err}");
-                }
-            }
-        }
-
-        Err(last_err)
+            max_response_bytes,
+        )
+        .await
     }
 }
 
@@ -289,34 +191,6 @@ fn hex_to_u128(s: &str) -> Result<u128, String> {
     u128::from_str_radix(s, 16).map_err(|err| err.to_string())
 }
 
-#[allow(dead_code)]
-fn decode_abi_string(bytes: &[u8]) -> Result<String, String> {
-    if bytes.len() < 64 {
-        return Err("abi string result too short".to_string());
-    }
-
-    let offset = U256::try_from_be_slice(&bytes[0..32]).unwrap();
-    let offset = usize::try_from(offset).map_err(|_| "abi string offset too large".to_string())?;
-    let offset_end = offset
-        .checked_add(32)
-        .ok_or_else(|| "abi string offset out of bounds".to_string())?;
-    if bytes.len() < offset_end {
-        return Err("abi string length out of bounds".to_string());
-    }
-
-    let len = U256::try_from_be_slice(&bytes[offset..offset_end]).unwrap();
-    let len = usize::try_from(len).map_err(|_| "abi string length too large".to_string())?;
-    let data_end = offset_end
-        .checked_add(len)
-        .ok_or_else(|| "abi string data out of bounds".to_string())?;
-    if bytes.len() < data_end {
-        return Err("abi string data out of bounds".to_string());
-    }
-
-    let data = &bytes[offset_end..data_end];
-    String::from_utf8(data.to_vec()).map_err(|err| err.to_string())
-}
-
 fn decode_abi_uint(bytes: &[u8]) -> Result<U256, String> {
     if bytes.len() != 32 {
         return Err("abi uint result must be 32 bytes".to_string());
@@ -324,22 +198,10 @@ fn decode_abi_uint(bytes: &[u8]) -> Result<U256, String> {
     Ok(U256::from_be_slice(bytes))
 }
 
-// fn decode_abi_address(bytes: &[u8]) -> Result<Address, String> {
-//     if bytes.len() != 32 {
-//         return Err("abi address result must be 32 bytes".to_string());
-//     }
-//     Address::try_from(&bytes[12..32]).map_err(|err| err.to_string())
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        collections::VecDeque,
-        sync::{Arc, Mutex},
-    };
-
-    use ic_cdk_management_canister::{HttpRequestResult, TransformContext};
+    use crate::outcall::tests::{MockHttpOutcall, success_response};
 
     #[test]
     fn test_encode_erc20_transfer() {
@@ -363,72 +225,10 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_abi_string() {
-        let mut payload = Vec::new();
-        payload.extend(U256::from(32u8).to_be_bytes::<32>());
-        payload.extend(U256::from(11u8).to_be_bytes::<32>());
-        payload.extend_from_slice(b"hello world");
-        payload.extend(vec![0u8; 21]);
-
-        assert_eq!(decode_abi_string(&payload).unwrap(), "hello world");
-
-        assert!(decode_abi_string(&payload[..60]).is_err());
-
-        let mut huge_offset = vec![0xff; 32];
-        huge_offset.extend(vec![0; 32]);
-        assert!(decode_abi_string(&huge_offset).is_err());
-    }
-
-    #[test]
     fn test_decode_abi_uint() {
         let value = U256::from(999u64).to_be_bytes::<32>();
         assert_eq!(decode_abi_uint(&value).unwrap(), U256::from(999u64));
         assert!(decode_abi_uint(&value[..31]).is_err());
-    }
-
-    #[derive(Clone, Default)]
-    struct MockHttpOutcall {
-        responses: Arc<Mutex<VecDeque<Result<HttpRequestResult, String>>>>,
-        urls: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl MockHttpOutcall {
-        fn new(responses: Vec<Result<HttpRequestResult, String>>) -> Self {
-            Self {
-                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
-                urls: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn urls(&self) -> Vec<String> {
-            self.urls.lock().unwrap().clone()
-        }
-    }
-
-    impl HttpOutcall for MockHttpOutcall {
-        async fn request(
-            &self,
-            args: &ic_cdk_management_canister::HttpRequestArgs,
-        ) -> Result<HttpRequestResult, String> {
-            self.urls.lock().unwrap().push(args.url.clone());
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Err("no mock response".to_string()))
-        }
-
-        fn transform_context(&self) -> Option<TransformContext> {
-            None
-        }
-    }
-
-    fn success_response(body: serde_json::Value) -> Result<HttpRequestResult, String> {
-        Ok(HttpRequestResult {
-            status: 200u64.into(),
-            body: serde_json::to_vec(&body).unwrap(),
-            headers: vec![],
-        })
     }
 
     #[test]
@@ -439,11 +239,12 @@ mod tests {
             "result": "0x2a"
         }))]);
 
-        let client = EvmClient::new(vec!["https://rpc.one".to_string()], 5, None, mock.clone());
+        let client = EvmClient::new(vec!["https://rpc.one".to_string()], 5, mock.clone());
         let value = futures::executor::block_on(client.chain_id(1_000)).unwrap();
 
         assert_eq!(value, 42);
         assert_eq!(mock.urls(), vec!["https://rpc.one".to_string()]);
+        assert_eq!(mock.max_response_bytes(), vec![Some(SMALL_RESPONSE)]);
     }
 
     #[test]
@@ -460,7 +261,6 @@ mod tests {
         let client = EvmClient::new(
             vec!["https://first".to_string(), "https://second".to_string()],
             5,
-            None,
             mock.clone(),
         );
 
@@ -481,10 +281,14 @@ mod tests {
             "error": {"code": -32000, "message": "execution reverted"}
         });
         let mock = MockHttpOutcall::new(vec![success_response(error_body)]);
-        let client = EvmClient::new(vec!["https://rpc".to_string()], 5, None, mock);
+        let client = EvmClient::new(vec!["https://rpc".to_string()], 5, mock);
 
-        let result: Result<u64, _> =
-            futures::executor::block_on(client.call("id-key".to_string(), "method", &[]));
+        let result: Result<u64, _> = futures::executor::block_on(client.call(
+            "id-key".to_string(),
+            "method",
+            &[],
+            SMALL_RESPONSE,
+        ));
         assert!(result.unwrap_err().contains("execution reverted"));
     }
 
@@ -496,7 +300,7 @@ mod tests {
             "result": null
         });
         let mock = MockHttpOutcall::new(vec![success_response(body)]);
-        let client = EvmClient::new(vec!["https://rpc".to_string()], 5, None, mock);
+        let client = EvmClient::new(vec!["https://rpc".to_string()], 5, mock);
 
         let tx_hash = TxHash::from([0u8; 32]);
         let result = futures::executor::block_on(client.get_transaction_receipt(1000, &tx_hash));
@@ -538,8 +342,9 @@ mod tests {
                 "effectiveGasPrice": "0x7270e00"
             }
         });
+        let payload_len = serde_json::to_vec(&body).unwrap().len();
         let mock = MockHttpOutcall::new(vec![success_response(body)]);
-        let client = EvmClient::new(vec!["https://rpc".to_string()], 5, None, mock);
+        let client = EvmClient::new(vec!["https://rpc".to_string()], 5, mock.clone());
 
         let tx_hash =
             TxHash::from_hex("0xbbded599a5f088cb82d9b439043ff691857ebff4f480225d5d563aed4ef11aaa")
@@ -547,6 +352,10 @@ mod tests {
         let result =
             futures::executor::block_on(client.get_transaction_receipt(1000, &tx_hash)).unwrap();
         assert!(result.is_some());
-        println!("{:?}", result);
+
+        // a real receipt, bloom filter and logs included, has to fit in the
+        // response the outcall reserved for it
+        assert!(payload_len < LARGE_RESPONSE as usize);
+        assert_eq!(mock.max_response_bytes(), vec![Some(LARGE_RESPONSE)]);
     }
 }

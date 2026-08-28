@@ -160,15 +160,7 @@ fn admin_set_evm_providers(
     max_confirmations: u64,
     providers: Vec<String>,
 ) -> Result<(), String> {
-    for url in &providers {
-        let v = Url::parse(url).map_err(|err| format!("invalid url {url}, error: {err}"))?;
-        if v.scheme() != "https" {
-            return Err(format!("url scheme must be https, got: {url}"));
-        }
-    }
-    if max_confirmations < 2 {
-        return Err("max_confirmations must be at least 2".to_string());
-    }
+    check_evm_providers(max_confirmations, &providers)?;
 
     store::state::with_mut(|s| {
         s.evm_providers
@@ -183,26 +175,21 @@ fn validate_admin_set_evm_providers(
     max_confirmations: u64,
     providers: Vec<String>,
 ) -> Result<String, String> {
-    for url in &providers {
-        let v = Url::parse(url).map_err(|err| format!("invalid url {url}, error: {err}"))?;
-        if v.scheme() != "https" {
-            return Err(format!("url scheme must be https, got: {url}"));
-        }
-    }
+    check_evm_providers(max_confirmations, &providers)?;
+    pretty_format(&(chain_name, max_confirmations, providers))
+}
+
+fn check_evm_providers(max_confirmations: u64, providers: &[String]) -> Result<(), String> {
+    check_providers(providers)?;
     if max_confirmations < 2 {
         return Err("max_confirmations must be at least 2".to_string());
     }
-    pretty_format(&(chain_name, max_confirmations, providers))
+    Ok(())
 }
 
 #[ic_cdk::update(guard = "is_controller")]
 fn admin_set_svm_providers(providers: Vec<String>) -> Result<(), String> {
-    for url in &providers {
-        let v = Url::parse(url).map_err(|err| format!("invalid url {url}, error: {err}"))?;
-        if v.scheme() != "https" {
-            return Err(format!("url scheme must be https, got: {url}"));
-        }
-    }
+    check_providers(&providers)?;
 
     store::state::with_mut(|s| {
         s.svm_providers = providers;
@@ -212,13 +199,18 @@ fn admin_set_svm_providers(providers: Vec<String>) -> Result<(), String> {
 
 #[ic_cdk::update]
 fn validate_admin_set_svm_providers(providers: Vec<String>) -> Result<String, String> {
-    for url in &providers {
+    check_providers(&providers)?;
+    pretty_format(&(providers,))
+}
+
+fn check_providers(providers: &[String]) -> Result<(), String> {
+    for url in providers {
         let v = Url::parse(url).map_err(|err| format!("invalid url {url}, error: {err}"))?;
         if v.scheme() != "https" {
             return Err(format!("url scheme must be https, got: {url}"));
         }
     }
-    pretty_format(&(providers,))
+    Ok(())
 }
 
 #[ic_cdk::update(guard = "is_controller")]

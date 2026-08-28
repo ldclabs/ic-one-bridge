@@ -39,14 +39,9 @@ fn my_pending_logs() -> Result<Vec<store::BridgeLog>, String> {
     let rt = store::state::with(|s| {
         s.pending
             .iter()
-            .filter_map(|item| {
-                if item.user == caller {
-                    Some(item.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<store::BridgeLog>>()
+            .filter(|item| item.user == caller)
+            .cloned()
+            .collect()
     });
     Ok(rt)
 }

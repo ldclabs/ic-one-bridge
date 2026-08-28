@@ -7,6 +7,9 @@ debug = false
 lto = true
 strip = true
 opt-level = 's'
+# one unit lets LTO see the whole canister: fewer duplicated monomorphisations
+# in the Wasm, and better inlining across the RPC and store modules
+codegen-units = 1
 
 [workspace.package]
 edition = "2024"
