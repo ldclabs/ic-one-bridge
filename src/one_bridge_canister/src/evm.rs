@@ -101,11 +101,19 @@ impl<H: HttpOutcall> EvmClient<H> {
         .await
     }
 
+    /// Broadcasts a signed transaction.
+    ///
+    /// The result is deliberately decoded as an untyped [`Value`]: by the time it
+    /// is parsed the transaction is already on its way to the mempool, and no
+    /// caller reads it — they all know the hash from the transaction they signed.
+    /// Insisting on a string here would turn a provider that answers with a null
+    /// or an unexpected shape into a failed broadcast that did happen, which on
+    /// the deposit path means a user's tokens move with no task recording it.
     pub async fn send_raw_transaction(
         &self,
         now_ms: u64,
         signed_tx: String,
-    ) -> Result<String, String> {
+    ) -> Result<Value, String> {
         self.call(
             format!("eth_sendRawTransaction-{}", now_ms),
             "eth_sendRawTransaction",
