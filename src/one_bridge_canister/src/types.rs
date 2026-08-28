@@ -18,10 +18,10 @@ impl PublicKeyOutput {
     }
 
     pub fn to_evm_adress(&self) -> Result<Address, String> {
-        use k256::elliptic_curve::sec1::ToSec1Point;
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
         let key = k256::PublicKey::from_sec1_bytes(self.public_key.as_slice())
             .map_err(|_| "Failed to convert to EVM address".to_string())?;
-        let point = key.to_sec1_point(false);
+        let point = key.to_encoded_point(false);
         Ok(Address::from_raw_public_key(&point.as_bytes()[1..]))
     }
 }

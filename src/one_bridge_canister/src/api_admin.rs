@@ -1,12 +1,12 @@
 use alloy_primitives::Address;
 use candid::Principal;
+use http::Uri;
 use std::collections::BTreeSet;
-use url::Url;
 
 use crate::{
     helper::{pretty_format, validate_principals},
     store,
-    svm::{Pubkey, TokenAccountType, get_token_account},
+    svm::{Pubkey, get_mint_decimals},
 };
 
 #[ic_cdk::update(guard = "is_controller")]
@@ -123,11 +123,8 @@ async fn admin_add_svm_contract(address: String) -> Result<(), String> {
     let account = account.ok_or_else(|| format!("account {address} does not exist"))?;
     let token_program = Pubkey::try_from(account.owner.as_str())
         .map_err(|err| format!("invalid token program address {}: {:?}", account.owner, err))?;
-    let account = get_token_account(account)?;
-    let decimals = match account {
-        TokenAccountType::Mint(mint) => mint.decimals,
-        _ => return Err(format!("account {address} is not a token mint account")),
-    };
+    let decimals = get_mint_decimals(&account)
+        .map_err(|err| format!("account {address} is not a token mint account: {err}"))?;
 
     store::state::with_mut(|s| {
         s.svm_token_address = (addr, decimals, token_program);
@@ -205,9 +202,14 @@ fn validate_admin_set_svm_providers(providers: Vec<String>) -> Result<String, St
 
 fn check_providers(providers: &[String]) -> Result<(), String> {
     for url in providers {
-        let v = Url::parse(url).map_err(|err| format!("invalid url {url}, error: {err}"))?;
-        if v.scheme() != "https" {
+        let uri = url
+            .parse::<Uri>()
+            .map_err(|err| format!("invalid url {url}, error: {err}"))?;
+        if uri.scheme_str() != Some("https") {
             return Err(format!("url scheme must be https, got: {url}"));
+        }
+        if uri.authority().is_none() {
+            return Err(format!("url must include a host, got: {url}"));
         }
     }
     Ok(())
@@ -246,7 +248,7 @@ async fn admin_collect_fees(to: Principal, icp_amount: u128) -> Result<store::Br
 }
 
 #[ic_cdk::update]
-async fn validate_admin_collect_fees(to: Principal, icp_amount: u128) -> Result<String, String> {
+fn validate_admin_collect_fees(to: Principal, icp_amount: u128) -> Result<String, String> {
     store::state::with(|s| {
         if icp_amount == 0 {
             return Err("icp_amount must be greater than 0".to_string());
@@ -342,5 +344,20 @@ fn is_controller() -> Result<(), String> {
         Ok(())
     } else {
         Err("user is not a controller".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_urls_must_be_absolute_https_uris() {
+        assert!(
+            check_providers(&["https://rpc.example/v1/key?network=mainnet".to_string()]).is_ok()
+        );
+        assert!(check_providers(&["http://rpc.example".to_string()]).is_err());
+        assert!(check_providers(&["/relative/rpc".to_string()]).is_err());
+        assert!(check_providers(&["https:/missing-host".to_string()]).is_err());
     }
 }

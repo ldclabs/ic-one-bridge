@@ -2,9 +2,19 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::str::FromStr;
 
-pub use solana_account_decoder_client_types::{UiAccount, UiAccountData, token::TokenAccountType};
-pub use solana_program::{hash::Hash, pubkey::Pubkey};
+pub use solana_hash::Hash;
+pub use solana_pubkey::Pubkey;
 pub use solana_transaction::{Message, Signature, Transaction};
+
+/// The subset of a Solana account returned by `getAccountInfo` that contract
+/// registration needs. Keeping the parsed payload untyped avoids pulling the
+/// validator-side account decoder and its large dependency graph into the
+/// canister Wasm.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct UiAccount {
+    pub data: Value,
+    pub owner: String,
+}
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -47,15 +57,22 @@ impl SignatureStatus {
     }
 }
 
-pub fn get_token_account(val: UiAccount) -> Result<TokenAccountType, String> {
-    match val.data {
-        UiAccountData::Json(parsed_account) => {
-            let account: TokenAccountType = serde_json::from_value(parsed_account.parsed)
-                .map_err(|err| format!("failed to parse TokenAccountType: {}", err))?;
-            Ok(account)
-        }
-        _ => Err("UiAccount data is not in JSON format".to_string()),
+pub fn get_mint_decimals(account: &UiAccount) -> Result<u8, String> {
+    let account_type = account
+        .data
+        .pointer("/parsed/type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "account data is not JSON-parsed token data".to_string())?;
+    if account_type != "mint" {
+        return Err("account is not a token mint account".to_string());
     }
+
+    let decimals = account
+        .data
+        .pointer("/parsed/info/decimals")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "token mint decimals are missing or invalid".to_string())?;
+    u8::try_from(decimals).map_err(|_| "token mint decimals exceed u8".to_string())
 }
 
 #[cfg(test)]
@@ -84,12 +101,35 @@ mod tests {
         assert!(failed.is_error());
         assert!(!failed.is_finalized());
     }
+
+    #[test]
+    fn extracts_only_the_mint_fields_from_account_info() {
+        let account: UiAccount = serde_json::from_value(json!({
+            "owner": "TokenzQdYh...",
+            "lamports": 1_461_600,
+            "data": {
+                "program": "spl-token-2022",
+                "parsed": {
+                    "type": "mint",
+                    "info": { "decimals": 8, "supply": "1000000" }
+                },
+                "space": 82
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(get_mint_decimals(&account), Ok(8));
+
+        let mut not_a_mint = account;
+        not_a_mint.data["parsed"]["type"] = json!("account");
+        assert!(get_mint_decimals(&not_a_mint).is_err());
+    }
 }
 
 #[cfg(test)]
 mod wire_tests {
     use super::*;
-    use crate::svm::instruction;
+    use crate::svm::system_transfer_instruction;
 
     /// `solana-transaction` dropped its `bincode` feature, so the crate now enables
     /// `serde` instead. Both give `Transaction` the same short-vec wire encoding,
@@ -101,7 +141,7 @@ mod wire_tests {
         let to = Pubkey::new_from_array([2u8; 32]);
         let blockhash = Hash::new_from_array([3u8; 32]);
 
-        let ix = instruction::transfer(&from, &to, 1_000);
+        let ix = system_transfer_instruction(&from, &to, 1_000);
         let message = Message::new_with_blockhash(&[ix], Some(&from), &blockhash);
         let tx = Transaction {
             message,

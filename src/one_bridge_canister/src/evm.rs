@@ -1,11 +1,32 @@
 use alloy_primitives::{U256, hex::FromHex};
-use alloy_rpc_types_eth::TransactionReceipt;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::outcall::{HttpOutcall, LARGE_RESPONSE, SMALL_RESPONSE, json_rpc_call};
 
 pub use alloy_primitives::{Address, TxHash};
+
+/// The only receipt fields finalization needs.
+///
+/// RPC providers return logs, bloom filters and gas metadata as well, but
+/// deserializing all of that on every poll wastes instructions and heap memory.
+/// Serde ignores those fields while retaining the transaction identity,
+/// inclusion height and execution status needed by the bridge.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EvmReceipt {
+    pub transaction_hash: TxHash,
+    #[serde(default, deserialize_with = "deserialize_optional_hex_u64")]
+    pub block_number: Option<u64>,
+    #[serde(deserialize_with = "deserialize_hex_u64")]
+    status: u64,
+}
+
+impl EvmReceipt {
+    pub fn succeeded(&self) -> bool {
+        self.status == 1
+    }
+}
 
 pub struct EvmClient<T: HttpOutcall> {
     pub providers: Vec<String>,
@@ -91,7 +112,7 @@ impl<H: HttpOutcall> EvmClient<H> {
         &self,
         now_ms: u64,
         tx_hash: &TxHash,
-    ) -> Result<Option<TransactionReceipt>, String> {
+    ) -> Result<Option<EvmReceipt>, String> {
         self.call(
             format!("eth_getTransactionReceipt-{}", now_ms),
             "eth_getTransactionReceipt",
@@ -197,6 +218,23 @@ fn hex_to_u64(s: &str) -> Result<u64, String> {
 fn hex_to_u128(s: &str) -> Result<u128, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     u128::from_str_radix(s, 16).map_err(|err| err.to_string())
+}
+
+fn deserialize_hex_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    hex_to_u64(&value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_hex_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| hex_to_u64(&value).map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 fn decode_abi_uint(bytes: &[u8]) -> Result<U256, String> {
@@ -359,11 +397,28 @@ mod tests {
                 .unwrap();
         let result =
             futures::executor::block_on(client.get_transaction_receipt(1000, &tx_hash)).unwrap();
-        assert!(result.is_some());
+        let receipt = result.unwrap();
+        assert_eq!(receipt.block_number, Some(0x418f472));
+        assert!(receipt.succeeded());
 
         // a real receipt, bloom filter and logs included, has to fit in the
         // response the outcall reserved for it
         assert!(payload_len < LARGE_RESPONSE as usize);
         assert_eq!(mock.max_response_bytes(), vec![Some(LARGE_RESPONSE)]);
+    }
+
+    #[test]
+    fn minimal_receipt_preserves_revert_status() {
+        let receipt: EvmReceipt = serde_json::from_value(serde_json::json!({
+            "transactionHash": "0xbbded599a5f088cb82d9b439043ff691857ebff4f480225d5d563aed4ef11aaa",
+            "blockNumber": "0x2a",
+            "status": "0x0",
+            "logs": [{"data": "ignored"}],
+            "logsBloom": "0x00"
+        }))
+        .unwrap();
+
+        assert_eq!(receipt.block_number, Some(42));
+        assert!(!receipt.succeeded());
     }
 }

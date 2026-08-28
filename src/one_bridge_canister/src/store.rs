@@ -2,7 +2,7 @@ use alloy_consensus::{SignableTransaction, Signed, TxEip1559};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, Signature, TxHash, U256, hex};
 use candid::{CandidType, Nat, Principal};
-use cbor2::{from_slice, to_vec};
+use ic_auth_types::{cbor_from_slice, cbor_into_vec};
 use ic_http_certification::{
     HttpCertification, HttpCertificationPath, HttpCertificationTree, HttpCertificationTreeEntry,
     cel::{DefaultCelBuilder, create_cel_expr},
@@ -19,14 +19,15 @@ use icrc_ledger_types::{
     },
     icrc2::transfer_from::{TransferFromArgs, TransferFromError},
 };
-use num_traits::cast::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteArray;
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    rc::Rc,
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -34,12 +35,12 @@ use crate::{
     ecdsa::{cost_sign_with_ecdsa, derive_public_key, ecdsa_public_key, sign_with_ecdsa},
     evm::{EvmClient, encode_erc20_transfer},
     helper::{bridge_amount_after_fee, call, convert_amount, format_error},
-    outcall::DefaultHttpOutcall,
+    outcall::{DefaultHttpOutcall, HttpOutcall},
     schnorr::{derive_schnorr_public_key, schnorr_public_key, sign_with_schnorr},
     svm::{
         Message, Pubkey, Signature as SvmSignature, SignatureStatus, SvmClient, Transaction,
-        create_associated_token_account_idempotent, get_associated_token_address, instruction,
-        transfer_checked_instruction,
+        create_associated_token_account_idempotent, get_associated_token_address,
+        system_transfer_instruction, transfer_checked_instruction,
     },
     types::PublicKeyOutput,
 };
@@ -391,15 +392,15 @@ impl Storable for BridgeLogLocal {
     const BOUND: Bound = Bound::Unbounded;
 
     fn into_bytes(self) -> Vec<u8> {
-        to_vec(&self).expect("failed to encode BridgeLogLocal data")
+        cbor_into_vec(&self).expect("failed to encode BridgeLogLocal data")
     }
 
     fn to_bytes(&self) -> Cow<'_, [u8]> {
-        Cow::Owned(to_vec(self).expect("failed to encode BridgeLogLocal data"))
+        Cow::Owned(cbor_into_vec(self).expect("failed to encode BridgeLogLocal data"))
     }
 
     fn from_bytes(bytes: Cow<'_, [u8]>) -> Self {
-        from_slice(&bytes).expect("failed to decode BridgeLogLocal data")
+        cbor_from_slice(&bytes).expect("failed to decode BridgeLogLocal data")
     }
 }
 
@@ -412,15 +413,15 @@ impl Storable for UserLogs {
     const BOUND: Bound = Bound::Unbounded;
 
     fn into_bytes(self) -> Vec<u8> {
-        to_vec(&self).expect("failed to encode UserLogs data")
+        cbor_into_vec(&self).expect("failed to encode UserLogs data")
     }
 
     fn to_bytes(&self) -> Cow<'_, [u8]> {
-        Cow::Owned(to_vec(self).expect("failed to encode UserLogs data"))
+        Cow::Owned(cbor_into_vec(self).expect("failed to encode UserLogs data"))
     }
 
     fn from_bytes(bytes: Cow<'_, [u8]>) -> Self {
-        from_slice(&bytes).expect("failed to decode UserLogs data")
+        cbor_from_slice(&bytes).expect("failed to decode UserLogs data")
     }
 }
 
@@ -433,6 +434,8 @@ thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::new());
     static HTTP_TREE: RefCell<HttpCertificationTree> = RefCell::new(HttpCertificationTree::default());
     static ACTIVE_BRIDGE_USERS: RefCell<BTreeSet<Principal>> = const { RefCell::new(BTreeSet::new()) };
+    static FINALIZE_TIMER: RefCell<Option<ScheduledFinalize>> = const { RefCell::new(None) };
+    static FINALIZE_TIMER_GENERATION: Cell<u64> = const { Cell::new(0) };
 
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
         RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
@@ -456,6 +459,12 @@ thread_local! {
             MEMORY_MANAGER.with_borrow(|m| m.get(BRIDGE_LOGS_DATA_MEMORY_ID)),
         )
     );
+}
+
+struct ScheduledFinalize {
+    id: ic_cdk_timers::TimerId,
+    deadline_ms: u64,
+    generation: u64,
 }
 
 struct ActiveBridgeUserGuard(Principal);
@@ -486,6 +495,16 @@ fn finalize_lock_available(running: bool, started_at: u64, now_ms: u64) -> bool 
     !running || now_ms.saturating_sub(started_at) >= FINALIZE_BRIDGING_LOCK_TIMEOUT_MS
 }
 
+fn finalize_timer_deadline_ms(now_ms: u64, delay: Duration, running: bool, started_at: u64) -> u64 {
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    let requested = now_ms.saturating_add(delay_ms);
+    if running {
+        requested.max(started_at.saturating_add(FINALIZE_BRIDGING_LOCK_TIMEOUT_MS))
+    } else {
+        requested
+    }
+}
+
 /// The state of an EVM transaction the canister is waiting on.
 enum EvmTxStatus {
     /// Not mined yet, or not yet confirmed deeply enough.
@@ -504,6 +523,44 @@ enum TaskOutcome {
     /// nothing and owes nothing. Archive it and drop it from the queue, rather
     /// than leaving an error behind that blocks every other user of that chain.
     Abandoned(BridgeLog),
+}
+
+/// RPC values shared by every task in one finalization round.
+///
+/// Several receipts on the same EVM chain need the same latest block height.
+/// Keeping one async slot per chain prevents concurrent tasks from paying for
+/// duplicate `eth_blockNumber` outcalls while still allowing different chains
+/// to progress in parallel.
+type EvmBlockSlot = Rc<futures::lock::Mutex<Option<u64>>>;
+type EvmBlockCache = Rc<RefCell<HashMap<String, EvmBlockSlot>>>;
+
+#[derive(Clone, Default)]
+struct FinalizeContext {
+    evm_blocks: EvmBlockCache,
+}
+
+impl FinalizeContext {
+    async fn evm_block_number<H: HttpOutcall>(
+        &self,
+        chain: &str,
+        client: &EvmClient<H>,
+        now_ms: u64,
+    ) -> Result<u64, String> {
+        let slot = self
+            .evm_blocks
+            .borrow_mut()
+            .entry(chain.to_string())
+            .or_insert_with(|| Rc::new(futures::lock::Mutex::new(None)))
+            .clone();
+        let mut cached = slot.lock().await;
+        if let Some(block) = *cached {
+            return Ok(block);
+        }
+
+        let block = client.block_number(now_ms).await?;
+        *cached = Some(block);
+        Ok(block)
+    }
 }
 
 impl TaskOutcome {
@@ -567,19 +624,15 @@ pub mod state {
 
     use super::*;
 
-    use lazy_static::lazy_static;
-    use once_cell::sync::Lazy;
-
-    lazy_static! {
-        pub static ref DEFAULT_EXPR_PATH: HttpCertificationPath<'static> =
-            HttpCertificationPath::wildcard("");
-        pub static ref DEFAULT_CERTIFICATION: HttpCertification = HttpCertification::skip();
-        pub static ref DEFAULT_CEL_EXPR: String =
-            create_cel_expr(&DefaultCelBuilder::skip_certification());
-    }
-
-    pub static DEFAULT_CERT_ENTRY: Lazy<HttpCertificationTreeEntry> =
-        Lazy::new(|| HttpCertificationTreeEntry::new(&*DEFAULT_EXPR_PATH, *DEFAULT_CERTIFICATION));
+    pub static DEFAULT_EXPR_PATH: LazyLock<HttpCertificationPath<'static>> =
+        LazyLock::new(|| HttpCertificationPath::wildcard(""));
+    pub static DEFAULT_CERTIFICATION: LazyLock<HttpCertification> =
+        LazyLock::new(HttpCertification::skip);
+    pub static DEFAULT_CEL_EXPR: LazyLock<String> =
+        LazyLock::new(|| create_cel_expr(&DefaultCelBuilder::skip_certification()));
+    pub static DEFAULT_CERT_ENTRY: LazyLock<HttpCertificationTreeEntry> = LazyLock::new(|| {
+        HttpCertificationTreeEntry::new(&*DEFAULT_EXPR_PATH, *DEFAULT_CERTIFICATION)
+    });
 
     /// Fetches the subnet master keys and derives the bridge's own addresses.
     ///
@@ -669,7 +722,7 @@ pub mod state {
                 if bytes.is_empty() {
                     return;
                 }
-                let v: State = from_slice(bytes).expect("failed to decode STATE_STORE data");
+                let v: State = cbor_from_slice(bytes).expect("failed to decode STATE_STORE data");
                 *h = v;
             });
         });
@@ -678,7 +731,7 @@ pub mod state {
     pub fn save() {
         STATE.with_borrow(|h| {
             STATE_STORE.with_borrow_mut(|r| {
-                let buf = to_vec(h).expect("failed to encode STATE_STORE data");
+                let buf = cbor_into_vec(h).expect("failed to encode STATE_STORE data");
                 r.set(buf);
             });
         });
@@ -760,6 +813,68 @@ pub mod state {
                 DefaultHttpOutcall::new(s.icp_address),
             )
         })
+    }
+
+    /// Keeps a single effective finalization timer.
+    ///
+    /// A newly accepted task may bring a distant backoff timer forward, but an
+    /// equal or earlier timer is reused. If a round is currently running, the
+    /// timer becomes its stale-lock recovery instead of immediately firing a
+    /// self-call that can only observe the lock and return.
+    pub fn schedule_finalize(delay: Duration, round: u64) {
+        let now_ms = ic_cdk::api::time() / 1_000_000;
+        let (running, started_at) =
+            STATE.with_borrow(|s| (s.finalize_bridging_round.1, s.finalize_bridging_started_at));
+        let deadline_ms = finalize_timer_deadline_ms(now_ms, delay, running, started_at);
+
+        let should_replace = FINALIZE_TIMER.with_borrow(|timer| {
+            timer
+                .as_ref()
+                .is_none_or(|scheduled| deadline_ms < scheduled.deadline_ms)
+        });
+        if !should_replace {
+            return;
+        }
+
+        if let Some(scheduled) = FINALIZE_TIMER.with_borrow_mut(Option::take) {
+            ic_cdk_timers::clear_timer(scheduled.id);
+        }
+
+        let generation = FINALIZE_TIMER_GENERATION.with(|value| {
+            let next = value.get().wrapping_add(1);
+            value.set(next);
+            next
+        });
+        let actual_delay = Duration::from_millis(deadline_ms.saturating_sub(now_ms));
+        let id = ic_cdk_timers::set_timer(actual_delay, async move {
+            let current = FINALIZE_TIMER.with_borrow_mut(|timer| {
+                if timer
+                    .as_ref()
+                    .is_some_and(|scheduled| scheduled.generation == generation)
+                {
+                    timer.take();
+                    true
+                } else {
+                    false
+                }
+            });
+            if current {
+                finalize_bridging(round).await;
+            }
+        });
+        FINALIZE_TIMER.with_borrow_mut(|timer| {
+            *timer = Some(ScheduledFinalize {
+                id,
+                deadline_ms,
+                generation,
+            });
+        });
+    }
+
+    fn clear_finalize_timer() {
+        if let Some(scheduled) = FINALIZE_TIMER.with_borrow_mut(Option::take) {
+            ic_cdk_timers::clear_timer(scheduled.id);
+        }
     }
 
     pub async fn bridge(
@@ -887,7 +1002,7 @@ pub mod state {
             s.finalize_bridging_round.0
         });
 
-        ic_cdk_timers::set_timer(Duration::from_secs(delay), finalize_bridging(round));
+        schedule_finalize(Duration::from_secs(delay), round);
 
         Ok(from_tx)
     }
@@ -1084,7 +1199,9 @@ pub mod state {
             });
 
             if let Some((delay, round)) = next {
-                ic_cdk_timers::set_timer(Duration::from_secs(delay), finalize_bridging(round));
+                schedule_finalize(Duration::from_secs(delay), round);
+            } else {
+                clear_finalize_timer();
             }
         }
     }
@@ -1120,7 +1237,7 @@ pub mod state {
             s.finalize_bridging_round.0
         });
 
-        ic_cdk_timers::set_timer(Duration::from_secs(0), finalize_bridging(round));
+        schedule_finalize(Duration::from_secs(0), round);
         round
     }
 
@@ -1232,10 +1349,20 @@ pub mod state {
 
     async fn try_finalize_tasks(tasks: Vec<BridgeLog>) -> Vec<TaskOutcome> {
         let now_ms = ic_cdk::api::time() / 1_000_000;
-        futures::future::join_all(tasks.into_iter().map(|task| process_task(task, now_ms))).await
+        let context = FinalizeContext::default();
+        futures::future::join_all(
+            tasks
+                .into_iter()
+                .map(|task| process_task(task, now_ms, context.clone())),
+        )
+        .await
     }
 
-    async fn process_task(mut task: BridgeLog, now_ms: u64) -> TaskOutcome {
+    async fn process_task(
+        mut task: BridgeLog,
+        now_ms: u64,
+        context: FinalizeContext,
+    ) -> TaskOutcome {
         // Set when the incoming transfer failed on chain. Nothing reached the
         // bridge, so the task is finished — unsuccessfully — and must not be left
         // in the queue holding an error against its chain.
@@ -1245,7 +1372,7 @@ pub mod state {
             let from_finalized = match (&task.from, &mut task.from_tx) {
                 (BridgeTarget::Evm(chain), BridgeTx::Evm(finalized, tx_hash)) if !*finalized => {
                     let tx_hash: TxHash = (**tx_hash).into();
-                    match check_evm_tx_finalized(chain, &tx_hash, now_ms).await? {
+                    match check_evm_tx_finalized(&context, chain, &tx_hash, now_ms).await? {
                         EvmTxStatus::Confirmed => {
                             *finalized = true;
                             true
@@ -1314,7 +1441,7 @@ pub mod state {
                         if !*finalized =>
                     {
                         let tx_hash: TxHash = (**tx_hash).into();
-                        match check_evm_tx_finalized(chain, &tx_hash, now_ms).await? {
+                        match check_evm_tx_finalized(&context, chain, &tx_hash, now_ms).await? {
                             EvmTxStatus::Confirmed => *finalized = true,
                             EvmTxStatus::Pending => {}
                             // Unlike a failed deposit, a failed payout leaves the bridge
@@ -1409,10 +1536,7 @@ pub mod state {
         .await?;
         let res = res
             .map_err(|err| format!("ICP: failed to transfer token from user, error: {:?}", err))?;
-        let idx = res
-            .0
-            .to_u64()
-            .ok_or_else(|| "ICP: block height too large".to_string())?;
+        let idx = u64::try_from(&res.0).map_err(|_| "ICP: block height too large".to_string())?;
         Ok(BridgeTx::Icp(true, idx))
     }
 
@@ -1443,10 +1567,7 @@ pub mod state {
         .await?;
         let res =
             res.map_err(|err| format!("ICP: failed to transfer token to user, error: {:?}", err))?;
-        let idx = res
-            .0
-            .to_u64()
-            .ok_or_else(|| "ICP: block height too large".to_string())?;
+        let idx = u64::try_from(&res.0).map_err(|_| "ICP: block height too large".to_string())?;
         Ok(BridgeTx::Icp(true, idx))
     }
 
@@ -1699,6 +1820,7 @@ pub mod state {
     }
 
     async fn check_evm_tx_finalized(
+        context: &FinalizeContext,
         chain: &str,
         tx_hash: &TxHash,
         now_ms: u64,
@@ -1723,8 +1845,8 @@ pub mod state {
         // log.topics[1] == from 地址（32 字节左填充）
         // log.topics[2] == to 地址（32 字节左填充）
         // log.data 为 uint256 的转账数量（ABI 编码）
-        let latest = client
-            .block_number(now_ms)
+        let latest = context
+            .evm_block_number(chain, &client, now_ms)
             .await
             .map_err(|err| format!("{chain}: failed to get block number, error: {err}"))?;
 
@@ -1734,7 +1856,7 @@ pub mod state {
 
         // A mined-and-reverted transaction will never finalize, so it must not be
         // reported as merely unconfirmed — that polls forever.
-        Ok(if receipt.status() {
+        Ok(if receipt.succeeded() {
             EvmTxStatus::Confirmed
         } else {
             EvmTxStatus::Reverted
@@ -1846,7 +1968,7 @@ pub mod state {
                 return Err("from and to cannot be the same".to_string());
             }
 
-            let ix = instruction::transfer(&from_addr, to_addr, sol_amount);
+            let ix = system_transfer_instruction(&from_addr, to_addr, sol_amount);
             Ok::<_, String>((s.key_name.clone(), from_addr, vec![ix]))
         })?;
 
@@ -1870,7 +1992,7 @@ pub mod state {
 }
 
 fn y_parity(prehash: &[u8], sig: &[u8], pubkey: &[u8]) -> Result<bool, String> {
-    use alloy_signer::k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 
     let orig_key = VerifyingKey::from_sec1_bytes(pubkey).map_err(format_error)?;
     let signature = Signature::try_from(sig).map_err(format_error)?;
@@ -1895,6 +2017,27 @@ fn y_parity(prehash: &[u8], sig: &[u8], pubkey: &[u8]) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outcall::tests::{MockHttpOutcall, success_response};
+
+    #[test]
+    fn finalization_shares_latest_block_outcalls_per_chain() {
+        let mock = MockHttpOutcall::new(vec![success_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": "0x2a"
+        }))]);
+        let client = EvmClient::new(vec!["https://rpc".to_string()], 2, mock.clone());
+        let context = FinalizeContext::default();
+
+        let (first, second) = futures::executor::block_on(futures::future::join(
+            context.evm_block_number("BNB", &client, 1),
+            context.evm_block_number("BNB", &client, 1),
+        ));
+
+        assert_eq!(first, Ok(42));
+        assert_eq!(second, Ok(42));
+        assert_eq!(mock.urls(), vec!["https://rpc".to_string()]);
+    }
 
     #[test]
     fn finalize_poll_backs_off_once_nothing_advances() {
@@ -1939,5 +2082,26 @@ mod tests {
 
         // state upgraded from a version without the timestamp
         assert!(finalize_lock_available(true, 0, 1_700_000_000_000));
+    }
+
+    #[test]
+    fn finalization_timer_waits_for_a_running_round_or_uses_the_requested_delay() {
+        assert_eq!(
+            finalize_timer_deadline_ms(1_000, Duration::from_secs(3), false, 0),
+            4_000
+        );
+        assert_eq!(
+            finalize_timer_deadline_ms(2_000, Duration::from_secs(3), true, 1_000),
+            1_000 + FINALIZE_BRIDGING_LOCK_TIMEOUT_MS
+        );
+        assert_eq!(
+            finalize_timer_deadline_ms(
+                1_000 + FINALIZE_BRIDGING_LOCK_TIMEOUT_MS,
+                Duration::from_secs(3),
+                true,
+                1_000,
+            ),
+            1_000 + FINALIZE_BRIDGING_LOCK_TIMEOUT_MS + 3_000
+        );
     }
 }

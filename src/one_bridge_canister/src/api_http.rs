@@ -1,9 +1,10 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use candid::CandidType;
+use http::Uri;
 use ic_auth_types::{ByteBufB64, cbor_into_vec};
 use ic_http_certification::{HeaderField, HttpRequest};
 use serde::{Deserialize, Serialize};
-use url::Url;
+use std::sync::LazyLock;
 
 use crate::store;
 
@@ -19,9 +20,15 @@ static CBOR: &str = "application/cbor";
 static JSON: &str = "application/json";
 static IC_CERTIFICATE_HEADER: &str = "ic-certificate";
 static IC_CERTIFICATE_EXPRESSION_HEADER: &str = "ic-certificateexpression";
+static CERTIFIED_EXPR_PATH: LazyLock<String> = LazyLock::new(|| {
+    BASE64.encode(
+        cbor_into_vec(&store::state::DEFAULT_EXPR_PATH.to_expr_path())
+            .expect("failed to serialize expr path"),
+    )
+});
 
 #[ic_cdk::query(hidden = true)]
-async fn http_request(request: HttpRequest<'static>) -> HttpResponse {
+fn http_request(request: HttpRequest<'static>) -> HttpResponse {
     let witness = store::state::http_tree_with(|t| {
         t.witness(&store::state::DEFAULT_CERT_ENTRY, request.url())
             .expect("get witness failed")
@@ -41,15 +48,12 @@ async fn http_request(request: HttpRequest<'static>) -> HttpResponse {
                 "certificate=:{}:, tree=:{}:, expr_path=:{}:, version=2",
                 BASE64.encode(certified_data),
                 BASE64.encode(cbor_into_vec(&witness).expect("failed to serialize witness")),
-                BASE64.encode(
-                    cbor_into_vec(&store::state::DEFAULT_EXPR_PATH.to_expr_path())
-                        .expect("failed to serialize expr path")
-                )
+                CERTIFIED_EXPR_PATH.as_str(),
             ),
         ),
     ];
 
-    let req_url = match parse_url(request.url()) {
+    let req_uri = match parse_uri(request.url()) {
         Ok(url) => url,
         Err(err) => {
             headers.push(("content-type".to_string(), "text/plain".to_string()));
@@ -64,7 +68,7 @@ async fn http_request(request: HttpRequest<'static>) -> HttpResponse {
 
     let in_cbor = supports_cbor(request.headers());
 
-    let rt = match (request.method().as_str(), req_url.path()) {
+    let rt = match (request.method().as_str(), req_uri.path()) {
         ("HEAD", _) => Ok(Vec::new()),
         ("GET", "/") => {
             let info = store::state::info();
@@ -106,13 +110,17 @@ async fn http_request(request: HttpRequest<'static>) -> HttpResponse {
     }
 }
 
-fn parse_url(s: &str) -> Result<Url, String> {
-    let url = if s.starts_with('/') {
-        Url::parse(format!("http://localhost{}", s).as_str())
+fn parse_uri(s: &str) -> Result<Uri, String> {
+    let uri = s
+        .parse::<Uri>()
+        .map_err(|err| format!("failed to parse url {s}, error: {err}"))?;
+    if s.starts_with('/') || (uri.scheme().is_some() && uri.authority().is_some()) {
+        Ok(uri)
     } else {
-        Url::parse(s)
-    };
-    url.map_err(|err| format!("failed to parse url {s}, error: {err}"))
+        Err(format!(
+            "url must be an absolute URI or start with '/': {s}"
+        ))
+    }
 }
 
 fn supports_cbor(headers: &[HeaderField]) -> bool {
@@ -147,5 +155,17 @@ mod tests {
             "accept".to_string(),
             "application/json".to_string()
         )]));
+    }
+
+    #[test]
+    fn parses_gateway_and_absolute_request_uris() {
+        assert_eq!(parse_uri("/?id=1").unwrap().path(), "/");
+        assert_eq!(
+            parse_uri("https://bridge.example/info?id=1")
+                .unwrap()
+                .path(),
+            "/info"
+        );
+        assert!(parse_uri("not-an-origin-form-uri").is_err());
     }
 }
