@@ -48,6 +48,16 @@ type Memory = VirtualMemory<DefaultMemoryImpl>;
 
 const MAX_ERROR_ROUNDS: u64 = 42;
 
+/// How far back through a user's archive `my_bridge_log` looks.
+///
+/// There is no index from an incoming transaction to the log that recorded it,
+/// so the lookup is a scan, and every step of it decodes a record out of stable
+/// memory. A user asks about a transaction right after making it, when it is
+/// still pending or sits at the very front of the archive, so the cap costs a
+/// real lookup nothing — it only stops a query for a transaction that was never
+/// there from reading a whole history to say so.
+const MAX_LOG_LOOKBACK: usize = 100;
+
 /// A finalization round that traps can never clear `finalize_bridging_round.1`,
 /// which would stop finalization forever. A lock held for longer than any round
 /// can plausibly take is therefore treated as stale and taken over.
@@ -519,14 +529,19 @@ fn task_progress(log: &BridgeLog) -> (bool, bool, bool) {
 ///
 /// A transaction that was dropped or replaced never produces a receipt, and
 /// polling for one is not an error, so without a backoff the chain re-queries
-/// the RPC providers every second forever — enough to spend a canister's entire
-/// cycle balance on a single abandoned task. The first tier still covers normal
-/// finality on every supported chain, so healthy bridging is unaffected.
+/// the RPC providers forever — enough to spend a canister's entire cycle balance
+/// on a single abandoned task.
+///
+/// The first tier is where healthy bridging lives, and it is paced by what the
+/// chains can actually do: two confirmations take ~3s on BNB Chain and ~25s on
+/// Ethereum, and Solana needs ~15s to finalize. Polling faster than that only
+/// pays to re-read the same answer, so the tier covers a full minute at a
+/// three-second cadence and every tier after it backs off hard.
 fn finalize_poll_delay_secs(idle_rounds: u64) -> u64 {
     match idle_rounds {
-        0..=9 => 1,    // ~10s: normal EVM/Solana finality lands here
-        10..=39 => 5,  // ~2.5min
-        40..=99 => 30, // ~30min
+        0..=19 => 3,   // ~1min: normal EVM/Solana finality lands here
+        20..=39 => 15, // ~6min
+        40..=99 => 60, // ~1h
         _ => 300,
     }
 }
@@ -877,41 +892,31 @@ pub mod state {
         Ok(from_tx)
     }
 
+    /// Finds the log recording `from_tx`, whether it is still being worked on or
+    /// already archived.
     pub fn my_bridge_log(user: Principal, from_tx: BridgeTx) -> Option<BridgeLog> {
-        let mut log = STATE.with_borrow(|s| {
+        let pending = STATE.with_borrow(|s| {
             s.pending
                 .iter()
                 .find(|item| item.user == user && item.from_tx == from_tx)
                 .cloned()
         });
-
-        if log.is_none() {
-            log = USER_LOGS.with_borrow(|r| {
-                let item = r.get(&user).unwrap_or_default();
-                if item.logs.is_empty() {
-                    return None;
-                }
-                let ids = item.logs.iter().rev().cloned().collect::<Vec<u64>>();
-
-                if ids.is_empty() {
-                    return None;
-                }
-
-                BRIDGE_LOGS.with_borrow(|log_store| {
-                    for id in ids {
-                        if let Some(mut log) = log_store.get(id)
-                            && log.from_tx == from_tx
-                        {
-                            log.id = Some(id);
-                            return Some(log.into());
-                        }
-                    }
-                    None
-                })
-            });
+        if pending.is_some() {
+            return pending;
         }
 
-        log
+        let archived = USER_LOGS.with_borrow(|r| r.get(&user).unwrap_or_default());
+        BRIDGE_LOGS.with_borrow(|log_store| {
+            for id in archived.logs.iter().rev().take(MAX_LOG_LOOKBACK) {
+                if let Some(mut log) = log_store.get(*id)
+                    && log.from_tx == from_tx
+                {
+                    log.id = Some(*id);
+                    return Some(log.into());
+                }
+            }
+            None
+        })
     }
 
     pub fn user_logs(user: Principal, take: usize, prev: Option<u64>) -> Vec<BridgeLog> {
@@ -1894,14 +1899,19 @@ mod tests {
     #[test]
     fn finalize_poll_backs_off_once_nothing_advances() {
         // healthy bridging: normal finality resolves inside the tight tier
-        assert_eq!(finalize_poll_delay_secs(0), 1);
-        assert_eq!(finalize_poll_delay_secs(9), 1);
+        assert_eq!(finalize_poll_delay_secs(0), 3);
+        assert_eq!(finalize_poll_delay_secs(19), 3);
 
         // a task that stopped advancing is polled progressively less often
-        assert_eq!(finalize_poll_delay_secs(10), 5);
-        assert_eq!(finalize_poll_delay_secs(40), 30);
+        assert_eq!(finalize_poll_delay_secs(20), 15);
+        assert_eq!(finalize_poll_delay_secs(40), 60);
         assert_eq!(finalize_poll_delay_secs(100), 300);
         assert_eq!(finalize_poll_delay_secs(u64::MAX), 300);
+
+        // the tight tier has to outlast the slowest finality bridged against:
+        // ~25s for two Ethereum confirmations, ~15s for Solana
+        let tight_tier: u64 = (0..20).map(finalize_poll_delay_secs).sum();
+        assert!(tight_tier >= 60);
 
         // an abandoned task must not cost more than a few hundred rounds a day
         assert!(86_400 / finalize_poll_delay_secs(u64::MAX) < 500);
