@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteArray;
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     rc::Rc,
@@ -435,6 +435,7 @@ thread_local! {
     static HTTP_TREE: RefCell<HttpCertificationTree> = RefCell::new(HttpCertificationTree::default());
     static ACTIVE_BRIDGE_USERS: RefCell<BTreeSet<Principal>> = const { RefCell::new(BTreeSet::new()) };
     static FINALIZE_TIMER: RefCell<Option<ScheduledFinalize>> = const { RefCell::new(None) };
+    static FINALIZE_RUN_GENERATION: Cell<u64> = const { Cell::new(0) };
 
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
         RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
@@ -493,6 +494,25 @@ fn finalize_lock_available(running: bool, started_at: u64, now_ms: u64) -> bool 
     !running || now_ms.saturating_sub(started_at) >= FINALIZE_BRIDGING_LOCK_TIMEOUT_MS
 }
 
+fn next_finalize_run_generation() -> u64 {
+    FINALIZE_RUN_GENERATION.with(|value| {
+        let next = value.get().wrapping_add(1);
+        value.set(next);
+        next
+    })
+}
+
+fn finalize_run_matches(expected: u64, current: u64, running: bool) -> bool {
+    expected == current && running
+}
+
+fn finalize_run_is_current(expected: u64) -> bool {
+    let current = FINALIZE_RUN_GENERATION.with(Cell::get);
+    STATE.with_borrow(|state| {
+        finalize_run_matches(expected, current, state.finalize_bridging_round.1)
+    })
+}
+
 fn finalize_timer_deadline_ms(now_ms: u64, delay: Duration, running: bool, started_at: u64) -> u64 {
     let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
     let requested = now_ms.saturating_add(delay_ms);
@@ -521,6 +541,75 @@ enum TaskOutcome {
     /// nothing and owes nothing. Archive it and drop it from the queue, rather
     /// than leaving an error behind that blocks every other user of that chain.
     Abandoned(BridgeLog),
+}
+
+/// Result of atomically reserving the outgoing transaction slot of a pending
+/// task before handing a signed transaction to an external provider.
+enum PayoutClaim {
+    /// This round filled the empty slot and is the only one allowed to broadcast
+    /// the candidate transaction.
+    Claimed,
+    /// Another (possibly stale-overlapping) round filled the slot first. Reuse
+    /// that transaction and never broadcast the candidate.
+    Existing(BridgeTx),
+    /// This round lost the stale-lock race before it could reserve the slot.
+    RunSuperseded,
+    /// The task was finalized or removed while this round was building its
+    /// candidate transaction.
+    TaskGone,
+}
+
+fn claim_payout_in(
+    pending: &mut VecDeque<BridgeLog>,
+    from_tx: &BridgeTx,
+    candidate: &BridgeTx,
+) -> PayoutClaim {
+    let Some(task) = pending
+        .iter_mut()
+        .find(|task| task.from_tx.same_with(from_tx))
+    else {
+        return PayoutClaim::TaskGone;
+    };
+
+    match &task.to_tx {
+        Some(existing) => PayoutClaim::Existing(existing.clone()),
+        None => {
+            task.to_tx = Some(candidate.clone());
+            PayoutClaim::Claimed
+        }
+    }
+}
+
+fn claim_pending_payout_with(
+    running: bool,
+    pending: &mut VecDeque<BridgeLog>,
+    current: u64,
+    run_generation: u64,
+    from_tx: &BridgeTx,
+    candidate: &BridgeTx,
+) -> PayoutClaim {
+    if !finalize_run_matches(run_generation, current, running) {
+        return PayoutClaim::RunSuperseded;
+    }
+    claim_payout_in(pending, from_tx, candidate)
+}
+
+fn claim_pending_payout(
+    run_generation: u64,
+    from_tx: &BridgeTx,
+    candidate: &BridgeTx,
+) -> PayoutClaim {
+    let current = FINALIZE_RUN_GENERATION.with(Cell::get);
+    STATE.with_borrow_mut(|state| {
+        claim_pending_payout_with(
+            state.finalize_bridging_round.1,
+            &mut state.pending,
+            current,
+            run_generation,
+            from_tx,
+            candidate,
+        )
+    })
 }
 
 /// RPC values shared by every task in one finalization round.
@@ -1106,14 +1195,35 @@ pub mod state {
         });
 
         if let Some(tasks) = tasks {
-            let tasks = try_finalize_tasks(tasks).await;
+            let run_generation = next_finalize_run_generation();
+            // Progress must be measured against how far each task had got when
+            // this round cloned it: `claim_pending_payout` writes a broadcast
+            // payout into the live task before the round merges, so comparing
+            // against the live queue at merge time would no longer see that
+            // transition and the round would be miscounted as idle.
+            let baselines: Vec<_> = tasks.iter().map(task_progress).collect();
+            let tasks = try_finalize_tasks(tasks, run_generation).await;
             let now_ms = ic_cdk::api::time() / 1_000_000;
+            let current_generation = FINALIZE_RUN_GENERATION.with(Cell::get);
             let next = STATE.with_borrow_mut(|s| {
+                if !finalize_run_matches(
+                    run_generation,
+                    current_generation,
+                    s.finalize_bridging_round.1,
+                ) {
+                    // A stale-lock takeover owns the queue now. The superseded
+                    // round must not merge results, release its lock, or touch
+                    // the replacement round's timer.
+                    return None;
+                }
+
                 let mut has_error = false;
                 let mut has_progress = false;
                 let mut abandoned: Vec<BridgeTx> = Vec::new();
 
-                for outcome in tasks {
+                // `join_all` keeps the input order, so outcomes line up with
+                // the baselines captured before processing.
+                for (outcome, baseline) in tasks.into_iter().zip(baselines) {
                     if let TaskOutcome::Abandoned(task) = outcome {
                         // The deposit failed on chain: nothing arrived, so nothing is
                         // owed. Archiving instead of erroring keeps the queue — and
@@ -1131,9 +1241,9 @@ pub mod state {
 
                     let task = outcome.into_log();
                     has_error = has_error || task.error.is_some();
+                    has_progress = has_progress || baseline != task_progress(&task);
                     for t in s.pending.iter_mut() {
                         if t.same_with(&task) {
-                            has_progress = has_progress || task_progress(t) != task_progress(&task);
                             *t = task;
                             if t.to_tx.as_ref().is_some_and(|tx| tx.is_finalized()) {
                                 t.error = None;
@@ -1156,7 +1266,7 @@ pub mod state {
                 s.finalize_bridging_round = (s.finalize_bridging_round.0.saturating_add(1), false);
                 s.finalize_bridging_started_at = 0;
 
-                if s.pending.is_empty() {
+                let next_delay = if s.pending.is_empty() {
                     None
                 } else if has_error {
                     s.idle_rounds = 0;
@@ -1174,8 +1284,13 @@ pub mod state {
                         s.idle_rounds.saturating_add(1)
                     };
                     Some(finalize_poll_delay_secs(s.idle_rounds))
-                }
+                };
+                Some(next_delay)
             });
+
+            let Some(next) = next else {
+                return;
+            };
 
             if let Some(delay) = next {
                 schedule_finalize(Duration::from_secs(delay));
@@ -1225,8 +1340,10 @@ pub mod state {
     /// A round works on clones and writes them back when it completes, so an edit
     /// made in the meantime is silently overwritten — or, worse, would undo a
     /// payout the round has already broadcast. A lock that looks abandoned is not
-    /// a reason to refuse: recovering from exactly that case is the point.
-    fn ensure_finalize_bridging_idle() -> Result<(), String> {
+    /// a reason to refuse: recovering from exactly that case is the point. A
+    /// successful edit invalidates its generation before this update returns so
+    /// a late callback cannot merge or broadcast afterward.
+    fn ensure_finalize_bridging_idle() -> Result<bool, String> {
         let now_ms = ic_cdk::api::time() / 1_000_000;
         STATE.with_borrow(|s| {
             if finalize_lock_available(
@@ -1234,7 +1351,7 @@ pub mod state {
                 s.finalize_bridging_started_at,
                 now_ms,
             ) {
-                Ok(())
+                Ok(s.finalize_bridging_round.1)
             } else {
                 Err("a finalization round is in progress, please retry in a moment".to_string())
             }
@@ -1260,7 +1377,7 @@ pub mod state {
     /// transaction whose blockhash expired without landing. Retrying a payout
     /// that did go through pays the recipient twice.
     pub fn retry_pending_task(from_tx: &BridgeTx) -> Result<BridgeLog, String> {
-        ensure_finalize_bridging_idle()?;
+        let stale_running = ensure_finalize_bridging_idle()?;
 
         let log = STATE.with_borrow_mut(|s| {
             let task = s
@@ -1280,6 +1397,10 @@ pub mod state {
             Ok(task.clone())
         })?;
 
+        if stale_running {
+            next_finalize_run_generation();
+        }
+
         restart_finalize_bridging();
         Ok(log)
     }
@@ -1291,8 +1412,16 @@ pub mod state {
     /// The bridging did not complete, so the amount and the fee are not added to
     /// `total_bridged_tokens` / `total_collected_fees`. Settling with the user is
     /// left to the administrator.
+    ///
+    /// Before settling an ICP-bound task manually, check the ledger for the
+    /// payout this task would have sent (its dedup key: `created_at` and the
+    /// memo derived from `from_tx`). A stale round's `icrc1_transfer` can still
+    /// be in flight when the task is closed and land afterward — the EVM/SOL
+    /// paths record their claimed transaction in `to_tx` before broadcasting,
+    /// but an ICP block height is unknown until the ledger answers, so the
+    /// archived record cannot carry it.
     pub fn close_pending_task(from_tx: &BridgeTx, now_ms: u64) -> Result<BridgeLog, String> {
-        ensure_finalize_bridging_idle()?;
+        let stale_running = ensure_finalize_bridging_idle()?;
 
         let log = STATE.with_borrow_mut(|s| {
             let idx = s
@@ -1323,17 +1452,21 @@ pub mod state {
             Ok(log)
         })?;
 
+        if stale_running {
+            next_finalize_run_generation();
+        }
+
         restart_finalize_bridging();
         Ok(log)
     }
 
-    async fn try_finalize_tasks(tasks: Vec<BridgeLog>) -> Vec<TaskOutcome> {
+    async fn try_finalize_tasks(tasks: Vec<BridgeLog>, run_generation: u64) -> Vec<TaskOutcome> {
         let now_ms = ic_cdk::api::time() / 1_000_000;
         let context = FinalizeContext::default();
         futures::future::join_all(
             tasks
                 .into_iter()
-                .map(|task| process_task(task, now_ms, context.clone())),
+                .map(|task| process_task(task, now_ms, context.clone(), run_generation)),
         )
         .await
     }
@@ -1342,6 +1475,7 @@ pub mod state {
         mut task: BridgeLog,
         now_ms: u64,
         context: FinalizeContext,
+        run_generation: u64,
     ) -> TaskOutcome {
         // Set when the incoming transfer failed on chain. Nothing reached the
         // bridge, so the task is finished — unsuccessfully — and must not be left
@@ -1388,6 +1522,9 @@ pub mod state {
             };
 
             if from_finalized {
+                if !finalize_run_is_current(run_generation) {
+                    return Ok(());
+                }
                 match (&task.to, &mut task.to_tx) {
                     (BridgeTarget::Icp, None) => {
                         let token_ledger = STATE.with_borrow(|s| s.token_ledger);
@@ -1404,8 +1541,9 @@ pub mod state {
                     }
                     (BridgeTarget::Evm(chain), None) => {
                         let to_addr = if let Some(addr) = &task.to_addr {
-                            addr.parse::<Address>()
-                                .map_err(|_| format!("{chain}: invalid to_addr address: {}", addr))?
+                            addr.parse::<Address>().map_err(|_| {
+                                format!("{chain}: invalid to_addr address: {}", addr)
+                            })?
                         } else {
                             // Prefix with the chain name so the stuck-task gate
                             // in `bridge()` recognizes which chain the error
@@ -1414,8 +1552,20 @@ pub mod state {
                                 .map_err(|err| format!("{chain}: {err}"))?
                         };
                         let to_amount = bridge_amount_after_fee(task.icp_amount, task.fee)?;
-                        match to_evm(chain, to_addr, to_amount, now_ms).await {
-                            Ok(to_tx) => task.to_tx = Some(to_tx),
+                        match to_evm(
+                            run_generation,
+                            &task.from_tx,
+                            chain,
+                            to_addr,
+                            to_amount,
+                            now_ms,
+                        )
+                        .await
+                        {
+                            Ok(Some(to_tx)) => task.to_tx = Some(to_tx),
+                            // This round was superseded, or a concurrent round
+                            // removed the task while the transaction was built.
+                            Ok(None) => return Ok(()),
                             Err((sent_tx, err)) => {
                                 task.to_tx = sent_tx;
                                 return Err(err);
@@ -1445,12 +1595,16 @@ pub mod state {
                             Pubkey::from_str(addr)
                                 .map_err(|_| format!("SOL: invalid to_addr address: {}", addr))?
                         } else {
-                            state::svm_address(&task.user)
-                                .map_err(|err| format!("SOL: {err}"))?
+                            state::svm_address(&task.user).map_err(|err| format!("SOL: {err}"))?
                         };
                         let to_amount = bridge_amount_after_fee(task.icp_amount, task.fee)?;
-                        match to_svm(to_addr, to_amount, now_ms).await {
-                            Ok(to_tx) => task.to_tx = Some(to_tx),
+                        match to_svm(run_generation, &task.from_tx, to_addr, to_amount, now_ms)
+                            .await
+                        {
+                            Ok(Some(to_tx)) => task.to_tx = Some(to_tx),
+                            // This round was superseded, or a concurrent round
+                            // removed the task while the transaction was built.
+                            Ok(None) => return Ok(()),
                             Err((sent_tx, err)) => {
                                 task.to_tx = sent_tx;
                                 return Err(err);
@@ -1619,14 +1773,17 @@ pub mod state {
 
     /// Broadcasts an outgoing payout transaction.
     ///
-    /// On failure the returned `Option<BridgeTx>` carries the transaction that was
-    /// already signed and handed to the provider, if any: the provider may have
-    /// accepted and propagated it even though the RPC call itself failed, so the
-    /// caller must record it and poll for its receipt instead of building and
-    /// sending a second transaction.
-    type BroadcastResult = Result<BridgeTx, (Option<BridgeTx>, String)>;
+    /// A successful `Some` is the transaction this task must poll. `None` means
+    /// the round was superseded or the task disappeared while its candidate was
+    /// being built. On failure the error's `Option<BridgeTx>` carries the
+    /// transaction that was atomically recorded before it was handed to the
+    /// provider, if any: the provider may have accepted and propagated it even
+    /// though the RPC call itself failed.
+    type BroadcastResult = Result<Option<BridgeTx>, (Option<BridgeTx>, String)>;
 
     async fn to_evm(
+        run_generation: u64,
+        from_tx: &BridgeTx,
         chain: &str,
         to_addr: Address,
         icp_amount: u128,
@@ -1647,11 +1804,17 @@ pub mod state {
         let tx = BridgeTx::Evm(false, tx_hash.into());
         let data = signed_tx.encoded_2718();
 
+        match claim_pending_payout(run_generation, from_tx, &tx) {
+            PayoutClaim::Claimed => {}
+            PayoutClaim::Existing(existing) => return Ok(Some(existing)),
+            PayoutClaim::RunSuperseded | PayoutClaim::TaskGone => return Ok(None),
+        }
+
         client
             .send_raw_transaction(now_ms, Bytes::from(data).to_string())
             .await
             .map_err(|err| (Some(tx.clone()), format!("{chain}: {err}")))?;
-        Ok(tx)
+        Ok(Some(tx))
     }
 
     async fn from_svm(user: Principal, icp_amount: u128, now_ms: u64) -> Result<BridgeTx, String> {
@@ -1669,7 +1832,13 @@ pub mod state {
         Ok(BridgeTx::Sol(false, tx_hash.into()))
     }
 
-    async fn to_svm(to_addr: Pubkey, icp_amount: u128, now_ms: u64) -> BroadcastResult {
+    async fn to_svm(
+        run_generation: u64,
+        from_tx: &BridgeTx,
+        to_addr: Pubkey,
+        icp_amount: u128,
+        now_ms: u64,
+    ) -> BroadcastResult {
         // let to_addr = evm_address(&user);
         let (client, signed_tx) =
             build_spl_transfer_tx(&ic_cdk::api::canister_self(), &to_addr, icp_amount, now_ms)
@@ -1680,11 +1849,17 @@ pub mod state {
         let tx = BridgeTx::Sol(false, tx_hash.into());
         let data = bincode::serialize(&signed_tx).map_err(|err| (None, format!("SOL: {err}")))?;
 
+        match claim_pending_payout(run_generation, from_tx, &tx) {
+            PayoutClaim::Claimed => {}
+            PayoutClaim::Existing(existing) => return Ok(Some(existing)),
+            PayoutClaim::RunSuperseded | PayoutClaim::TaskGone => return Ok(None),
+        }
+
         client
             .send_transaction(now_ms, data.into())
             .await
             .map_err(|err| (Some(tx.clone()), format!("SOL: {err}")))?;
-        Ok(tx)
+        Ok(Some(tx))
     }
 
     /// What an EVM transaction should do, before the nonce, the gas price and
@@ -2080,6 +2255,93 @@ mod tests {
         assert!(first.is_err());
         assert_eq!(first, second);
         assert_eq!(mock.urls(), vec!["https://rpc".to_string()]);
+    }
+
+    #[test]
+    fn only_the_first_overlapping_round_can_claim_a_payout() {
+        let from_tx = BridgeTx::Icp(true, 7);
+        let first = BridgeTx::Evm(false, [1_u8; 32].into());
+        let replacement = BridgeTx::Evm(false, [2_u8; 32].into());
+        let mut pending = VecDeque::from([BridgeLog {
+            id: None,
+            user: Principal::anonymous(),
+            from: BridgeTarget::Icp,
+            to: BridgeTarget::Evm("ETH".to_string()),
+            icp_amount: 100,
+            fee: 1,
+            from_tx: from_tx.clone(),
+            to_tx: None,
+            to_addr: None,
+            created_at: 1,
+            finalized_at: 0,
+            error: None,
+        }]);
+
+        assert!(matches!(
+            claim_payout_in(&mut pending, &from_tx, &first),
+            PayoutClaim::Claimed
+        ));
+        assert!(pending[0].to_tx.as_ref().is_some_and(|tx| tx == &first));
+
+        let second = claim_payout_in(&mut pending, &from_tx, &replacement);
+        match second {
+            PayoutClaim::Existing(existing) => assert!(existing == first),
+            _ => panic!("the stale round replaced the claimed payout"),
+        }
+        assert!(pending[0].to_tx.as_ref().is_some_and(|tx| tx == &first));
+
+        assert!(matches!(
+            claim_payout_in(&mut pending, &BridgeTx::Icp(true, 8), &replacement),
+            PayoutClaim::TaskGone
+        ));
+    }
+
+    #[test]
+    fn superseded_finalize_run_cannot_merge() {
+        assert!(finalize_run_matches(2, 2, true));
+        assert!(!finalize_run_matches(1, 2, true));
+        assert!(!finalize_run_matches(2, 2, false));
+    }
+
+    #[test]
+    fn superseded_run_cannot_claim_a_payout() {
+        let from_tx = BridgeTx::Icp(true, 9);
+        let candidate = BridgeTx::Evm(false, [3_u8; 32].into());
+        let mut pending = VecDeque::from([BridgeLog {
+            id: None,
+            user: Principal::anonymous(),
+            from: BridgeTarget::Icp,
+            to: BridgeTarget::Evm("ETH".to_string()),
+            icp_amount: 100,
+            fee: 1,
+            from_tx: from_tx.clone(),
+            to_tx: None,
+            to_addr: None,
+            created_at: 1,
+            finalized_at: 0,
+            error: None,
+        }]);
+
+        // A run whose generation was bumped away must not touch the slot.
+        assert!(matches!(
+            claim_pending_payout_with(true, &mut pending, 2, 1, &from_tx, &candidate),
+            PayoutClaim::RunSuperseded
+        ));
+        assert!(pending[0].to_tx.is_none());
+
+        // A released lock refuses the claim even for a matching generation.
+        assert!(matches!(
+            claim_pending_payout_with(false, &mut pending, 2, 2, &from_tx, &candidate),
+            PayoutClaim::RunSuperseded
+        ));
+        assert!(pending[0].to_tx.is_none());
+
+        // The current generation with the lock held is the only one that can.
+        assert!(matches!(
+            claim_pending_payout_with(true, &mut pending, 2, 2, &from_tx, &candidate),
+            PayoutClaim::Claimed
+        ));
+        assert!(pending[0].to_tx.as_ref().is_some_and(|tx| tx == &candidate));
     }
 
     #[test]
