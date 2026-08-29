@@ -1,22 +1,83 @@
 # 🌉 `One Bridge Canister`
-The project enables seamless multi-chain token transfers across the Internet Computer, Ethereum, BNB Chain, and other EVM-compatible networks through a fully on-chain bridge.
 
-## Demo
+A fully on-chain token bridge running as an Internet Computer canister. It moves a token between the
+IC, Solana, and EVM networks (BNB Chain, Ethereum, Base, ...) without any off-chain relayer: the
+canister reads the remote chains through HTTPS outcalls and signs remote transactions itself with
+threshold ECDSA (secp256k1) and threshold Schnorr (Ed25519).
 
-ICPanda's PANDA token bridge: https://dpjyw-raaaa-aaaar-qbxlq-cai.raw.icp0.io/?id=53cyg-yyaaa-aaaap-ahpua-cai
+Each token gets its own canister instance, holding the whole non-IC supply and locking or releasing
+against it. ICPanda's PANDA is the reference deployment; see [token_listing.md](./token_listing.md)
+to have a token listed.
+
+- Web app: https://1bridge.app/ (`ejwdq-iyaaa-aaaap-an47q-cai`)
+- PANDA bridge canister: `dpjyw-raaaa-aaaar-qbxlq-cai`, controlled by the ICPanda SNS DAO
+- Certified state as JSON (or CBOR with `Accept: application/cbor`):
+  https://dpjyw-raaaa-aaaar-qbxlq-cai.icp0.io/
+
+## How it works
+
+**Every user has a deposit address on every chain.** The canister derives one address per caller
+principal — an EVM address from its threshold ECDSA key and a Solana address from its threshold
+Ed25519 key — and it can sign for them. Read them with `evm_address` / `svm_address`.
+
+**Bridging in.** `bridge(from_chain, to_chain, amount, opt to)` takes the amount in the IC ledger's
+decimals and converts it to the destination chain's decimals.
+
+| `from_chain` | what the canister does |
+| --- | --- |
+| `"ICP"` | `icrc2_transfer_from` on the token ledger, so the caller must `icrc2_approve` the canister first |
+| `"BNB"`, other EVM chains | signs an ERC-20 transfer from the caller's derived EVM address into the bridge's own address, so the caller must fund that address first (with the token, and with enough native gas) |
+| `"SOL"` | the same, as an SPL transfer from the caller's derived Solana address |
+
+**Bridging out.** The task goes on a pending queue and a finalization round waits for the incoming
+transaction to reach finality, then pays out `amount - token_bridge_fee` on the destination chain:
+to `to` when given, otherwise to the caller's own principal or derived address. Payouts are
+deduplicated so a retry cannot pay twice. Polling is paced by finality — every 3s for the first
+minute, then backing off to 15s, 60s and 5min while nothing advances.
+
+**Guards.** `bridge` rejects amounts below `min_threshold_to_bridge`, refuses a second unconfirmed
+EVM deposit from the same user on the same chain, and refuses new tasks on a chain that already has
+a task stuck with an error. After too many consecutive failing rounds it stops entirely until
+`admin_restart_bridging` is called.
+
+Track a task with `my_bridge_log(from_tx)`, `my_pending_logs()` and `my_finalized_logs(take, prev)`.
+
+## Repository layout
+
+| Path | What |
+| --- | --- |
+| [src/one_bridge_canister](./src/one_bridge_canister) | the bridge canister (Rust) |
+| [src/one_bridge_app](./src/one_bridge_app) | the web app (SvelteKit), deployed as an asset canister |
+| [evm_contracts](./evm_contracts) | the flattened ERC-20 source deployed on the EVM side |
+| [proposals](./proposals) | `quill` scripts for the SNS proposals that operate the canister |
+| [sns_functions.md](./sns_functions.md) | SNS generic function ids for the admin methods |
+
+## Development
+
+```bash
+make lint   # cargo fmt + clippy
+make test   # cargo test --workspace
+
+make build-wasm  # cargo build --release --target wasm32-unknown-unknown
+make build-did   # regenerate the .did from the wasm, then dfx generate
+```
+
+Releases are built by [.github/workflows/release.yml](./.github/workflows/release.yml) on a `v*`
+tag, with `ic-wasm` and `wasm-opt` pinned so the artifact can be rebuilt byte for byte. Each release
+publishes `one_bridge_canister.wasm.gz` next to a file naming its SHA-256, which is what upgrade
+proposals reference.
 
 ## Quick Start
 
 ### Local Deployment
 
-Deploy the canister:
 ```bash
 dfx canister create --specified-id dpjyw-raaaa-aaaar-qbxlq-cai one_bridge_canister
-# deploy with default settings
+# deploy with default settings (key_name = "dfx_test_key")
 dfx deploy one_bridge_canister
 ```
 
-### Deployment
+### Mainnet Deployment
 
 #### 1. Deploy the canister to subnet `pzp6e`:
 ```bash
@@ -28,77 +89,130 @@ dfx deploy one_bridge_canister --argument "(opt variant {Init =
     token_decimals = 8;
     token_logo = \"https://532er-faaaa-aaaaj-qncpa-cai.icp0.io/f/374?inline&filename=1734188626561.webp\";
     token_ledger = principal \"druyg-tyaaa-aaaaq-aactq-cai\";
-    token_bridge_fee = 100_000;
-    min_threshold_to_bridge = 1_000_000_000;
+    token_bridge_fee = 10_000_000_000;
+    min_threshold_to_bridge = 1_000_000_000_000;
     governance_canister = opt principal \"dwv6s-6aaaa-aaaaq-aacta-cai\";
   }
 })" --ic --subnet pzp6e-ekpqk-3c5x7-2h6so-njoeq-mt45d-h3h6c-q3mxf-vpeq5-fk5o7-yae
 ```
 
+`token_bridge_fee` and `min_threshold_to_bridge` are in the ledger's decimals — the values above are
+100 PANDA and 10,000 PANDA. Neither has a setter: changing them later means an upgrade that passes
+new `UpgradeArgs`, and an omitted field keeps its stored value.
+
 #### 2. Check info:
 ```bash
 dfx canister call one_bridge_canister info '()' --ic
-dfx canister call one_bridge_canister my_evm_address '()' --ic
+dfx canister call one_bridge_canister evm_address '(null)' --ic
+dfx canister call one_bridge_canister svm_address '(null)' --ic
 ```
 
 #### 3. Set EVM providers (e.g. BNB Chain Mainnet):
 ```bash
-# chain_name = "BNB"
-# max_confirmations = 11
-# providers = vec { "https://bsc.nodereal.io"; "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3" }
-dfx canister call one_bridge_canister admin_set_evm_providers '("BNB", 11, vec { "https://bsc.nodereal.io"; "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3" })' --ic
+# chain_name = "BNB", max_confirmations = 3 (must be >= 2)
+dfx canister call one_bridge_canister admin_set_evm_providers '("BNB", 3, vec { "https://bsc-dataseed.bnbchain.org"; "https://bsc.nodereal.io"; "https://bsc-dataseed.nariox.org" })' --ic
 ```
 
-#### 4. Add EVM contract (e.g. BNB Chain PANDA token):
+The providers are tried in order, so a list of at least two keeps the bridge working when one is
+down. Only `https` URLs are accepted.
+
+#### 4. Add the EVM contract (e.g. BNB Chain PANDA token):
 ```bash
-# chain_name = "BNB"
-# chain_id = 56
-# contract_address = "0xe74583edAFF618D88463554b84Bc675196b36990" (this is testnet address, replace with mainnet address)
+# chain_name = "BNB" (uppercase, at most 8 chars), chain_id = 56
+# contract_address must be EIP-55 checksummed
 dfx canister call one_bridge_canister admin_add_evm_contract '("BNB", 56, "0xe74583edAFF618D88463554b84Bc675196b36990")' --ic
 ```
 
-**We can add other EVM chains (Ethereum, Base, Avalanche...) and contracts similarly.**
+The canister verifies the chain id against the providers and reads the contract's `decimals()`
+itself. **Other EVM chains (Ethereum, Base, Avalanche...) are added the same way.**
 
-#### 5. Bridge 1 PANDA from ICP to BNB Chain:
-- 5.1. The total supply of PANDA on BNB Chain should be hold by the bridge canister's EVM address at initialization.
-- 5.2. Make sure the bridge canister evm address has enough gas (BNB) to pay for the transaction fees on BNB Chain.
-- 5.3. The user should approve the canister to spend PANDA on their behalf.
+#### 5. Add the Solana side (optional):
+```bash
+dfx canister call one_bridge_canister admin_set_svm_providers '(vec { "https://api.mainnet-beta.solana.com" })' --ic
+# the SPL mint address; the canister reads its decimals and token program
+dfx canister call one_bridge_canister admin_add_svm_contract '("<SPL mint address>")' --ic
+```
+
+#### 6. Bridge 10,000 PANDA from ICP to BNB Chain:
+- 6.1. The whole PANDA supply on BNB Chain should be held by the bridge canister's EVM address at
+  initialization.
+- 6.2. That address needs enough native gas (BNB) to pay for the payout transactions.
+- 6.3. The user must approve the canister to spend PANDA on their behalf (`icrc2_approve`).
 
 ```bash
-# from_chain = "ICP"
-# to_chain = "BNB"
-# amount = 100_000_000 (1 PANDA with 8 decimals)
-dfx canister call one_bridge_canister bridge '("ICP", "BNB", 100_000_000)' --ic
+# from_chain = "ICP", to_chain = "BNB"
+# amount = 1_000_000_000_000 (10,000 PANDA with 8 decimals)
+# to = null pays out to the caller's own derived EVM address
+dfx canister call one_bridge_canister bridge '("ICP", "BNB", 1_000_000_000_000, null)' --ic
 
-# check pending tansfers
+# check pending transfers
 dfx canister call one_bridge_canister my_pending_logs '()' --ic
 
-# after some time, check finalized tansfers
-dfx canister call one_bridge_canister my_finalized_logs '(null, null)' --ic
+# after some time, check finalized transfers (take, prev)
+dfx canister call one_bridge_canister my_finalized_logs '(10, null)' --ic
 ```
+
+Bridging back is the mirror image: send the tokens to the address `evm_address '(null)'` returns,
+leave enough BNB there for one transfer, then call
+`bridge '("BNB", "ICP", 1_000_000_000_000, null)'`.
+
+## Operating the bridge
+
+The admin methods are guarded by `is_controller`, so on mainnet the SNS DAO calls them through
+proposals. Each one has a `validate_*` twin that renders the arguments for voters, and the generic
+function ids are listed in [sns_functions.md](./sns_functions.md). The scripts under
+[proposals/](./proposals) are the working examples, including canister upgrades.
+
+| Method | When |
+| --- | --- |
+| `admin_restart_bridging` | bridging is disabled after too many failing rounds; clears the counter and re-arms the timer |
+| `admin_retry_bridging_task` | a payout transaction demonstrably moved no funds and must be rebuilt |
+| `admin_close_bridging_task` | a task is stuck and is archived as not bridged; settling with the user is manual |
+| `admin_collect_fees` | withdraw collected fees to a principal |
+| `admin_add_bridges` / `admin_remove_bridges` | manage the canisters allowed to call `evm_sign` |
 
 ## API Reference
 
-The canister exposes a comprehensive Candid API. Key endpoints include:
-
 ```candid
-admin_add_evm_contract : (text, nat64, text) -> (Result);
+// state and addresses
+info : () -> (Result_7) query;
+evm_address : (opt principal) -> (Result_4) query;
+svm_address : (opt principal) -> (Result_4) query;
+
+// bridging
+bridge : (text, text, nat, opt text) -> (Result_2);
+my_bridge_log : (BridgeTx) -> (Result_1) query;
+my_pending_logs : () -> (Result_6) query;
+my_finalized_logs : (nat32, opt nat64) -> (Result_6) query;
+pending_logs : () -> (Result_6) query;
+finalized_logs : (nat32, opt nat64) -> (Result_6) query;
+
+// moving funds out of a derived address; the *_tx variants return a signed
+// transaction for the caller to broadcast instead of broadcasting it
+erc20_transfer : (text, text, nat) -> (Result_4);
+erc20_transfer_tx : (text, text, nat) -> (Result_4);
+evm_transfer_tx : (text, text, nat) -> (Result_4);
+spl_transfer_tx : (text, nat) -> (Result_4);
+sol_transfer_tx : (text, nat64) -> (Result_4);
+evm_sign : (blob) -> (Result_5);
+
+// admin, controller only; each has a validate_* twin
 admin_set_evm_providers : (text, nat64, vec text) -> (Result);
-admin_update_evm_gas_price : () -> (Result);
-bridge : (text, text, nat) -> (Result_1);
-erc20_transfer : (text, text, nat) -> (Result_2);
-erc20_transfer_tx : (text, text, nat) -> (Result_2);
-info : () -> (Result_3) query;
-my_evm_address : () -> (Result_2) query;
-my_finalized_logs : (opt nat64, opt nat64) -> (Result_4) query;
-my_pending_logs : () -> (Result_4) query;
-validate_admin_add_evm_contract : (text, nat64, text) -> (Result_2);
-validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_2);
+admin_add_evm_contract : (text, nat64, text) -> (Result);
+admin_set_svm_providers : (vec text) -> (Result);
+admin_add_svm_contract : (text) -> (Result);
+admin_restart_bridging : () -> (Result_3);
+admin_retry_bridging_task : (BridgeTx) -> (Result_1);
+admin_close_bridging_task : (BridgeTx) -> (Result_1);
+admin_collect_fees : (principal, nat) -> (Result_2);
+admin_add_bridges : (vec principal) -> (Result);
+admin_remove_bridges : (vec principal) -> (Result);
 ```
 
-Full Candid API definition: [one_bridge_canister.did](https://github.com/ldclabs/ic-one-bridge/tree/main/src/one_bridge_canister/one_bridge_canister.did)
+Full Candid API definition: [one_bridge_canister.did](./src/one_bridge_canister/one_bridge_canister.did)
 
 ## License
-Copyright © 2024-2025 [LDC Labs](https://github.com/ldclabs).
+Copyright © 2024-2026 [LDC Labs](https://github.com/ldclabs).
 
-`ldclabs/ic-one-bridge` is licensed under the MIT License. See [LICENSE](./LICENSE-MIT) for the full license text.
+`ldclabs/ic-one-bridge` is licensed under the MIT License. See [LICENSE](./LICENSE) for the full
+license text.
