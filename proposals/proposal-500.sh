@@ -18,10 +18,14 @@ export CANISTERS_PATH="$(pwd)/debug"
 # No upgrade argument on purpose: every field of UpgradeArgs is optional and an
 # absent one leaves the stored value alone, so token_bridge_fee (100 PANDA) and
 # min_threshold_to_bridge (10,000 PANDA) survive the upgrade unchanged.
+#
+# erc20_gas_limit is new in v0.5.2 and has no stored value to leave alone, but
+# absent it takes its default of 84,000 -- the literal v0.5.1 hard-codes -- so
+# omitting it changes nothing either. Pass it only to move off that figure.
 
 quill sns make-upgrade-canister-proposal $PROPOSAL_NEURON_ID --canister-ids-file ./sns_canister_ids.json --pem-file $PROPOSAL_PEM_FILE --target-canister-id "dpjyw-raaaa-aaaar-qbxlq-cai" --wasm-path "$CANISTERS_PATH/one_bridge_canister.wasm.gz" --mode upgrade --title "Upgrade one_bridge_canister canister to v0.5.2" --summary "This proposal upgrades dpjyw-raaaa-aaaar-qbxlq-cai from v0.5.1 to v0.5.2. The canister runs module de2b54e82a431b330cffa5fc92bdf3050651aaa06014655762b16423c606ed69 today; this installs ad5f0814fb28d3cea0253450347ac20e888ae183929e916716bd86a1ef6c5dac, the artifact the release workflow built from the v0.5.2 tag and published with its SHA-256.
 
-No upgrade argument is passed, so the bridge fee and the minimum bridge amount keep their current values. The Candid interface only gains record fields and trailing optional arguments, so existing callers are unaffected.
+No upgrade argument is passed, so the bridge fee and the minimum bridge amount keep their current values, and the ERC-20 gas limit that v0.5.2 turns into a setting takes its default of 84,000 -- the figure v0.5.1 hard-codes, against a measured transfer cost of about 53,700. The Candid interface only gains record fields and trailing optional arguments, so existing callers are unaffected.
 
 The release is the outcome of a security review of the bridging path.
 
