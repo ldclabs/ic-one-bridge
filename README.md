@@ -11,8 +11,8 @@ to have a token listed.
 
 - Web app: https://1bridge.app/ (`ejwdq-iyaaa-aaaap-an47q-cai`)
 - PANDA bridge canister: `dpjyw-raaaa-aaaar-qbxlq-cai`, controlled by the ICPanda SNS DAO
-- Certified state as JSON (or CBOR with `Accept: application/cbor`):
-  https://dpjyw-raaaa-aaaar-qbxlq-cai.icp0.io/
+- Bridge info as JSON (or CBOR with `Accept: application/cbor`), served over HTTP without response
+  certification: https://dpjyw-raaaa-aaaar-qbxlq-cai.icp0.io/
 
 ## How it works
 
@@ -35,10 +35,22 @@ to `to` when given, otherwise to the caller's own principal or derived address. 
 deduplicated so a retry cannot pay twice. Polling is paced by finality — every 3s for the first
 minute, then backing off to 15s, 60s and 5min while nothing advances.
 
-**Guards.** `bridge` rejects amounts below `min_threshold_to_bridge`, refuses a second unconfirmed
-EVM deposit from the same user on the same chain, and refuses new tasks on a chain that already has
-a task stuck with an error. After too many consecutive failing rounds it stops entirely until
-`admin_restart_bridging` is called.
+**What a round trusts.** Every HTTPS outcall is made by a single replica, and every answer a
+payout depends on — a receipt and its `Transfer` events, a block height, a nonce, a signature
+status, a balance — is asked of two providers and acted on only when they agree. A signed deposit
+or payout is recorded on its task before it is broadcast, and the rounds broadcast it again while
+no provider has seen it; one that can no longer land (its nonce was spent by another transaction,
+or its blockhash expired) is detected and, for a deposit, abandoned, or, for a payout, rebuilt.
+
+**Guards.** `bridge` rejects amounts below `min_threshold_to_bridge` or with more precision than
+the source chain carries, refuses the bridge's own addresses, the token contracts and the anonymous
+principal as destinations, refuses a second unconfirmed EVM deposit from the same user on the same
+chain, and refuses new tasks on a chain whose providers are failing. Before signing for a user's
+derived address it checks that the address can pay for the transaction. A task that fails on its
+own account — a payout refused on chain, a deposit that delivered less than it claimed — is marked
+stuck for an administrator and blocks nothing else. After too many consecutive rounds with
+provider errors, new tasks are paused and the rounds slow to an hourly cooldown; a clean round or
+`admin_restart_bridging` lifts the pause.
 
 Track a task with `my_bridge_log(from_tx)`, `my_pending_logs()` and `my_finalized_logs(take, prev)`.
 
@@ -117,8 +129,10 @@ dfx canister call one_bridge_canister svm_address '(null)' --ic
 dfx canister call one_bridge_canister admin_set_evm_providers '("BNB", 3, vec { "https://bsc-dataseed.bnbchain.org"; "https://bsc.nodereal.io"; "https://bsc-dataseed.nariox.org" })' --ic
 ```
 
-The providers are tried in order, so a list of at least two keeps the bridge working when one is
-down. Only `https` URLs are accepted.
+The reads a payout depends on need two agreeing providers, so at least two are required and
+three keep the bridge working while one is down; only `https` URLs are accepted. `max_confirmations`
+is how many blocks a transaction has to be behind the tip, or `0` to rely on the chain's own
+`finalized` block tag, which is the safer choice on every chain that supports it.
 
 #### 4. Add the EVM contract (e.g. BNB Chain PANDA token):
 ```bash
@@ -132,7 +146,7 @@ itself. **Other EVM chains (Ethereum, Base, Avalanche...) are added the same way
 
 #### 5. Add the Solana side (optional):
 ```bash
-dfx canister call one_bridge_canister admin_set_svm_providers '(vec { "https://api.mainnet-beta.solana.com" })' --ic
+dfx canister call one_bridge_canister admin_set_svm_providers '(vec { "https://api.mainnet-beta.solana.com"; "https://solana-rpc.publicnode.com" })' --ic
 # the SPL mint address; the canister reads its decimals and token program
 dfx canister call one_bridge_canister admin_add_svm_contract '("<SPL mint address>")' --ic
 ```
@@ -169,10 +183,11 @@ function ids are listed in [sns_functions.md](./sns_functions.md). The scripts u
 
 | Method | When |
 | --- | --- |
-| `admin_restart_bridging` | bridging is disabled after too many failing rounds; clears the counter and re-arms the timer |
-| `admin_retry_bridging_task` | a payout transaction demonstrably moved no funds and must be rebuilt |
-| `admin_close_bridging_task` | a task is stuck and is archived as not bridged; settling with the user is manual |
-| `admin_collect_fees` | withdraw collected fees to a principal |
+| `admin_restart_bridging` | bridging is paused after too many failing rounds; clears the counter and re-arms the timer right away instead of waiting for the cooldown |
+| `admin_retry_bridging_task` | a task is stuck: its payout demonstrably moved no funds and must be rebuilt, optionally to another target — a corrected address, or the chain the deposit came from as a refund |
+| `admin_close_bridging_task` | a task cannot be retried and is archived as not bridged; refused while its payout may still land unless forced |
+| `admin_init_public_keys` | a master key could not be fetched at install or upgrade; bridging that needs it is refused until it is there |
+| `admin_collect_fees` | withdraw the fees held on the ICP ledger to a principal |
 | `admin_add_bridges` / `admin_remove_bridges` | manage the canisters allowed to call `evm_sign` |
 
 ## API Reference
@@ -206,8 +221,9 @@ admin_add_evm_contract : (text, nat64, text) -> (Result);
 admin_set_svm_providers : (vec text) -> (Result);
 admin_add_svm_contract : (text) -> (Result);
 admin_restart_bridging : () -> (Result_3);
-admin_retry_bridging_task : (BridgeTx) -> (Result_1);
-admin_close_bridging_task : (BridgeTx) -> (Result_1);
+admin_retry_bridging_task : (BridgeTx, opt BridgeTarget, opt text) -> (Result_1);
+admin_close_bridging_task : (BridgeTx, opt bool) -> (Result_1);
+admin_init_public_keys : () -> (Result_8);
 admin_collect_fees : (principal, nat) -> (Result_2);
 admin_add_bridges : (vec principal) -> (Result);
 admin_remove_bridges : (vec principal) -> (Result);

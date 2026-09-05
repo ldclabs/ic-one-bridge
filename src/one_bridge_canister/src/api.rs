@@ -1,14 +1,14 @@
 use std::str::FromStr;
 
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{Address, Bytes};
+use alloy_primitives::Bytes;
 use candid::Principal;
 use ic_auth_types::ByteBufB64;
 use serde_bytes::ByteBuf;
 
 use crate::{
-    helper::{check_auth, msg_caller, now_ms},
-    store,
+    helper::{check_auth, msg_caller, now_ms, parse_evm_address},
+    store::{self, Funding},
     svm::Pubkey,
 };
 
@@ -67,9 +67,16 @@ fn my_bridge_log(from_tx: store::BridgeTx) -> Result<store::BridgeLog, String> {
     })
 }
 
+/// The oldest pending tasks, at most `PENDING_LOGS_LIMIT` of them.
 #[ic_cdk::query]
 fn pending_logs() -> Result<Vec<store::BridgeLog>, String> {
-    let rt = store::state::with(|s| s.pending.iter().cloned().collect::<Vec<store::BridgeLog>>());
+    let rt = store::state::with(|s| {
+        s.pending
+            .iter()
+            .take(store::PENDING_LOGS_LIMIT)
+            .cloned()
+            .collect::<Vec<store::BridgeLog>>()
+    });
     Ok(rt)
 }
 
@@ -88,39 +95,46 @@ async fn bridge(
     to: Option<String>,
 ) -> Result<store::BridgeTx, String> {
     let caller = msg_caller()?;
-    let now_ms = now_ms();
-    store::state::bridge(from_chain, to_chain, icp_amount, to, caller, now_ms).await
+    store::state::bridge(from_chain, to_chain, icp_amount, to, caller, now_ms()).await
 }
 
 #[ic_cdk::update]
 async fn erc20_transfer_tx(chain: String, to: String, icp_amount: u128) -> Result<String, String> {
-    let to_addr = to
-        .parse::<Address>()
-        .map_err(|err| format!("invalid to address: {}", err))?;
+    let to_addr = parse_evm_address(&to)?;
     let caller = msg_caller()?;
-    let now_ms = now_ms();
-    let (_, signed_tx) =
-        store::state::build_erc20_transfer_tx(&chain, &caller, &to_addr, icp_amount, now_ms)
-            .await?;
+    let _signing = store::acquire_active_bridge_user(caller)?;
+    let (_, signed_tx) = store::state::build_erc20_transfer_tx(
+        &chain,
+        &caller,
+        &to_addr,
+        icp_amount,
+        now_ms(),
+        Funding::Verify,
+    )
+    .await?;
     let data = signed_tx.encoded_2718();
     Ok(Bytes::from(data).to_string())
 }
 
 #[ic_cdk::update]
 async fn erc20_transfer(chain: String, to: String, icp_amount: u128) -> Result<String, String> {
-    let to_addr = to
-        .parse::<Address>()
-        .map_err(|err| format!("invalid to address: {}", err))?;
+    let to_addr = parse_evm_address(&to)?;
     let caller = msg_caller()?;
-    let now_ms = now_ms();
-    let (cli, signed_tx) =
-        store::state::build_erc20_transfer_tx(&chain, &caller, &to_addr, icp_amount, now_ms)
-            .await?;
+    let _signing = store::acquire_active_bridge_user(caller)?;
+    let (cli, signed_tx) = store::state::build_erc20_transfer_tx(
+        &chain,
+        &caller,
+        &to_addr,
+        icp_amount,
+        now_ms(),
+        Funding::Verify,
+    )
+    .await?;
     let tx_hash = signed_tx.hash().to_string();
 
     let data = signed_tx.encoded_2718();
     let _ = cli
-        .send_raw_transaction(now_ms, Bytes::from(data).to_string())
+        .send_raw_transaction(Bytes::from(data).to_string())
         .await?;
 
     Ok(tx_hash)
@@ -128,13 +142,18 @@ async fn erc20_transfer(chain: String, to: String, icp_amount: u128) -> Result<S
 
 #[ic_cdk::update]
 async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<String, String> {
-    let to_addr = to
-        .parse::<Address>()
-        .map_err(|err| format!("invalid to address: {}", err))?;
+    let to_addr = parse_evm_address(&to)?;
     let caller = msg_caller()?;
-    let now_ms = now_ms();
-    let (_, signed_tx) =
-        store::state::build_evm_transfer_tx(&chain, &caller, &to_addr, evm_amount, now_ms).await?;
+    let _signing = store::acquire_active_bridge_user(caller)?;
+    let (_, signed_tx) = store::state::build_evm_transfer_tx(
+        &chain,
+        &caller,
+        &to_addr,
+        evm_amount,
+        now_ms(),
+        Funding::Verify,
+    )
+    .await?;
     let data = signed_tx.encoded_2718();
     Ok(Bytes::from(data).to_string())
 }
@@ -143,9 +162,9 @@ async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<
 async fn spl_transfer_tx(to: String, icp_amount: u128) -> Result<String, String> {
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
-    let now_ms = now_ms();
-    let (_, signed_tx) =
-        store::state::build_spl_transfer_tx(&caller, &to_addr, icp_amount, now_ms).await?;
+    let _signing = store::acquire_active_bridge_user(caller)?;
+    let (_, signed_tx, _) =
+        store::state::build_spl_transfer_tx(&caller, &to_addr, icp_amount, Funding::Verify).await?;
     let data = bincode::serialize(&signed_tx)
         .map_err(|err| format!("failed to serialize signed tx: {}", err))?;
     Ok(ByteBufB64::from(data).to_base64())
@@ -155,9 +174,9 @@ async fn spl_transfer_tx(to: String, icp_amount: u128) -> Result<String, String>
 async fn sol_transfer_tx(to: String, sol_amount: u64) -> Result<String, String> {
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
-    let now_ms = now_ms();
-    let (_, signed_tx) =
-        store::state::build_sol_transfer_tx(&caller, &to_addr, sol_amount, now_ms).await?;
+    let _signing = store::acquire_active_bridge_user(caller)?;
+    let (_, signed_tx, _) =
+        store::state::build_sol_transfer_tx(&caller, &to_addr, sol_amount, Funding::Verify).await?;
     let data = bincode::serialize(&signed_tx)
         .map_err(|err| format!("failed to serialize signed tx: {}", err))?;
     Ok(ByteBufB64::from(data).to_base64())

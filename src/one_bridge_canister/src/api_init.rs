@@ -80,6 +80,7 @@ fn pre_upgrade() {
 fn post_upgrade(args: Option<CanisterArgs>) {
     store::state::load();
     store::state::migrate_user_log_index();
+    store::state::migrate_icp_collected_fees();
 
     match args {
         Some(CanisterArgs::Upgrade(args)) => {
@@ -124,9 +125,8 @@ fn post_upgrade(args: Option<CanisterArgs>) {
         s.finalize_bridging_started_at = 0;
     });
     store::state::init_http_certified_data();
-    ic_cdk_timers::set_timer(
-        Duration::from_secs(0),
-        store::state::try_init_ed25519_public_key(),
-    );
+    ic_cdk_timers::set_timer(Duration::from_secs(0), async {
+        store::state::try_init_public_keys().await;
+    });
     store::state::schedule_finalize(Duration::from_secs(3));
 }

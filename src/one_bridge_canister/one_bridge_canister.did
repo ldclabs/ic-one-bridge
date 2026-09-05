@@ -2,13 +2,22 @@ type BridgeLog = record {
   id : opt nat64;
   to : BridgeTarget;
   fee : nat;
+  // When the payout was first attempted, in ms, or 0. The ledger dedup key
+  // of an ICP payout is built from it, so every attempt shares it.
+  payout_started_at : nat64;
   to_tx : opt BridgeTx;
+  from_meta : opt TxMeta;
   to_addr : opt text;
+  to_meta : opt TxMeta;
   from : BridgeTarget;
   user : principal;
   from_tx : BridgeTx;
   created_at : nat64;
   error : opt text;
+  // The error is the task's own and will not clear by itself: an
+  // administrator has to retry or close the task. It blocks nothing else
+  // meanwhile.
+  stuck : bool;
   icp_amount : nat;
   finalized_at : nat64;
 };
@@ -36,11 +45,12 @@ type InitArgs = record {
 type Result = variant { Ok; Err : text };
 type Result_1 = variant { Ok : BridgeLog; Err : text };
 type Result_2 = variant { Ok : BridgeTx; Err : text };
-type Result_3 = variant { Ok : nat64; Err : text };
-type Result_4 = variant { Ok : text; Err : text };
-type Result_5 = variant { Ok : blob; Err : text };
-type Result_6 = variant { Ok : vec BridgeLog; Err : text };
-type Result_7 = variant { Ok : StateInfo; Err : text };
+type Result_3 = variant { Ok : record { text; text }; Err : text };
+type Result_4 = variant { Ok : nat64; Err : text };
+type Result_5 = variant { Ok : text; Err : text };
+type Result_6 = variant { Ok : blob; Err : text };
+type Result_7 = variant { Ok : vec BridgeLog; Err : text };
+type Result_8 = variant { Ok : StateInfo; Err : text };
 type StateInfo = record {
   total_withdrawn_fees : nat;
   error_rounds : nat64;
@@ -66,7 +76,23 @@ type StateInfo = record {
   token_ledger : principal;
   token_logo : text;
   token_name : text;
+  icp_collected_fees : nat;
   sub_bridges : vec principal;
+};
+// The point past which a transaction can never be included any more.
+type TxDeadline = variant {
+  // EVM: the nonce it spends. Once the sender's nonce has moved past it
+  // without it being mined, another transaction took its place.
+  Nonce : nat64;
+  // Solana: the last block height its blockhash is valid at.
+  BlockHeight : nat64;
+};
+// What a round needs to know about a transaction besides its hash: how to
+// tell that it is dead, and how to broadcast it again while it is not.
+type TxMeta = record {
+  // The signed transaction, kept while it is unconfirmed.
+  raw : opt blob;
+  deadline : TxDeadline;
 };
 type UpgradeArgs = record {
   min_threshold_to_bridge : opt nat;
@@ -86,49 +112,74 @@ service : (opt CanisterArgs) -> {
   // error preserved, unblocking the chains it references.
   // 
   // The task is recorded as not bridged: the amount and the fee are left out of
-  // the totals, and settling with the user is up to the administrator.
-  admin_close_bridging_task : (BridgeTx) -> (Result_1);
+  // the totals, and settling with the user is up to the administrator — prefer
+  // `admin_retry_bridging_task` with a refund target. A task whose payout is
+  // broadcast but not confirmed is refused unless `force` is set.
+  admin_close_bridging_task : (BridgeTx, opt bool) -> (Result_1);
+  // Withdraws collected fees. Only the fees that sit on the ICP ledger — those
+  // of tasks deposited on ICP — can be taken from it; a task deposited on
+  // another chain left its fee there.
   admin_collect_fees : (principal, nat) -> (Result_2);
+  // Fetches whichever of the subnet master keys the canister is still
+  // missing, and returns the bridge's EVM and Solana addresses. Bridging that
+  // needs a missing key is refused until it is there.
+  admin_init_public_keys : () -> (Result_3);
   admin_remove_bridges : (vec principal) -> (Result);
   // Resets the error circuit breaker and re-arms the finalization timer chain.
   // 
-  // Finalization stops scheduling itself once `error_rounds` reaches its limit,
-  // which disables bridging until someone intervenes. Use this once the cause of
-  // the failures has been dealt with.
-  admin_restart_bridging : () -> (Result_3);
-  // Drops the outgoing transaction of a stuck bridging task so the next
-  // finalization round builds and broadcasts a fresh one.
+  // Once `error_rounds` reaches its limit, new tasks are refused and the rounds
+  // slow to an hourly cooldown that lifts the pause by itself after a clean
+  // round. Use this to lift it right away once the cause has been dealt with.
+  admin_restart_bridging : () -> (Result_4);
+  // Drops the outgoing transaction and the error of a stuck bridging task so
+  // the next finalization round pays it out afresh, optionally somewhere else.
+  // 
+  // `to` and `to_addr` replace the task's target: a corrected address, the
+  // user's own address on the same chain (`to_addr = null`), or the chain the
+  // deposit came from — a refund. They are vetted like a `bridge()` call's.
   // 
   // Only use this after verifying on chain that the recorded outgoing
   // transaction moved no funds (an EVM transaction that reverted, or a Solana
   // transaction whose blockhash expired without landing). Retrying a payout that
   // did go through pays the recipient twice.
-  admin_retry_bridging_task : (BridgeTx) -> (Result_1);
+  admin_retry_bridging_task : (BridgeTx, opt BridgeTarget, opt text) -> (
+      Result_1,
+    );
+  // Sets the RPC providers of an EVM chain and when a transaction on it counts
+  // as final: after `max_confirmations` blocks, or, when it is `0`, once the
+  // chain's own `finalized` block tag has passed it. The tag is the safer
+  // choice on every chain that supports it.
   admin_set_evm_providers : (text, nat64, vec text) -> (Result);
   admin_set_svm_providers : (vec text) -> (Result);
   bridge : (text, text, nat, opt text) -> (Result_2);
-  erc20_transfer : (text, text, nat) -> (Result_4);
-  erc20_transfer_tx : (text, text, nat) -> (Result_4);
-  evm_address : (opt principal) -> (Result_4) query;
-  evm_sign : (blob) -> (Result_5);
-  evm_transfer_tx : (text, text, nat) -> (Result_4);
-  finalized_logs : (nat32, opt nat64) -> (Result_6) query;
-  info : () -> (Result_7) query;
+  erc20_transfer : (text, text, nat) -> (Result_5);
+  erc20_transfer_tx : (text, text, nat) -> (Result_5);
+  evm_address : (opt principal) -> (Result_5) query;
+  evm_sign : (blob) -> (Result_6);
+  evm_transfer_tx : (text, text, nat) -> (Result_5);
+  finalized_logs : (nat32, opt nat64) -> (Result_7) query;
+  info : () -> (Result_8) query;
   my_bridge_log : (BridgeTx) -> (Result_1) query;
-  my_finalized_logs : (nat32, opt nat64) -> (Result_6) query;
-  my_pending_logs : () -> (Result_6) query;
-  pending_logs : () -> (Result_6) query;
-  sol_transfer_tx : (text, nat64) -> (Result_4);
-  spl_transfer_tx : (text, nat) -> (Result_4);
-  svm_address : (opt principal) -> (Result_4) query;
-  validate_admin_add_bridges : (vec principal) -> (Result_4);
-  validate_admin_add_evm_contract : (text, nat64, text) -> (Result_4);
-  validate_admin_add_svm_contract : (text) -> (Result_4);
-  validate_admin_close_bridging_task : (BridgeTx) -> (Result_4);
-  validate_admin_collect_fees : (principal, nat) -> (Result_4);
-  validate_admin_remove_bridges : (vec principal) -> (Result_4);
-  validate_admin_restart_bridging : () -> (Result_4);
-  validate_admin_retry_bridging_task : (BridgeTx) -> (Result_4);
-  validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_4);
-  validate_admin_set_svm_providers : (vec text) -> (Result_4);
+  my_finalized_logs : (nat32, opt nat64) -> (Result_7) query;
+  my_pending_logs : () -> (Result_7) query;
+  // The oldest pending tasks, at most `PENDING_LOGS_LIMIT` of them.
+  pending_logs : () -> (Result_7) query;
+  sol_transfer_tx : (text, nat64) -> (Result_5);
+  spl_transfer_tx : (text, nat) -> (Result_5);
+  svm_address : (opt principal) -> (Result_5) query;
+  validate_admin_add_bridges : (vec principal) -> (Result_5);
+  validate_admin_add_evm_contract : (text, nat64, text) -> (Result_5);
+  validate_admin_add_svm_contract : (text) -> (Result_5);
+  validate_admin_close_bridging_task : (BridgeTx, opt bool) -> (Result_5);
+  validate_admin_collect_fees : (principal, nat) -> (Result_5);
+  validate_admin_init_public_keys : () -> (Result_5);
+  validate_admin_remove_bridges : (vec principal) -> (Result_5);
+  validate_admin_restart_bridging : () -> (Result_5);
+  validate_admin_retry_bridging_task : (
+      BridgeTx,
+      opt BridgeTarget,
+      opt text,
+    ) -> (Result_5);
+  validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_5);
+  validate_admin_set_svm_providers : (vec text) -> (Result_5);
 }

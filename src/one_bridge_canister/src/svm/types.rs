@@ -57,6 +57,45 @@ impl SignatureStatus {
     }
 }
 
+/// Where a Solana transaction has got to, as far as the queried providers can
+/// tell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SolTxStatus {
+    /// No provider has the signature in its ledger.
+    Unknown,
+    /// At least one provider has it, but it is not final on both yet.
+    Landed,
+    /// Finalized and successful on every provider asked.
+    Finalized,
+    /// Landed and failed on every provider asked: it moved nothing.
+    Failed(String),
+}
+
+impl SolTxStatus {
+    pub fn from_signature_status(status: Option<SignatureStatus>) -> Self {
+        match status {
+            None => Self::Unknown,
+            Some(status) if status.is_error() => {
+                Self::Failed(status.err.map(|err| err.to_string()).unwrap_or_default())
+            }
+            Some(status) if status.is_finalized() => Self::Finalized,
+            Some(_) => Self::Landed,
+        }
+    }
+
+    /// The verdict two providers support together. Only a status both report
+    /// is acted on; anything they disagree on is treated as a transaction that
+    /// exists but is not final, which only ever delays.
+    pub fn reconcile(a: Self, b: Self) -> Result<Self, String> {
+        Ok(match (a, b) {
+            (Self::Finalized, Self::Finalized) => Self::Finalized,
+            (Self::Failed(err), Self::Failed(_)) => Self::Failed(err),
+            (Self::Unknown, Self::Unknown) => Self::Unknown,
+            _ => Self::Landed,
+        })
+    }
+}
+
 pub fn get_mint_decimals(account: &UiAccount) -> Result<u8, String> {
     let account_type = account
         .data
@@ -100,6 +139,34 @@ mod tests {
         );
         assert!(failed.is_error());
         assert!(!failed.is_finalized());
+    }
+
+    #[test]
+    fn a_verdict_needs_both_providers_behind_it() {
+        use SolTxStatus::*;
+        let failed = || Failed("InstructionError".to_string());
+
+        assert_eq!(
+            SolTxStatus::from_signature_status(Some(status("finalized", None))),
+            Finalized
+        );
+        assert_eq!(
+            SolTxStatus::from_signature_status(Some(status("confirmed", None))),
+            Landed
+        );
+        assert_eq!(
+            SolTxStatus::from_signature_status(Some(status("finalized", Some(json!("x"))))),
+            Failed("\"x\"".to_string())
+        );
+        assert_eq!(SolTxStatus::from_signature_status(None), Unknown);
+
+        assert_eq!(SolTxStatus::reconcile(Finalized, Finalized), Ok(Finalized));
+        assert_eq!(SolTxStatus::reconcile(failed(), failed()), Ok(failed()));
+        assert_eq!(SolTxStatus::reconcile(Unknown, Unknown), Ok(Unknown));
+        assert_eq!(SolTxStatus::reconcile(Finalized, Landed), Ok(Landed));
+        assert_eq!(SolTxStatus::reconcile(Finalized, Unknown), Ok(Landed));
+        assert_eq!(SolTxStatus::reconcile(failed(), Unknown), Ok(Landed));
+        assert_eq!(SolTxStatus::reconcile(Unknown, Landed), Ok(Landed));
     }
 
     #[test]

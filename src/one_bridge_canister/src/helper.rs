@@ -1,3 +1,4 @@
+use alloy_primitives::Address;
 use candid::{
     CandidType, IDLValue, Principal, pretty::candid::value::pp_value, utils::ArgumentEncoder,
 };
@@ -70,6 +71,25 @@ pub fn convert_amount(
     }
 }
 
+/// Parses an EVM address, checking the EIP-55 checksum when the input carries
+/// one. An all-lowercase or all-uppercase address has no checksum to check; a
+/// mixed-case one that fails it is a typo, not an address.
+pub fn parse_evm_address(s: &str) -> Result<Address, String> {
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    let has_lower = hex.bytes().any(|b| b.is_ascii_lowercase());
+    let has_upper = hex.bytes().any(|b| b.is_ascii_uppercase());
+    if has_lower && has_upper {
+        Address::parse_checksummed(s, None)
+            .map_err(|_| format!("invalid EIP-55 checksum in EVM address {s}"))
+    } else {
+        s.parse::<Address>()
+            .map_err(|err| format!("invalid EVM address {s}: {err}"))
+    }
+}
+
 pub fn bridge_amount_after_fee(amount: u128, fee: u128) -> Result<u128, String> {
     amount
         .checked_sub(fee)
@@ -119,6 +139,27 @@ mod tests {
         assert_eq!(bridge_amount_after_fee(100, 1), Ok(99));
         assert!(bridge_amount_after_fee(100, 100).is_err());
         assert!(bridge_amount_after_fee(100, 101).is_err());
+    }
+
+    #[test]
+    fn evm_addresses_are_checksummed_when_they_claim_to_be() {
+        let checksummed = "0xe74583edAFF618D88463554b84Bc675196b36990";
+        let parsed = parse_evm_address(checksummed).unwrap();
+        assert_eq!(parsed.to_checksum(None), checksummed);
+
+        assert_eq!(
+            parse_evm_address(&checksummed.to_lowercase()).unwrap(),
+            parsed
+        );
+        assert_eq!(
+            parse_evm_address(&format!("0x{}", checksummed[2..].to_uppercase())).unwrap(),
+            parsed
+        );
+
+        // one letter flipped: the checksum no longer matches
+        let typo = "0xe74583edAFF618D88463554b84Bc675196b36990".replace("AFF", "Aff");
+        assert!(parse_evm_address(&typo).is_err());
+        assert!(parse_evm_address("0x1234").is_err());
     }
 
     #[test]

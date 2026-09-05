@@ -1,8 +1,6 @@
-use alloy_primitives::{hex, keccak256};
-use candid::Principal;
+use http::Uri;
 use ic_cdk_management_canister::{
-    HttpHeader, HttpMethod, HttpRequestArgs, HttpRequestResult, TransformArgs, TransformContext,
-    TransformFunc, http_request,
+    HttpHeader, HttpMethod, HttpRequestArgs, HttpRequestResult, http_request,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -31,112 +29,153 @@ use crate::{
 pub const SMALL_RESPONSE: u64 = 8 * 1024;
 
 /// Response budget for a JSON-RPC call that returns a document: an EVM
-/// transaction receipt (logs plus a 512-byte bloom filter) or a parsed Solana
-/// account. See [`SMALL_RESPONSE`] for why the budget exists.
+/// transaction receipt (logs plus a 512-byte bloom filter), a block header or
+/// a parsed Solana account. See [`SMALL_RESPONSE`] for why the budget exists.
 pub const LARGE_RESPONSE: u64 = 32 * 1024;
 
-/// How many replicas make an outcall.
-///
-/// A replicated request is made by every replica of the subnet and their
-/// answers have to agree, so the response is as trustworthy as the subnet. A
-/// single-replica request is made by one replica and its answer is used as is:
-/// far cheaper, and exactly as trustworthy as that one replica. Every RPC
-/// method states which it wants, so the choice is visible where the response
-/// is acted on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Replication {
-    Single,
-    // No RPC method asks for it yet; the finality reads are the candidates.
-    #[allow(dead_code)]
-    Replicated,
-}
+/// How much of a provider's answer an error message quotes. Answers are up to
+/// [`LARGE_RESPONSE`] long and the message ends up in the pending queue, the
+/// archive and users' error strings.
+const ERROR_BODY_EXCERPT: usize = 200;
 
+/// # Trust model
+///
+/// Every outcall is made by a single replica (`is_replicated: false`): a
+/// replicated call costs two orders of magnitude more, and would still trust
+/// whichever provider answered it. Instead, an answer that a payout depends on
+/// — a receipt, a block height, a nonce, a signature status, a balance — is
+/// asked of two providers and only acted on when their answers agree, see
+/// [`Agreement`]. One faulty replica or one faulty provider can then delay
+/// the bridge, but cannot make it pay for a deposit that never happened.
+///
+/// A broadcast, a gas price and a recent blockhash are asked of one provider:
+/// the worst a wrong answer does is a transaction that never lands, which the
+/// finalization rounds detect and recover from.
 pub trait HttpOutcall {
-    /// The transform a replicated request is answered through. It has to strip
-    /// whatever differs between replicas, such as dated headers, or the
-    /// replicas' answers never agree.
-    fn transform_context(&self) -> Option<TransformContext>;
     async fn request(&self, args: &HttpRequestArgs) -> Result<HttpRequestResult, String>;
 }
 
-pub struct DefaultHttpOutcall(Principal);
-
-impl DefaultHttpOutcall {
-    pub fn new(canister_id: Principal) -> Self {
-        Self(canister_id)
-    }
-}
+pub struct DefaultHttpOutcall;
 
 impl HttpOutcall for DefaultHttpOutcall {
     async fn request(&self, args: &HttpRequestArgs) -> Result<HttpRequestResult, String> {
         http_request(args).await.map_err(|err| format!("{err}"))
     }
+}
 
-    fn transform_context(&self) -> Option<TransformContext> {
-        Some(TransformContext {
-            function: TransformFunc::new(self.0, "inner_transform_response".to_string()),
-            context: vec![],
-        })
+/// A JSON-RPC request and the response budget reserved for its answer.
+pub struct RpcCall<'a> {
+    pub method: &'a str,
+    pub params: &'a [Value],
+    pub max_response_bytes: u64,
+}
+
+/// How many providers have to answer a call, and how their answers become the
+/// one that is acted on.
+pub enum Agreement<T> {
+    /// The first provider to answer is believed.
+    First,
+    /// Two providers have to answer, and the function turns their two answers
+    /// into one — the same value, the more conservative of the two, or an
+    /// error when they cannot be reconciled.
+    Two(fn(T, T) -> Result<T, String>),
+}
+
+/// Two answers agree only when they are identical.
+pub fn same<T: PartialEq + std::fmt::Debug>(a: T, b: T) -> Result<T, String> {
+    if a == b {
+        Ok(a)
+    } else {
+        Err(format!("the providers disagree: {a:?} and {b:?}"))
     }
 }
 
-/// Sends a JSON-RPC request to the providers in turn, returning the decoded
-/// `result` of the first one that answers.
+/// Two answers are reconciled to the lower one: the fewer confirmations, the
+/// lower balance, the earlier block.
+pub fn lower<T: Ord>(a: T, b: T) -> Result<T, String> {
+    Ok(a.min(b))
+}
+
+/// The decoded result, as it is.
+pub fn as_is<T>(value: T) -> Result<T, String> {
+    Ok(value)
+}
+
+/// Sends a JSON-RPC request to the providers in turn until enough of them have
+/// answered, decoding each `result` with `interpret`, and returns the answer
+/// `agreement` makes of them.
 ///
-/// A transport failure, a non-2xx status and a body that is not a JSON-RPC
-/// response all move on to the next provider. A well-formed JSON-RPC error
-/// does not: it is the chain's answer, not a provider fault, and re-asking
-/// every other provider would just pay for the same answer again.
-pub async fn json_rpc_call<H: HttpOutcall, T: DeserializeOwned>(
+/// A transport failure, a non-2xx status, a body that is not a JSON-RPC
+/// response and a result `interpret` rejects all move on to the next
+/// provider. A well-formed JSON-RPC error does not: it is the chain's answer,
+/// not a provider fault, and re-asking every other provider would just pay
+/// for the same answer again.
+pub async fn json_rpc_call<H: HttpOutcall, R: DeserializeOwned, T>(
     outcall: &H,
     providers: &[String],
-    now_ms: u64,
-    method: &str,
-    params: &[Value],
-    max_response_bytes: u64,
-    replication: Replication,
+    call: RpcCall<'_>,
+    interpret: impl Fn(R) -> Result<T, String>,
+    agreement: Agreement<T>,
 ) -> Result<T, String> {
-    if providers.is_empty() {
-        return Err("no available provider".to_string());
+    let needed = match agreement {
+        Agreement::First => 1,
+        Agreement::Two(_) => 2,
+    };
+    if providers.len() < needed {
+        return Err(format!(
+            "{} provider(s) configured, {needed} must answer",
+            providers.len()
+        ));
     }
 
     let body = serde_json::to_vec(&RPCRequest {
         jsonrpc: "2.0",
-        method,
-        params,
+        method: call.method,
+        params: call.params,
         id: 1,
     })
     .map_err(|err| err.to_string())?;
-    let mut args = request_args(
-        outcall,
-        method,
-        now_ms,
-        body,
-        max_response_bytes,
-        replication,
-    );
+    let mut args = HttpRequestArgs {
+        url: String::new(),
+        max_response_bytes: Some(call.max_response_bytes),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            },
+            HttpHeader {
+                name: "user-agent".to_string(),
+                value: APP_AGENT.to_string(),
+            },
+        ],
+        body: Some(body),
+        transform: None,
+        is_replicated: Some(false),
+    };
 
-    let mut last_err = "No provider succeeded".to_string();
+    let mut answers: Vec<T> = Vec::with_capacity(needed);
+    let mut last_err = "no provider answered".to_string();
     for p in providers {
         args.url = p.clone();
+        let host = provider_host(p);
         let res = match outcall.request(&args).await {
             Ok(res) => res,
             Err(err) => {
-                last_err = format!("failed to request provider: {p}, error: {err}");
+                last_err = format!("provider {host} is unreachable: {err}");
                 continue;
             }
         };
         if res.status < 200u64 || res.status >= 300u64 {
             last_err = format!(
-                "request provider: {}, status: {}, body: {}",
-                p,
+                "provider {host} answered with status {}: {}",
                 res.status,
-                String::from_utf8_lossy(&res.body),
+                excerpt(&res.body)
             );
             continue;
         }
 
-        match serde_json::from_slice::<RPCResponse<T>>(&res.body) {
+        let answer = match serde_json::from_slice::<RPCResponse<R>>(&res.body) {
             Ok(RPCResponse {
                 error: Some(error), ..
             }) => {
@@ -145,84 +184,65 @@ pub async fn json_rpc_call<H: HttpOutcall, T: DeserializeOwned>(
             Ok(RPCResponse {
                 result: Some(result),
                 ..
-            }) => return Ok(result),
-            Ok(RPCResponse { result: None, .. }) => {
-                // `null` is a valid answer for an optional result, such as a
-                // receipt that does not exist yet; for anything else the
-                // provider has not answered the question.
-                if let Ok(result) = serde_json::from_value(Value::Null) {
-                    return Ok(result);
+            }) => interpret(result),
+            // `null` is a valid answer for an optional result, such as a
+            // receipt that does not exist yet; for anything else the provider
+            // has not answered the question.
+            Ok(RPCResponse { result: None, .. }) => serde_json::from_value::<R>(Value::Null)
+                .map_err(|_| "neither a result nor an error".to_string())
+                .and_then(&interpret),
+            Err(err) => Err(format!(
+                "an undecodable body: {err}, body: {}",
+                excerpt(&res.body)
+            )),
+        };
+        match answer {
+            Ok(value) => {
+                answers.push(value);
+                if answers.len() == needed {
+                    break;
                 }
-                last_err = format!("provider {p} answered with neither a result nor an error");
             }
-            Err(err) => {
-                last_err = format!(
-                    "provider {p} answered with an undecodable body: {err}, body: {}",
-                    String::from_utf8_lossy(&res.body),
-                );
-            }
+            Err(err) => last_err = format!("provider {host} answered with {err}"),
         }
     }
 
-    Err(last_err)
-}
-
-fn request_args<H: HttpOutcall>(
-    outcall: &H,
-    method: &str,
-    now_ms: u64,
-    body: Vec<u8>,
-    max_response_bytes: u64,
-    replication: Replication,
-) -> HttpRequestArgs {
-    let mut headers = vec![
-        HttpHeader {
-            name: "content-type".to_string(),
-            value: "application/json".to_string(),
-        },
-        HttpHeader {
-            name: "user-agent".to_string(),
-            value: APP_AGENT.to_string(),
-        },
-    ];
-    let (transform, is_replicated) = match replication {
-        Replication::Single => (None, false),
-        Replication::Replicated => {
-            // Every replica sends its own copy of the request, and the key is
-            // what lets a provider recognise the copies as one request. It has
-            // to differ between requests that differ in any way, so it covers
-            // the whole body rather than just the method name.
-            headers.push(HttpHeader {
-                name: "idempotency-key".to_string(),
-                value: idempotency_key(method, now_ms, &body),
-            });
-            (outcall.transform_context(), true)
+    if answers.len() < needed {
+        return Err(if answers.is_empty() {
+            last_err
+        } else {
+            format!(
+                "only {} of the {needed} answers needed came back; last failure: {last_err}",
+                answers.len()
+            )
+        });
+    }
+    match agreement {
+        Agreement::First => Ok(answers.pop().expect("one answer")),
+        Agreement::Two(reconcile) => {
+            let b = answers.pop().expect("two answers");
+            let a = answers.pop().expect("two answers");
+            reconcile(a, b)
         }
-    };
-
-    HttpRequestArgs {
-        url: String::new(),
-        max_response_bytes: Some(max_response_bytes),
-        method: HttpMethod::POST,
-        headers,
-        body: Some(body),
-        transform,
-        is_replicated: Some(is_replicated),
     }
 }
 
-fn idempotency_key(method: &str, now_ms: u64, body: &[u8]) -> String {
-    format!("{method}-{now_ms}-{}", hex::encode(&keccak256(body)[..8]))
+/// The host of a provider URL: the part that identifies the provider without
+/// the path and query, which may carry an API key.
+fn provider_host(url: &str) -> String {
+    url.parse::<Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(str::to_string))
+        .unwrap_or_else(|| "<invalid url>".to_string())
 }
 
-#[ic_cdk::query(hidden = true)]
-fn inner_transform_response(args: TransformArgs) -> HttpRequestResult {
-    HttpRequestResult {
-        status: args.response.status,
-        body: args.response.body,
-        // Remove headers (which may contain a timestamp) for consensus
-        headers: vec![],
+fn excerpt(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let mut out: String = text.chars().take(ERROR_BODY_EXCERPT).collect();
+    if text.chars().nth(ERROR_BODY_EXCERPT).is_some() {
+        out.push('…');
     }
+    out
 }
 
 #[cfg(test)]
@@ -263,6 +283,17 @@ pub mod tests {
                 .map(|args| args.max_response_bytes)
                 .collect()
         }
+
+        /// The JSON-RPC methods that were called, in order.
+        pub fn methods(&self) -> Vec<String> {
+            self.requests()
+                .into_iter()
+                .map(|args| {
+                    let body: Value = serde_json::from_slice(&args.body.unwrap()).unwrap();
+                    body["method"].as_str().unwrap().to_string()
+                })
+                .collect()
+        }
     }
 
     impl HttpOutcall for MockHttpOutcall {
@@ -274,16 +305,6 @@ pub mod tests {
                 .pop_front()
                 .unwrap_or_else(|| Err("no mock response".to_string()))
         }
-
-        fn transform_context(&self) -> Option<TransformContext> {
-            Some(TransformContext {
-                function: TransformFunc::new(
-                    Principal::anonymous(),
-                    "inner_transform_response".to_string(),
-                ),
-                context: vec![],
-            })
-        }
     }
 
     pub fn success_response(body: serde_json::Value) -> Result<HttpRequestResult, String> {
@@ -294,6 +315,11 @@ pub mod tests {
         })
     }
 
+    /// A successful JSON-RPC response carrying `result`.
+    pub fn result(result: serde_json::Value) -> Result<HttpRequestResult, String> {
+        success_response(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+    }
+
     fn raw_response(body: &str) -> Result<HttpRequestResult, String> {
         Ok(HttpRequestResult {
             status: 200u64.into(),
@@ -302,71 +328,85 @@ pub mod tests {
         })
     }
 
-    fn call<T: DeserializeOwned>(
+    fn providers(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("https://rpc{i}.example/v1/secret-key-{i}"))
+            .collect()
+    }
+
+    fn call<T>(
         mock: &MockHttpOutcall,
-        providers: &[&str],
-        replication: Replication,
-    ) -> Result<T, String> {
-        let providers: Vec<String> = providers.iter().map(|p| p.to_string()).collect();
+        providers: &[String],
+        agreement: Agreement<T>,
+    ) -> Result<T, String>
+    where
+        T: DeserializeOwned,
+    {
         futures::executor::block_on(json_rpc_call(
             mock,
-            &providers,
-            1_000,
-            "eth_blockNumber",
-            &[],
-            SMALL_RESPONSE,
-            replication,
+            providers,
+            RpcCall {
+                method: "eth_blockNumber",
+                params: &[],
+                max_response_bytes: SMALL_RESPONSE,
+            },
+            as_is,
+            agreement,
         ))
     }
 
     /// Every outcall must cap the response it reserves; an uncapped one silently
     /// reserves — and pays for — 2 MB.
     #[test]
-    fn every_request_reserves_a_bounded_response() {
-        let mock = MockHttpOutcall::new(vec![success_response(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": "0x1"
-        }))]);
+    fn every_request_reserves_a_bounded_response_from_a_single_replica() {
+        let mock = MockHttpOutcall::new(vec![result("0x1".into())]);
 
-        let value: String = call(&mock, &["https://rpc"], Replication::Single).unwrap();
+        let value: String = call(&mock, &providers(1), Agreement::First).unwrap();
 
         assert_eq!(value, "0x1");
         assert_eq!(mock.max_response_bytes(), vec![Some(SMALL_RESPONSE)]);
+        let request = mock.requests().remove(0);
+        assert_eq!(request.is_replicated, Some(false));
+        assert!(request.transform.is_none());
     }
 
     #[test]
     fn undecodable_answers_fail_over_to_the_next_provider() {
-        // A proxy's HTML error page, a `null` where a value is required, and a
-        // value of the wrong shape are all answers to a different question.
+        // A proxy's HTML error page, a `null` where a value is required, a
+        // value of the wrong shape and one `interpret` rejects are all
+        // answers to a different question.
         let mock = MockHttpOutcall::new(vec![
             raw_response("<html>502 Bad Gateway</html>"),
-            success_response(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": null})),
-            success_response(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": 42})),
-            success_response(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": "0x2a"})),
+            result(Value::Null),
+            result(42.into()),
+            result("not hex".into()),
+            result("0x2a".into()),
         ]);
 
-        let value: String = call(
+        let value = futures::executor::block_on(json_rpc_call(
             &mock,
-            &["https://a", "https://b", "https://c", "https://d"],
-            Replication::Single,
-        )
+            &providers(5),
+            RpcCall {
+                method: "eth_blockNumber",
+                params: &[],
+                max_response_bytes: SMALL_RESPONSE,
+            },
+            |hex: String| {
+                u64::from_str_radix(hex.trim_start_matches("0x"), 16).map_err(|e| e.to_string())
+            },
+            Agreement::First,
+        ))
         .unwrap();
 
-        assert_eq!(value, "0x2a");
-        assert_eq!(mock.urls().len(), 4);
+        assert_eq!(value, 42);
+        assert_eq!(mock.urls().len(), 5);
     }
 
     #[test]
     fn a_null_result_is_an_answer_when_the_result_is_optional() {
-        let mock = MockHttpOutcall::new(vec![success_response(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": null
-        }))]);
+        let mock = MockHttpOutcall::new(vec![result(Value::Null)]);
 
-        let value: Option<String> =
-            call(&mock, &["https://a", "https://b"], Replication::Single).unwrap();
+        let value: Option<String> = call(&mock, &providers(2), Agreement::First).unwrap();
 
         assert_eq!(value, None);
         assert_eq!(mock.urls().len(), 1);
@@ -380,84 +420,69 @@ pub mod tests {
                 "id": 1,
                 "error": {"code": -32000, "message": "execution reverted"}
             })),
-            success_response(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": "0x1"})),
+            result("0x1".into()),
         ]);
 
-        let err =
-            call::<String>(&mock, &["https://a", "https://b"], Replication::Single).unwrap_err();
+        let err = call::<String>(&mock, &providers(2), Agreement::First).unwrap_err();
 
         assert!(err.contains("execution reverted"));
-        assert_eq!(mock.urls(), vec!["https://a".to_string()]);
+        assert_eq!(mock.urls().len(), 1);
     }
 
     #[test]
-    fn every_provider_failing_reports_the_last_failure() {
+    fn two_providers_have_to_answer_before_an_agreed_value_is_used() {
+        let mock = MockHttpOutcall::new(vec![
+            Err("timeout".to_string()),
+            result("0x10".into()),
+            result("0x10".into()),
+        ]);
+
+        let value: String = call(&mock, &providers(3), Agreement::Two(same)).unwrap();
+
+        assert_eq!(value, "0x10");
+        assert_eq!(mock.urls().len(), 3);
+
+        // one answer is not enough, however good it looks
+        let mock = MockHttpOutcall::new(vec![result("0x10".into()), Err("timeout".to_string())]);
+        let err = call::<String>(&mock, &providers(2), Agreement::Two(same)).unwrap_err();
+        assert!(err.contains("only 1 of the 2"), "{err}");
+
+        // and a single configured provider can never reach agreement
+        let err = call::<String>(&mock, &providers(1), Agreement::Two(same)).unwrap_err();
+        assert!(err.contains("1 provider(s) configured"), "{err}");
+    }
+
+    #[test]
+    fn disagreeing_answers_are_reconciled_or_rejected() {
+        let mock = MockHttpOutcall::new(vec![result(7.into()), result(9.into())]);
+        assert_eq!(
+            call::<u64>(&mock, &providers(2), Agreement::Two(lower)),
+            Ok(7)
+        );
+
+        let mock = MockHttpOutcall::new(vec![result(7.into()), result(9.into())]);
+        let err = call::<u64>(&mock, &providers(2), Agreement::Two(same)).unwrap_err();
+        assert!(err.contains("disagree"), "{err}");
+    }
+
+    #[test]
+    fn errors_name_the_provider_host_only_and_quote_a_short_excerpt() {
+        let long_body = "x".repeat(ERROR_BODY_EXCERPT + 50);
         let mock = MockHttpOutcall::new(vec![
             Err("timeout".to_string()),
             Ok(HttpRequestResult {
                 status: 429u64.into(),
-                body: b"slow down".to_vec(),
+                body: long_body.into_bytes(),
                 headers: vec![],
             }),
         ]);
 
-        let err =
-            call::<String>(&mock, &["https://a", "https://b"], Replication::Single).unwrap_err();
+        let err = call::<String>(&mock, &providers(2), Agreement::First).unwrap_err();
 
-        assert!(err.contains("https://b"));
-        assert!(err.contains("429"));
-        assert!(err.contains("slow down"));
-    }
-
-    #[test]
-    fn single_replica_requests_carry_no_consensus_plumbing() {
-        let mock = MockHttpOutcall::new(vec![success_response(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": "0x1"
-        }))]);
-
-        call::<String>(&mock, &["https://rpc"], Replication::Single).unwrap();
-
-        let request = mock.requests().remove(0);
-        assert_eq!(request.is_replicated, Some(false));
-        assert!(request.transform.is_none());
-        assert!(
-            !request
-                .headers
-                .iter()
-                .any(|header| header.name == "idempotency-key")
-        );
-    }
-
-    #[test]
-    fn replicated_requests_carry_a_transform_and_a_body_specific_idempotency_key() {
-        let mock = MockHttpOutcall::new(vec![success_response(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": "0x1"
-        }))]);
-
-        call::<String>(&mock, &["https://rpc"], Replication::Replicated).unwrap();
-
-        let request = mock.requests().remove(0);
-        assert_eq!(request.is_replicated, Some(true));
-        assert!(request.transform.is_some());
-        let key = request
-            .headers
-            .iter()
-            .find(|header| header.name == "idempotency-key")
-            .map(|header| header.value.clone())
-            .expect("a replicated request names its idempotency key");
-        assert_eq!(
-            key,
-            idempotency_key("eth_blockNumber", 1_000, request.body.as_deref().unwrap())
-        );
-
-        // requests that differ only in their parameters must not share a key
-        assert_ne!(
-            idempotency_key("m", 1, b"[1]"),
-            idempotency_key("m", 1, b"[2]")
-        );
+        assert!(err.contains("rpc1.example"), "{err}");
+        assert!(!err.contains("secret-key"), "{err}");
+        assert!(err.contains("429"), "{err}");
+        assert!(err.len() < ERROR_BODY_EXCERPT + 100, "{err}");
+        assert!(err.ends_with('…'), "{err}");
     }
 }
