@@ -142,8 +142,8 @@
   .dropdown-menu {
     position: fixed;
     z-index: 999;
-    overflow: auto; /* 当菜单内容过多时，内部可以滚动 */
-    max-height: 40vh; /* 限制最大高度，防止超出屏幕 */
+    overflow: auto; /* long menus scroll inside themselves */
+    max-height: 40vh; /* so the menu never runs off the screen */
     transition:
       opacity 0.15s ease-in-out,
       transform 0.15s ease-in-out;
@@ -155,7 +155,7 @@
     transform: scaleY(1) translateY(0);
   }
 
-  /* 7. 向上翻转时的效果 */
+  /* flipped above the trigger when there is no room below */
   .dropdown-menu.flipped {
     transform-origin: bottom;
     transform: scaleY(0.95) translateY(10px);

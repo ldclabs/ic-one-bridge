@@ -32,24 +32,6 @@ export class TokenLedgerAPI {
     return this.#token
   }
 
-  static async fromID(canisterId: Principal): Promise<TokenLedgerAPI> {
-    const token: TokenInfo = {
-      name: 'Internet Computer',
-      symbol: 'ICP',
-      decimals: 8,
-      fee: 10000n,
-      one: 100000000n,
-      logo: '',
-      canisterId: canisterId.toText()
-    }
-
-    const self = new TokenLedgerAPI(token)
-    const info = await self.fetchTokenInfo()
-    self.#token = info
-
-    return self
-  }
-
   async fetchTokenInfo(): Promise<TokenInfo> {
     const metadata = await this.#actor.icrc1_metadata()
 
@@ -58,7 +40,6 @@ export class TokenLedgerAPI {
       symbol: this.token.symbol,
       decimals: this.token.decimals,
       fee: this.token.fee,
-      one: this.token.one,
       logo: this.token.logo,
       canisterId: this.canisterId.toText()
     }
@@ -74,7 +55,6 @@ export class TokenLedgerAPI {
         case 'icrc1:decimals':
           const decimals = (value as { 'Nat': bigint }).Nat
           token.decimals = Number(decimals)
-          token.one = 10n ** decimals
           continue
         case 'icrc1:fee':
           token.fee = (value as { 'Nat': bigint }).Nat
@@ -145,26 +125,6 @@ export class TokenLedgerAPI {
     })
 
     return unwrapResult(res, 'call icrc1_transfer failed')
-  }
-
-  async transfer_from(
-    from: string,
-    to: string,
-    amount: bigint
-  ): Promise<bigint> {
-    const fromPrincipal = Principal.fromText(from)
-    const toPrincipal = Principal.fromText(to)
-    const res = await this.#actor.icrc2_transfer_from({
-      to: { owner: toPrincipal, subaccount: [] },
-      from: { owner: fromPrincipal, subaccount: [] },
-      spender_subaccount: [],
-      amount,
-      fee: [],
-      memo: [],
-      created_at_time: [BigInt(Date.now() * 1_000_000)]
-    })
-
-    return unwrapResult(res, 'call icrc2_transfer_from failed')
   }
 
   async transferICP(to: string, amount: bigint): Promise<bigint> {

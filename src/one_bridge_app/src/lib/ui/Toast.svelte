@@ -16,7 +16,7 @@
     const checkState = () => {
       if (ele.childElementCount > 0) {
         try {
-          // 重新打开以确保位于 Top Layer 顶部
+          // reopen so the toast sits on top of the top layer
           try {
             ele.hidePopover()
           } catch {}
@@ -28,7 +28,6 @@
         } catch {}
       }
     }
-    // 初始检查
     checkState()
 
     const observer = new MutationObserver(checkState)

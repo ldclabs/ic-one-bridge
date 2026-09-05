@@ -1,257 +1,78 @@
-const locale = new Intl.Locale(globalThis?.navigator.language || 'en')
+const locale = new Intl.Locale(globalThis?.navigator?.language || 'en')
 
-export interface Token {
-  symbol: string
+export interface TokenInfo {
   name: string
+  symbol: string
   decimals: number
-}
-
-// vendored from the deprecated @dfinity/utils TokenAmountV2
-export class TokenAmount {
-  private constructor(
-    protected ulps: bigint,
-    public token: Token
-  ) {}
-
-  static fromUlps({
-    amount,
-    token
-  }: {
-    amount: bigint
-    token: Token
-  }): TokenAmount {
-    return new TokenAmount(amount, token)
-  }
-
-  static fromString({
-    amount,
-    token
-  }: {
-    amount: string
-    token: Token
-  }): TokenAmount | FromStringToTokenError {
-    const ulps = convertStringToUlps({ amount, decimals: token.decimals })
-
-    if (typeof ulps === 'bigint') {
-      return new TokenAmount(ulps, token)
-    }
-    return ulps
-  }
-
-  // 1 integer is considered 10^{token.decimals} ulps
-  static fromNumber({
-    amount,
-    token
-  }: {
-    amount: number
-    token: Token
-  }): TokenAmount {
-    const tokenAmount = TokenAmount.fromString({
-      amount: amount.toFixed(token.decimals),
-      token
-    })
-    if (tokenAmount instanceof TokenAmount) {
-      return tokenAmount
-    }
-    if (tokenAmount === FromStringToTokenError.FractionalTooManyDecimals) {
-      throw new Error(
-        `Number ${amount} has more than ${token.decimals} decimals`
-      )
-    }
-
-    // This should never happen
-    throw new Error(`Invalid number ${amount}`)
-  }
-
-  toUlps(): bigint {
-    return this.ulps
-  }
-}
-
-export enum FromStringToTokenError {
-  InvalidFormat,
-  FractionalTooManyDecimals
-}
-
-function convertStringToUlps({
-  amount,
-  decimals
-}: {
-  amount: string
-  decimals: number
-}): bigint | FromStringToTokenError {
-  // Remove all instances of "," and "'".
-  amount = amount.trim().replace(/[,']/g, '')
-
-  // Verify that the string is of the format 1234.5678
-  const regexMatch = amount.match(/\d*(\.\d*)?/)
-  if (!regexMatch || regexMatch[0] !== amount) {
-    return FromStringToTokenError.InvalidFormat
-  }
-
-  const [integral, fractional] = amount.split('.')
-
-  let ulps = 0n
-  const ulpsPerToken = 10n ** BigInt(decimals)
-
-  if (integral) {
-    try {
-      ulps += BigInt(integral) * ulpsPerToken
-    } catch {
-      return FromStringToTokenError.InvalidFormat
-    }
-  }
-
-  if (fractional) {
-    if (fractional.length > decimals) {
-      return FromStringToTokenError.FractionalTooManyDecimals
-    }
-    try {
-      ulps += BigInt(fractional.padEnd(decimals, '0'))
-    } catch {
-      return FromStringToTokenError.InvalidFormat
-    }
-  }
-
-  return ulps
-}
-
-export interface TokenInfo extends Token {
   fee: bigint
-  one: bigint
   logo: string // base64 encoded
   canisterId: string
 }
 
-// export const PANDAToken: TokenInfo = {
-// name: 'ICPanda',
-// symbol: 'PANDA',
-// decimals: 8,
-// fee: 10000n,
-// one: 100000000n,
-// logo: '',
-// canisterId: TOKEN_LEDGER_CANISTER_ID
-// }
-
-export function formatNumber(val: number, maxDigits: number = 4): string {
-  return new Intl.NumberFormat(locale, {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: maxDigits,
-    roundingMode: 'trunc'
-  } as Intl.NumberFormatOptions).format(val)
-}
-
+/**
+ * Formats and parses the amounts of one token.
+ *
+ * Amounts are bigint ulps everywhere else in the app — 10^decimals per whole
+ * token — and this is the only place that turns them into text or back, so
+ * rounding and the viewer's locale are decided once.
+ */
 export class TokenDisplay {
-  readonly billedToSource: boolean
-  readonly token: TokenInfo
-  readonly one: bigint
-  readonly formater: Intl.NumberFormat
+  readonly #decimals: number
+  readonly #one: number
+  readonly #formatter: Intl.NumberFormat
 
-  amount: bigint
-  fee: bigint
-
-  // Initialize from a string. Accepted formats:
-  //   1234567.8901
-  //   1'234'567.8901
-  //   1,234,567.8901
-  //
-  static fromString(
-    token: TokenInfo,
-    amount: string,
-    billedToSource: boolean = true
-  ): TokenDisplay {
-    const val = TokenAmount.fromString({ amount, token }) as TokenAmount
-    return new TokenDisplay(token, val.toUlps(), billedToSource)
-  }
-
-  // Initialize from a number.
-  // 1 integer is considered 10^{token.decimals} ulps
-  static fromNumber(
-    token: TokenInfo,
-    amount: number,
-    billedToSource: boolean = true
-  ): TokenDisplay {
-    const val = TokenAmount.fromNumber({ amount, token }) as TokenAmount
-    return new TokenDisplay(token, val.toUlps(), billedToSource)
-  }
-
-  constructor(
-    token: TokenInfo,
-    amount: bigint,
-    billedToSource: boolean = true
-  ) {
-    this.billedToSource = billedToSource
-    this.token = token
-    this.one = 10n ** BigInt(token.decimals)
-    this.formater = new Intl.NumberFormat(locale, {
+  constructor(decimals: number) {
+    this.#decimals = decimals
+    this.#one = Number(10n ** BigInt(decimals))
+    this.#formatter = new Intl.NumberFormat(locale, {
       minimumFractionDigits: 1,
-      maximumFractionDigits: token.decimals,
+      maximumFractionDigits: decimals,
+      // never round up: a displayed balance must not exceed the real one
       roundingMode: 'floor'
     } as Intl.NumberFormatOptions)
-    this.amount = amount
-    this.fee = token.fee
   }
 
-  get num(): number {
-    return Number(this.amount) / Number(this.one)
+  displayValue(ulps: bigint): string {
+    return this.#formatter.format(Number(ulps) / this.#one)
   }
 
-  set num(amount: number) {
-    const val = TokenAmount.fromNumber({
-      amount,
-      token: this.token
-    }) as TokenAmount
-    this.amount = val.toUlps()
-  }
-
-  get total(): bigint {
-    return this.billedToSource ? this.amount + this.fee : this.amount
-  }
-
-  get received(): bigint {
-    return this.billedToSource ? this.amount : this.amount - this.fee
-  }
-
+  /**
+   * Accepts `1234567.8901`, `1'234'567.8901` and `1,234,567.8901`.
+   *
+   * Throws on anything else rather than returning a number: this converts what
+   * the user typed into the amount that will be signed, so a silent 0 or a
+   * silently truncated value is the one outcome worth avoiding.
+   */
   parseAmount(amount: string | number): bigint {
-    const val =
-      typeof amount === 'string'
-        ? (TokenAmount.fromString({ amount, token: this.token }) as TokenAmount)
-        : (TokenAmount.fromNumber({
-            amount,
-            token: this.token
-          }) as TokenAmount)
-    return val.toUlps()
-  }
+    const str =
+      typeof amount === 'number' ? amount.toFixed(this.#decimals) : amount
+    const clean = str.trim().replace(/[,']/g, '')
+    if (!/^\d*(\.\d*)?$/.test(clean)) {
+      throw new Error(`Invalid amount: ${str}`)
+    }
 
-  fullFormat(value: number | bigint): string {
-    return this.formater.format(value)
-  }
+    const [integral, fractional] = clean.split('.')
+    if (fractional && fractional.length > this.#decimals) {
+      throw new Error(`Amount ${str} has more than ${this.#decimals} decimals`)
+    }
 
-  short(maxDigits: number = 3): string {
-    return formatNumber(this.num, maxDigits)
+    let ulps = integral ? BigInt(integral) * 10n ** BigInt(this.#decimals) : 0n
+    if (fractional) {
+      ulps += BigInt(fractional.padEnd(this.#decimals, '0'))
+    }
+    return ulps
   }
+}
 
-  toString(): string {
-    return this.fullFormat(this.num)
-  }
+// native tokens are keyed by decimals, so the handful of Intl.NumberFormat
+// instances are built once instead of on every render
+const displays = new Map<number, TokenDisplay>()
 
-  display(): string {
-    return this.toString()
+export function tokenDisplay(decimals: number): TokenDisplay {
+  let display = displays.get(decimals)
+  if (!display) {
+    display = new TokenDisplay(decimals)
+    displays.set(decimals, display)
   }
-
-  displayValue(value: bigint): string {
-    return this.fullFormat(Number(value) / Number(this.one))
-  }
-
-  displayFee(): string {
-    return this.displayValue(this.fee)
-  }
-
-  displayTotal(): string {
-    return this.displayValue(this.total)
-  }
-
-  displayReceived(): string {
-    return this.displayValue(this.received)
-  }
+  return display
 }

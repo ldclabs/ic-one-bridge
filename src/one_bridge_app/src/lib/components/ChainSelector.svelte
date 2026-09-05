@@ -1,6 +1,6 @@
 <script lang="ts">
   import ArrowDownSLine from '$lib/icons/arrow-down-s-line.svelte'
-  import type { Chain } from '$lib/types/bridge'
+  import type { Chain } from '$lib/chains'
   import Dropdown from '$lib/ui/Dropdown.svelte'
 
   let {
@@ -30,11 +30,13 @@
 {#snippet trigger()}
   <div class="flex min-w-0 items-center gap-2 text-sm">
     {#if selectedChain}
-      <img
-        src={selectedChain.logo}
-        alt="{selectedChain.fullName} Logo"
-        class="size-6 rounded"
-      />
+      {#if selectedChain.logo}
+        <img
+          src={selectedChain.logo}
+          alt="{selectedChain.fullName} Logo"
+          class="size-6 rounded"
+        />
+      {/if}
       <span class="truncate text-white/90">{selectedChain.fullName}</span>
     {:else}
       <span class="leading-8 text-white/90">Select chain</span>
@@ -65,11 +67,13 @@
             ? 'cursor-not-allowed text-gray-500'
             : 'text-white/80 hover:bg-white/20 hover:text-white'}"
         >
-          <img
-            src={chain.logo}
-            alt="{chain.fullName} Logo"
-            class="size-6 rounded"
-          />
+          {#if chain.logo}
+            <img
+              src={chain.logo}
+              alt="{chain.fullName} Logo"
+              class="size-6 rounded"
+            />
+          {/if}
           <span>{chain.fullName}</span>
         </button>
       </li>

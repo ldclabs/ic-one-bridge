@@ -67,5 +67,3 @@ function removeToast(id: number) {
     toastStore.splice(idx, 1)
   }
 }
-
-// "ICP: failed to transfer token from user, error: InsufficientAllowance { allowance: Nat(2000000000) }"

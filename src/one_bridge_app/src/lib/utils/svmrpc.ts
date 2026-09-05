@@ -6,7 +6,6 @@ import {
   mainnet,
   type Address,
   type Base64EncodedWireTransaction,
-  type Blockhash,
   type Signature
 } from '@solana/kit'
 
@@ -36,11 +35,6 @@ export class SvmRpc {
     this.#rpc = selected
   }
 
-  async getLatestBlockhash(): Promise<Blockhash> {
-    const { value } = await this.#rpc.getLatestBlockhash().send()
-    return value.blockhash
-  }
-
   async getBalance(addr: string): Promise<bigint> {
     try {
       const { value } = await this.#rpc.getBalance(address(addr)).send()
@@ -51,7 +45,7 @@ export class SvmRpc {
     }
   }
 
-  async getAssociatedTokenAddress(addr: string): Promise<Address> {
+  async #associatedTokenAddress(addr: string): Promise<Address> {
     const [pda, _] = await getProgramDerivedAddress({
       programAddress: 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL' as Address,
       seeds: [
@@ -67,7 +61,7 @@ export class SvmRpc {
   }
 
   async getSplBalance(addr: string): Promise<bigint> {
-    const address = await this.getAssociatedTokenAddress(addr)
+    const address = await this.#associatedTokenAddress(addr)
     try {
       const { value } = await this.#rpc.getTokenAccountBalance(address).send()
       return BigInt(value.amount)

@@ -1,19 +1,19 @@
 <script lang="ts">
   import { BridgeCanisterAPI } from '$lib/canisters/bridge.svelte'
   import BridgeCard from '$lib/components/BridgeCard.svelte'
-  import BridgeLogs from '$lib/components/BridgeLogs.svelte'
+  import BridgeLogsPanel from '$lib/components/BridgeLogsPanel.svelte'
   import WalletCard from '$lib/components/WalletCard.svelte'
   import { BRIDGE_CANISTER_ID } from '$lib/constants'
   import ArrowRightUpLine from '$lib/icons/arrow-right-up-line.svelte'
   import GithubFill from '$lib/icons/github-fill.svelte'
   import LogoutCircleRLine from '$lib/icons/logout-circle-r-line.svelte'
-  import RefreshLine from '$lib/icons/refresh-line.svelte'
   import TwitterXLine from '$lib/icons/twitter-x-line.svelte'
   import { authStore } from '$lib/stores/auth.svelte'
   import { toastRun } from '$lib/stores/toast.svelte'
   import { type BridgeLogInfo } from '$lib/types/bridge'
-  import Spinner from '$lib/ui/Spinner.svelte'
   import { onMount, tick } from 'svelte'
+
+  const RECENT_LOGS = 20
 
   const principal = $derived(authStore.identity.getPrincipal().toText())
   const isAuthenticated = $derived(authStore.identity.isAuthenticated)
@@ -29,22 +29,26 @@
     return authStore.signIn()
   }
 
+  // the newest logs across the main bridge and every sub-bridge, since each
+  // canister keeps only its own token's history
+  async function loadLogs(
+    take: (bridge: BridgeCanisterAPI) => Promise<BridgeLogInfo[]>
+  ): Promise<BridgeLogInfo[]> {
+    const bridge = mainBridge!
+    const bridges = [bridge, ...(await bridge.loadSubBridges())]
+    const logs = (await Promise.all(bridges.map(take))).flat()
+    logs.sort((a, b) => b.finalizedAt - a.finalizedAt)
+    return logs.slice(0, RECENT_LOGS)
+  }
+
   function fetchRecentLogs() {
     if (!mainBridge || isLoading) return
 
     isLoading = true
     toastRun(async (_signal) => {
-      if (!mainBridge) return
-
-      const bridges = [mainBridge, ...(await mainBridge.loadSubBridges())]
-
-      const logs = await Promise.all(
-        bridges.map((b) => b.listFinalizedLogs(20))
-      ).then((logs) => logs.flat())
-      // 按时间降序排序
-      logs.sort((a, b) => Number(b.finalizedAt - a.finalizedAt))
-      recentLogs = logs.slice(0, 20)
+      recentLogs = await loadLogs((b) => b.listFinalizedLogs(RECENT_LOGS))
     }).finally(() => {
+      // the button stays busy briefly so a click always reads as an action
       setTimeout(() => {
         isLoading = false
       }, 1000)
@@ -56,16 +60,7 @@
 
     isMyLoading = true
     toastRun(async (_signal) => {
-      if (!mainBridge) return
-
-      const bridges = [mainBridge, ...(await mainBridge.loadSubBridges())]
-
-      const logs = await Promise.all(
-        bridges.map((b) => b.listMyFinalizedLogs(20))
-      ).then((logs) => logs.flat())
-      // 按时间降序排序
-      logs.sort((a, b) => Number(b.finalizedAt - a.finalizedAt))
-      myRecentLogs = logs.slice(0, 20)
+      myRecentLogs = await loadLogs((b) => b.listMyFinalizedLogs(RECENT_LOGS))
     }).finally(() => {
       setTimeout(() => {
         isMyLoading = false
@@ -227,66 +222,22 @@
   </section>
 
   {#if isAuthenticated}
-    <section class="mx-auto w-full max-w-6xl px-6 pt-10 sm:px-10">
-      <div class="rounded-xl border border-white/10 bg-[#0e1119] p-6 sm:p-10">
-        <header
-          class="flex flex-col gap-2 pb-6 text-white sm:flex-row sm:items-end sm:justify-between"
-        >
-          <div>
-            <h2 class="text-2xl font-semibold">My bridge logs</h2>
-          </div>
-          <button
-            class="flex h-10 items-center rounded-xl bg-white/5 px-4 text-xs font-semibold text-white/70 transition hover:bg-white/20 hover:text-white"
-            type="button"
-            onclick={fetchMyRecentLogs}
-            disabled={isLoading || isMyLoading}
-          >
-            {#if isMyLoading}
-              <Spinner class="mr-2 size-5 text-white" />
-            {:else}
-              <span class="mr-2 *:size-5"><RefreshLine /></span>
-            {/if}
-            <span>Refresh logs</span>
-          </button>
-        </header>
-
-        <div
-          class="max-h-[800px] overflow-auto rounded-xl border border-white/5"
-        >
-          <BridgeLogs logs={myRecentLogs} />
-        </div>
-      </div>
-    </section>
+    <BridgeLogsPanel
+      title="My bridge logs"
+      logs={myRecentLogs}
+      isLoading={isMyLoading}
+      disabled={isLoading || isMyLoading}
+      onRefresh={fetchMyRecentLogs}
+    />
   {/if}
 
-  <section class="mx-auto w-full max-w-6xl px-6 pt-10 sm:px-10">
-    <div class="rounded-xl border border-white/10 bg-[#0e1119] p-6 sm:p-10">
-      <header
-        class="flex flex-col gap-2 pb-6 text-white sm:flex-row sm:items-end sm:justify-between"
-      >
-        <div>
-          <h2 class="text-2xl font-semibold">Bridge logs</h2>
-        </div>
-        <button
-          class="flex h-10 items-center rounded-xl bg-white/5 px-4 text-xs font-semibold text-white/70 transition hover:bg-white/20 hover:text-white"
-          type="button"
-          onclick={fetchRecentLogs}
-          disabled={isLoading || isMyLoading}
-        >
-          {#if isLoading}
-            <Spinner class="mr-2 size-5 text-white" />
-          {:else}
-            <span class="mr-2 *:size-5"><RefreshLine /></span>
-          {/if}
-          <span>Refresh logs</span>
-        </button>
-      </header>
-
-      <div class="max-h-[800px] overflow-auto rounded-xl border border-white/5">
-        <BridgeLogs logs={recentLogs} />
-      </div>
-    </div>
-  </section>
+  <BridgeLogsPanel
+    title="Bridge logs"
+    logs={recentLogs}
+    {isLoading}
+    disabled={isLoading || isMyLoading}
+    onRefresh={fetchRecentLogs}
+  />
 
   <footer id="page-footer" class="text-surface-400 px-4 pt-12 pb-24">
     <div class="flex h-16 flex-col items-center">

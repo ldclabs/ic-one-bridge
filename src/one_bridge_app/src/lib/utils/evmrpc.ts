@@ -1,5 +1,10 @@
-import { createRequest, JSON_MIME_TYPE } from './fetcher'
-
+/**
+ * Read-only EVM access over public JSON-RPC endpoints.
+ *
+ * The bridge canister publishes the provider URLs in `info()`; the browser
+ * talks to them directly, so nothing here holds a key or signs anything —
+ * `sendRawTransaction` only broadcasts a transaction the canister signed.
+ */
 export class EvmRpc {
   #providers: string[]
   #endpoint: string
@@ -11,123 +16,88 @@ export class EvmRpc {
     this.#contract = contract
   }
 
+  // settle on the first provider that answers, so a dead endpoint in the list
+  // does not make every later call slow or fail
   async selectProvider() {
-    let selected = await Promise.any(
+    this.#endpoint = await Promise.any(
       this.#providers.map(async (url) => {
-        await jsonRPC<string>(url, 'eth_chainId', [])
+        await jsonRPC<string>(url, 'eth_chainId')
         return url
       })
     )
-    this.#endpoint = selected
   }
 
-  async chainId(): Promise<number> {
-    const rt =
-      (await jsonRPC<string>(this.#endpoint, 'eth_chainId', [])) || '0x0'
-    return parseInt(rt.slice(2), 16)
-  }
-
-  async gasPrice(): Promise<bigint> {
-    const rt =
-      (await jsonRPC<string>(this.#endpoint, 'eth_gasPrice', [])) || '0x0'
-    return BigInt(rt)
-  }
-
-  async maxPriorityFeePerGas(): Promise<bigint> {
-    const rt =
-      (await jsonRPC<string>(this.#endpoint, 'eth_maxPriorityFeePerGas', [])) ||
-      '0x0'
-    return BigInt(rt)
+  async #hex(method: string, params: unknown[] = []): Promise<bigint> {
+    return BigInt((await jsonRPC<string>(this.#endpoint, method, params)) ?? 0)
   }
 
   async gasFeeEstimation(gas: bigint = 54000n): Promise<bigint> {
     const [gasPrice, maxPriorityFeePerGas] = await Promise.all([
-      this.gasPrice(),
-      this.maxPriorityFeePerGas()
+      this.#hex('eth_gasPrice'),
+      this.#hex('eth_maxPriorityFeePerGas')
     ])
     return gas * (gasPrice + maxPriorityFeePerGas)
   }
 
-  async blockNumber(): Promise<number> {
-    const rt =
-      (await jsonRPC<string>(this.#endpoint, 'eth_blockNumber', [])) || '0x0'
-    return parseInt(rt.slice(2), 16)
-  }
-
   async getBalance(address: string): Promise<bigint> {
-    const rt =
-      (await jsonRPC<string>(this.#endpoint, 'eth_getBalance', [
-        address,
-        'latest'
-      ])) || '0x0'
-    return BigInt(rt)
+    return this.#hex('eth_getBalance', [address, 'latest'])
   }
 
   async getErc20Balance(address: string): Promise<bigint> {
+    // balanceOf(address) selector, then the address left-padded to 32 bytes
     const data =
       '0x70a08231000000000000000000000000' +
       address.toLowerCase().replace(/^0x/, '')
-    const rt =
-      (await jsonRPC<string>(this.#endpoint, 'eth_call', [
-        {
-          to: this.#contract,
-          data: data
-        },
-        'latest'
-      ])) || '0x0'
-    return BigInt(rt)
+    return this.#hex('eth_call', [{ to: this.#contract, data }, 'latest'])
   }
 
-  async getTransactionReceipt(txHash: string): Promise<any> {
-    const rt =
-      (await jsonRPC<any>(this.#endpoint, 'eth_getTransactionReceipt', [
-        txHash
-      ])) || null
-    return rt
+  async getTransactionReceipt(
+    txHash: string
+  ): Promise<{ status: string } | null> {
+    return jsonRPC(this.#endpoint, 'eth_getTransactionReceipt', [txHash])
   }
 
   async sendRawTransaction(signedTx: string): Promise<string> {
-    const rt =
+    return (
       (await jsonRPC<string>(this.#endpoint, 'eth_sendRawTransaction', [
         signedTx
-      ])) || '0x'
-    return rt
+      ])) ?? '0x'
+    )
   }
 }
 
-export async function jsonRPC<T>(
+async function jsonRPC<T>(
   url: string,
   method: string,
-  params: unknown[] = [],
-  signal?: AbortSignal | null | undefined
+  params: unknown[] = []
 ): Promise<T | null> {
-  const request = createRequest(url, {
+  const resp = await fetch(url, {
+    method: 'POST',
+    mode: 'cors',
     headers: {
-      'Content-Type': JSON_MIME_TYPE
-    }
+      'Content-Type': 'application/json',
+      Accept: 'application/json'
+    },
+    body: JSON.stringify({ id: 1, jsonrpc: '2.0', method, params })
   })
 
-  const body = {
-    id: 1,
-    jsonrpc: '2.0',
-    method,
-    params
+  if (!resp.ok) {
+    throw new Error(
+      `${method} on ${url} failed: ${resp.status} ${resp.statusText}`
+    )
   }
 
-  const res = await request.post<{
-    jsonrpc: string
+  const res = (await resp.json()) as {
     result?: T
     error?: { code: number; message: string; data?: unknown }
-    id: string | number
-  }>(url, body, signal)
+  }
 
   if (res.error) {
     const { code, message, data } = res.error
-    const error = new Error(
+    throw new Error(
       `JSON-RPC Error ${code}: ${message}${data ? ` - ${JSON.stringify(data)}` : ''}`
     )
-    throw error
   }
 
-  return res.result || null
+  return res.result ?? null
 }

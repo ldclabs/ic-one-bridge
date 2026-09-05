@@ -6,15 +6,12 @@ import {
   type StateInfo,
   type _SERVICE
 } from '$declarations/one_bridge_canister/one_bridge_canister.did.js'
-import {
-  type BridgeLogInfo,
-  type BridgingStatus,
-  type Chain
-} from '$lib/types/bridge'
+import { getChain, type Chain } from '$lib/chains'
+import { type BridgeLogInfo, type BridgingStatus } from '$lib/types/bridge'
 import { unwrapResult } from '$lib/types/result'
 import { EvmRpc } from '$lib/utils/evmrpc'
 import { SvmRpc } from '$lib/utils/svmrpc'
-import { TokenDisplay, type TokenInfo } from '$lib/utils/token'
+import { tokenDisplay, TokenDisplay, type TokenInfo } from '$lib/utils/token'
 import { Principal } from '@icp-sdk/core/principal'
 import { bytesToHex } from '@ldclabs/cose-ts/utils'
 import { getBase58Codec } from '@solana/kit'
@@ -31,6 +28,45 @@ export {
 } from '$declarations/one_bridge_canister/one_bridge_canister.did.js'
 
 const base58 = getBase58Codec()
+
+// the Solana system program, which `svm_token_address` carries when the bridge
+// has no SPL token configured
+const SVM_UNSET = '11111111111111111111111111111111'
+
+// the ICP ledger's own transfer fee, in e8s
+const ICP_TX_FEE = 10_000n
+// the canister needs 5 000 lamports for a Solana transfer and makes the user's
+// derived address the fee payer; the margin keeps a rounded-down "max" from
+// landing exactly on that limit
+const SOL_TX_FEE = 10_000n
+
+// the three addresses one identity has across the chains a bridge reaches
+export type MyAddresses = {
+  icp: string
+  svm: string
+  evm: string
+}
+
+export function addressOn(chain: string, my: MyAddresses): string {
+  if (chain === 'ICP') return my.icp
+  if (chain === 'SOL') return my.svm
+  return my.evm
+}
+
+// what the user holds on one chain, as the bridge sees it
+export type ChainAccount = {
+  chain: string
+  // the user's address on this chain
+  address: string
+  // the bridge's token, in the token's own units
+  tokenBalance: bigint
+  // the chain's native token, in its own units
+  nativeBalance: bigint
+  // what one transfer costs on this chain, in native units. On ICP the ledger
+  // charges its fee in the token itself, so this is the native ICP fee and
+  // only applies to a native ICP transfer
+  nativeFee: bigint
+}
 
 export class BridgeCanisterAPI {
   static #bridges: SvelteMap<string, BridgeCanisterAPI> = new SvelteMap()
@@ -63,7 +99,7 @@ export class BridgeCanisterAPI {
   readonly canisterId: Principal
   #actor: _SERVICE
   #token: TokenInfo | null = null
-  #tokenDisplay: TokenDisplay | null = null
+  #display: TokenDisplay | null = null
   #tokenLedger: TokenLedgerAPI | null = null
   #svmRpc: SvmRpc | null = null
   #evmRPC: Map<string, EvmRpc> = new Map()
@@ -85,56 +121,31 @@ export class BridgeCanisterAPI {
     return this.#token
   }
 
-  get tokenDisplay(): TokenDisplay | null {
-    return this.#tokenDisplay
+  // the smallest amount this bridge accepts, in the token's units
+  get minAmount(): bigint {
+    return this.#state?.min_threshold_to_bridge ?? 0n
   }
 
-  getTokenUrl(chain: string): [string, string] {
-    if (!this.#state) return ['', '']
-    if (chain === 'ICP') {
-      const token = this.#state.token_ledger.toText()
-      return [token, `https://dashboard.internetcomputer.org/canister/${token}`]
-    }
-    if (chain === 'SOL') {
-      const token = this.#state.svm_token_address[0]
-      return [token, `https://solscan.io/token/${token}`]
-    }
-    const contract = this.#state.evm_token_contracts.find(
-      ([name, _]) => name === chain
-    )?.[1][0]
-    if (!contract) return ['', '']
-    switch (chain) {
-      case 'BNB':
-        return [contract, `https://bscscan.com/token/${contract}`]
-      default:
-        return ['', '']
-    }
+  get bridgeFee(): bigint {
+    return this.#state?.token_bridge_fee ?? 0n
   }
 
-  evmToIcpAmount(chain: string, evmBalance: bigint): bigint {
-    if (!this.#state) return evmBalance
-    const evmDecimals = this.#state.evm_token_contracts.find(
-      ([name, _]) => name === chain
-    )?.[1][1]
-    if (!evmDecimals) return evmBalance
-    if (this.#state.token_decimals > evmDecimals) {
-      const diff = this.#state.token_decimals - evmDecimals
-      return evmBalance * 10n ** BigInt(diff)
-    }
-    const diff = evmDecimals - this.#state.token_decimals
-    return evmBalance / 10n ** BigInt(diff)
+  //#region amounts
+
+  parseAmount(amount: string | number): bigint {
+    return this.#display?.parseAmount(amount) ?? 0n
   }
 
-  svmToIcpAmount(svmBalance: bigint): bigint {
-    if (!this.#state) return svmBalance
-    const svmDecimals = this.#state.svm_token_address[1]
-    if (!svmDecimals) return svmBalance
-    if (this.#state.token_decimals > svmDecimals) {
-      const diff = this.#state.token_decimals - svmDecimals
-      return svmBalance * 10n ** BigInt(diff)
-    }
-    const diff = svmDecimals - this.#state.token_decimals
-    return svmBalance / 10n ** BigInt(diff)
+  displayAmount(amount: bigint): string {
+    return this.#display?.displayValue(amount) ?? ''
+  }
+
+  parseNativeAmount(chain: string, amount: string | number): bigint {
+    return tokenDisplay(getChain(chain).nativeDecimals).parseAmount(amount)
+  }
+
+  displayNativeAmount(chain: string, amount: bigint): string {
+    return tokenDisplay(getChain(chain).nativeDecimals).displayValue(amount)
   }
 
   // decimals the token uses on the given chain, or undefined when the chain is
@@ -144,124 +155,70 @@ export class BridgeCanisterAPI {
     if (chain === 'ICP') return this.#state.token_decimals
     if (chain === 'SOL') return this.#state.svm_token_address[1]
     return this.#state.evm_token_contracts.find(
-      ([name, _]) => name === chain
+      ([name]) => name === chain
     )?.[1][1]
   }
 
-  chainToIcpAmount(chain: string, chainAmount: bigint): bigint {
-    if (chain === 'SOL') return this.svmToIcpAmount(chainAmount)
-    if (chain !== 'ICP') return this.evmToIcpAmount(chain, chainAmount)
-    return chainAmount
+  // an amount held on `chain`, expressed in the token's own units
+  toTokenAmount(chain: string, chainAmount: bigint): bigint {
+    const decimals = this.#chainDecimals(chain)
+    if (!this.#state || decimals == undefined) return chainAmount
+    const tokenDecimals = this.#state.token_decimals
+    if (tokenDecimals >= decimals) {
+      return chainAmount * 10n ** BigInt(tokenDecimals - decimals)
+    }
+    return chainAmount / 10n ** BigInt(decimals - tokenDecimals)
   }
 
   // the conversion the canister applies before it signs the transfer
-  icpToChainAmount(chain: string, icpAmount: bigint): bigint {
+  toChainAmount(chain: string, tokenAmount: bigint): bigint {
     const decimals = this.#chainDecimals(chain)
-    if (!this.#state || decimals == undefined) return icpAmount
+    if (!this.#state || decimals == undefined) return tokenAmount
     const tokenDecimals = this.#state.token_decimals
     if (decimals >= tokenDecimals) {
-      return icpAmount * 10n ** BigInt(decimals - tokenDecimals)
+      return tokenAmount * 10n ** BigInt(decimals - tokenDecimals)
     }
-    return icpAmount / 10n ** BigInt(tokenDecimals - decimals)
+    return tokenAmount / 10n ** BigInt(tokenDecimals - decimals)
   }
 
-  // balance the bridge would draw from on the source chain, in that chain's units
-  async sourceChainBalance(fromChain: string): Promise<bigint> {
-    switch (fromChain) {
-      case 'ICP': {
-        const icp = await this.loadICPTokenAPI()
-        return await icp.balance()
-      }
-      case 'SOL': {
-        const svm = await this.loadSvmTokenAPI()
-        if (!svm) throw new Error('SOL is not supported by this bridge')
-        return await svm.getSplBalance(await this.mySvmAddress())
-      }
-      default: {
-        const evm = await this.loadEVMTokenAPI(fromChain)
-        return await evm.getErc20Balance(await this.myEvmAddress())
-      }
-    }
-  }
+  //#endregion
 
-  parseAmount(amount: string | number): bigint {
-    if (!this.#tokenDisplay) return 0n
-    return this.#tokenDisplay.parseAmount(amount)
-  }
-
-  displayAmount(icpBalance: bigint): string {
-    if (!this.#tokenDisplay) return ''
-    return this.#tokenDisplay.displayValue(icpBalance)
-  }
-
-  parseNativeAmount(chain: string, amount: string | number): bigint {
-    let decimals = 8
-    if (chain === 'ICP') {
-      decimals = 8
-    } else if (chain === 'SOL') {
-      decimals = 9
-    } else {
-      decimals = 18
-    }
-
-    const token: TokenInfo = {
-      name: chain,
-      symbol: chain,
-      decimals: decimals,
-      fee: 0n,
-      one: 10n ** BigInt(decimals),
-      logo: '',
-      canisterId: ''
-    }
-    const td = new TokenDisplay(token, 0n)
-    return td.parseAmount(amount)
-  }
-
-  displayNativeAmount(chain: string, balance: bigint): string {
-    let decimals = 8
-    if (chain === 'ICP') {
-      decimals = 8
-    } else if (chain === 'SOL') {
-      decimals = 9
-    } else {
-      decimals = 18
-    }
-
-    const token: TokenInfo = {
-      name: chain,
-      symbol: chain,
-      decimals: decimals,
-      fee: 0n,
-      one: 10n ** BigInt(decimals),
-      logo: '',
-      canisterId: ''
-    }
-    const td = new TokenDisplay(token, balance)
-    return td.displayValue(balance)
-  }
+  //#region state
 
   async loadState(): Promise<StateInfo> {
     if (this.#state == null) {
       const state = await this.refreshState()
-      const token: TokenInfo = {
+      this.#token = {
         name: state.token_name,
         symbol: state.token_symbol,
         decimals: state.token_decimals,
         fee: 0n,
-        one: 10n ** BigInt(state.token_decimals),
         logo: state.token_logo,
         canisterId: state.token_ledger.toText()
       }
-
-      this.#token = token
-      const td = new TokenDisplay(token, state.min_threshold_to_bridge)
-      td.fee = state.token_bridge_fee
-      this.#tokenDisplay = td
+      this.#display = new TokenDisplay(state.token_decimals)
     }
 
     return this.#state as StateInfo
   }
 
+  async refreshState(): Promise<StateInfo> {
+    const state = await this.#actor.info()
+    this.#state = unwrapResult(state, 'call info failed')
+    return this.#state as StateInfo
+  }
+
+  /**
+   * The other bridge canisters this one fronts, one per extra token.
+   *
+   * A sub-bridge keeps its own token, ledger and logs, but not its own keys:
+   * the main bridge derives the user addresses and signs the transfers, which
+   * is why the whole app reads addresses from the main bridge alone.
+   *
+   * Sub-bridge development is paused, so `sub_bridges` is empty in production
+   * and every path below currently runs against the main bridge only. The
+   * support is kept because the canister still publishes the field.
+   */
   async loadSubBridges(): Promise<BridgeCanisterAPI[]> {
     const state = await this.loadState()
     const subBridges = await Promise.all(
@@ -282,23 +239,40 @@ export class BridgeCanisterAPI {
     return subBridges.filter((b) => b !== null)
   }
 
-  async refreshState(): Promise<StateInfo> {
-    const state = await this.#actor.info()
-    this.#state = unwrapResult(state, 'call get_state failed')
-    return this.#state as StateInfo
-  }
-
   async supportChains(): Promise<Chain[]> {
     const state = await this.loadState()
-    const chains = ['ICP']
-    if (state.svm_token_address[0] !== '11111111111111111111111111111111') {
-      chains.push('SOL')
+    const names = ['ICP']
+    if (state.svm_token_address[0] !== SVM_UNSET) {
+      names.push('SOL')
     }
-    return [
-      ...chains,
-      ...state.evm_token_contracts.map(([name, _]) => name)
-    ].map(getChain)
+    names.push(...state.evm_token_contracts.map(([name]) => name))
+    return names.map(getChain)
   }
+
+  // the token's identifier on `chain` and its explorer page, or two empty
+  // strings when the chain carries no token on this bridge
+  tokenOn(chain: string): [string, string] {
+    if (!this.#state) return ['', '']
+
+    let token = ''
+    if (chain === 'ICP') {
+      token = this.#state.token_ledger.toText()
+    } else if (chain === 'SOL') {
+      const addr = this.#state.svm_token_address[0]
+      token = addr === SVM_UNSET ? '' : addr
+    } else {
+      token =
+        this.#state.evm_token_contracts.find(
+          ([name]) => name === chain
+        )?.[1][0] ?? ''
+    }
+
+    return token ? [token, getChain(chain).tokenUrl(token)] : ['', '']
+  }
+
+  //#endregion
+
+  //#region chain clients
 
   async loadICPTokenAPI(): Promise<TokenLedgerAPI> {
     if (this.#tokenLedger == null) {
@@ -306,7 +280,7 @@ export class BridgeCanisterAPI {
 
       this.#tokenLedger = new TokenLedgerAPI(this.#token!)
       try {
-        let info = await this.#tokenLedger.fetchTokenInfo()
+        const info = await this.#tokenLedger.fetchTokenInfo()
         this.#token!.fee = info.fee
       } catch (error) {
         console.error('Failed to load ICP token API:', error)
@@ -321,7 +295,7 @@ export class BridgeCanisterAPI {
       const state = await this.loadState()
       if (
         state.svm_providers.length > 0 &&
-        state.svm_token_address[0] !== '11111111111111111111111111111111'
+        state.svm_token_address[0] !== SVM_UNSET
       ) {
         this.#svmRpc = new SvmRpc(
           state.svm_providers,
@@ -341,13 +315,11 @@ export class BridgeCanisterAPI {
     }
 
     const state = await this.loadState()
-    const contract = state.evm_token_contracts.find(
-      ([name, _]) => name === chain
-    )
+    const contract = state.evm_token_contracts.find(([name]) => name === chain)
     if (!contract) {
       throw new Error(`EVM token contract for chain ${chain} not found`)
     }
-    const provider = state.evm_providers.find(([name, _]) => name === chain)
+    const provider = state.evm_providers.find(([name]) => name === chain)
     if (!provider) {
       throw new Error(`EVM providers for chain ${chain} not found`)
     }
@@ -362,6 +334,10 @@ export class BridgeCanisterAPI {
     return api
   }
 
+  //#endregion
+
+  //#region accounts
+
   async myEvmAddress(): Promise<string> {
     const res = await this.#actor.evm_address([])
     return unwrapResult(res, 'call evm_address failed')
@@ -372,14 +348,112 @@ export class BridgeCanisterAPI {
     return unwrapResult(res, 'call svm_address failed')
   }
 
+  /**
+   * The user's three addresses, as derived by THIS bridge canister.
+   *
+   * Call this on the main bridge only. A canister derives its addresses from
+   * the root key it holds, and each canister's root key is its own, so a
+   * sub-bridge asked directly would answer with addresses nobody deposits to:
+   * by design the main bridge owns the key, publishes the one set of addresses
+   * every token uses, and signs the transfers on a sub-bridge's behalf.
+   *
+   * Pass the result down to {@link myAccountOn} rather than re-deriving per
+   * bridge. See also the note on {@link BridgeCanisterAPI.loadSubBridges}.
+   */
+  async myAddresses(icp: string): Promise<MyAddresses> {
+    const [svm, evm] = await Promise.all([
+      this.mySvmAddress(),
+      this.myEvmAddress()
+    ])
+    return { icp, svm, evm }
+  }
+
+  /**
+   * The user's position on one chain: where they hold the token, how much of it
+   * and of the chain's native coin they have, and what a transfer costs there.
+   *
+   * `my` must come from the main bridge's {@link myAddresses}, for every
+   * bridge: the main canister publishes the one set of addresses, and a
+   * sub-bridge's token is deposited to those same addresses.
+   */
+  async myAccountOn(chain: string, my: MyAddresses): Promise<ChainAccount> {
+    switch (chain) {
+      case 'ICP': {
+        const icp = await this.loadICPTokenAPI()
+        const [tokenBalance, nativeBalance] = await Promise.all([
+          icp.balance(),
+          icp.getICPBalanceOf(Principal.fromText(my.icp))
+        ])
+        return {
+          chain,
+          address: my.icp,
+          tokenBalance,
+          nativeBalance,
+          nativeFee: ICP_TX_FEE
+        }
+      }
+      case 'SOL': {
+        const svm = await this.loadSvmTokenAPI()
+        if (!svm) throw new Error('SOL is not supported by this bridge')
+        const [splBalance, nativeBalance] = await Promise.all([
+          svm.getSplBalance(my.svm),
+          svm.getBalance(my.svm)
+        ])
+        return {
+          chain,
+          address: my.svm,
+          tokenBalance: this.toTokenAmount(chain, splBalance),
+          nativeBalance,
+          nativeFee: SOL_TX_FEE
+        }
+      }
+      default: {
+        const evm = await this.loadEVMTokenAPI(chain)
+        const [erc20Balance, nativeBalance, nativeFee] = await Promise.all([
+          evm.getErc20Balance(my.evm),
+          evm.getBalance(my.evm),
+          evm.gasFeeEstimation()
+        ])
+        return {
+          chain,
+          address: my.evm,
+          tokenBalance: this.toTokenAmount(chain, erc20Balance),
+          nativeBalance,
+          nativeFee
+        }
+      }
+    }
+  }
+
+  // what the bridge itself holds on `chain`, in the token's units — the pool a
+  // transfer out of that chain is paid from
+  async reserveOn(chain: string): Promise<bigint> {
+    switch (chain) {
+      case 'ICP': {
+        const icp = await this.loadICPTokenAPI()
+        return icp.getBalanceOf(this.canisterId)
+      }
+      case 'SOL': {
+        const svm = await this.loadSvmTokenAPI()
+        if (!svm) throw new Error('SOL is not supported by this bridge')
+        const balance = await svm.getSplBalance(this.#state?.svm_address!)
+        return this.toTokenAmount(chain, balance)
+      }
+      default: {
+        const evm = await this.loadEVMTokenAPI(chain)
+        const balance = await evm.getErc20Balance(this.#state?.evm_address!)
+        return this.toTokenAmount(chain, balance)
+      }
+    }
+  }
+
+  //#endregion
+
+  //#region logs
+
   async getMyBridgeLog(fromTx: BridgeTx): Promise<BridgeLog> {
     const res = await this.#actor.my_bridge_log(fromTx)
     return unwrapResult(res, 'call my_bridge_log failed')
-  }
-
-  async listMyPendingLogs(): Promise<BridgeLog[]> {
-    const res = await this.#actor.my_pending_logs()
-    return unwrapResult(res, 'call my_pending_logs failed')
   }
 
   async listMyFinalizedLogs(
@@ -391,11 +465,6 @@ export class BridgeCanisterAPI {
     return logs.map((log) => this.toBridgeLogInfo(log))
   }
 
-  async listPendingLogs(): Promise<BridgeLog[]> {
-    const res = await this.#actor.pending_logs()
-    return unwrapResult(res, 'call pending_logs failed')
-  }
-
   async listFinalizedLogs(
     take: number,
     prev?: bigint
@@ -404,6 +473,40 @@ export class BridgeCanisterAPI {
     const logs = unwrapResult(res, 'call finalized_logs failed')
     return logs.map((log) => this.toBridgeLogInfo(log))
   }
+
+  toBridgeLogInfo(log: BridgeLog): BridgeLogInfo {
+    const from = getChainName(log.from)
+    const to = getChainName(log.to)
+    return {
+      id: log.id[0] || 0n,
+      user: log.user.toText(),
+      token: this.#token?.symbol || '',
+      from,
+      to,
+      amount: this.displayAmount(log.icp_amount),
+      fee: this.displayAmount(log.fee),
+      fromTx: getTx(log.from_tx),
+      fromTxUrl: this.#txUrl(from, log.from_tx)!,
+      toTx: log.to_tx[0] && getTx(log.to_tx[0]),
+      toTxUrl: this.#txUrl(to, log.to_tx[0]),
+      toAddr: log.to_addr[0],
+      createdAt: Number(log.created_at),
+      finalizedAt: Number(log.finalized_at),
+      status: getBridgingStatus(log),
+      error: log.error[0]
+    } as BridgeLogInfo
+  }
+
+  #txUrl(chain: string, tx?: BridgeTx): string | undefined {
+    if (!tx) return undefined
+    const hash = getTx(tx)
+    if (!hash) return undefined
+    return getChain(chain).txUrl(hash, this.tokenOn(chain)[0]) || undefined
+  }
+
+  //#endregion
+
+  //#region transfers
 
   /**
    * Re-reads the source chain balance right before submitting.
@@ -422,9 +525,9 @@ export class BridgeCanisterAPI {
    */
   async #assertSufficientSourceBalance(
     fromChain: string,
-    icpAmount: bigint
+    amount: bigint
   ): Promise<void> {
-    let required = this.icpToChainAmount(fromChain, icpAmount)
+    let required = this.toChainAmount(fromChain, amount)
     if (fromChain === 'ICP') {
       // ICP deposits go through icrc2_transfer_from, so the ledger takes its fee
       // from the user's account on top of the amount
@@ -433,7 +536,7 @@ export class BridgeCanisterAPI {
 
     let balance: bigint
     try {
-      balance = await this.sourceChainBalance(fromChain)
+      balance = await this.#sourceChainBalance(fromChain)
     } catch (err) {
       console.error(`Failed to read ${fromChain} balance before bridging:`, err)
       return
@@ -443,41 +546,70 @@ export class BridgeCanisterAPI {
       const symbol = this.#token?.symbol ?? 'token'
       throw new Error(
         `Insufficient ${symbol} balance on ${fromChain}: ` +
-          `need ${this.displayAmount(icpAmount)}, ` +
-          `have ${this.displayAmount(this.chainToIcpAmount(fromChain, balance))}`
+          `need ${this.displayAmount(amount)}, ` +
+          `have ${this.displayAmount(this.toTokenAmount(fromChain, balance))}`
       )
+    }
+  }
+
+  /**
+   * Balance the bridge would draw from on the source chain, in that chain's
+   * units.
+   *
+   * This asks `this` canister for the address, which is right only while `this`
+   * is the main bridge — the one that holds the key and publishes the addresses.
+   * That holds today because sub-bridge development is paused; when it resumes,
+   * read the address from the main bridge here too, the way
+   * {@link myAccountOn} already does, or this guard will compare an amount
+   * against an address nobody funded.
+   */
+  async #sourceChainBalance(fromChain: string): Promise<bigint> {
+    switch (fromChain) {
+      case 'ICP': {
+        const icp = await this.loadICPTokenAPI()
+        return await icp.balance()
+      }
+      case 'SOL': {
+        const svm = await this.loadSvmTokenAPI()
+        if (!svm) throw new Error('SOL is not supported by this bridge')
+        return await svm.getSplBalance(await this.mySvmAddress())
+      }
+      default: {
+        const evm = await this.loadEVMTokenAPI(fromChain)
+        return await evm.getErc20Balance(await this.myEvmAddress())
+      }
     }
   }
 
   async bridge(
     fromChain: string,
     toChain: string,
-    icpAmount: bigint,
+    amount: bigint,
     toAddr?: string
   ): Promise<BridgingProgress> {
-    await this.#assertSufficientSourceBalance(fromChain, icpAmount)
+    await this.#assertSufficientSourceBalance(fromChain, amount)
 
     const res = await this.#actor.bridge(
       fromChain,
       toChain,
-      icpAmount,
+      amount,
       toAddr ? [toAddr] : []
     )
-    let tx = unwrapResult(res, 'call bridge failed')
+    const tx = unwrapResult(res, 'call bridge failed')
     return BridgingProgress.track(this, tx)
   }
 
-  // return signed erc20 transfer transaction
+  // the transfer transactions below are signed by the canister; the browser
+  // only broadcasts them through the chain's own RPC
   async buildErc20TransferTx(
     chain: string,
     toAddr: string,
-    icpAmount: bigint
+    amount: bigint
   ): Promise<string> {
-    const tx = await this.#actor.erc20_transfer_tx(chain, toAddr, icpAmount)
+    const tx = await this.#actor.erc20_transfer_tx(chain, toAddr, amount)
     return unwrapResult(tx, 'call erc20_transfer_tx failed')
   }
 
-  // return signed evm transfer transaction
   async buildEvmTransferTx(
     chain: string,
     toAddr: string,
@@ -487,38 +619,17 @@ export class BridgeCanisterAPI {
     return unwrapResult(tx, 'call evm_transfer_tx failed')
   }
 
-  // return signed erc20 transfer transaction
-  async buildSplTransferTx(toAddr: string, icpAmount: bigint): Promise<string> {
-    const tx = await this.#actor.spl_transfer_tx(toAddr, icpAmount)
+  async buildSplTransferTx(toAddr: string, amount: bigint): Promise<string> {
+    const tx = await this.#actor.spl_transfer_tx(toAddr, amount)
     return unwrapResult(tx, 'call spl_transfer_tx failed')
   }
 
-  // return signed evm transfer transaction
   async buildSolTransferTx(toAddr: string, solAmount: bigint): Promise<string> {
     const tx = await this.#actor.sol_transfer_tx(toAddr, solAmount)
     return unwrapResult(tx, 'call sol_transfer_tx failed')
   }
 
-  toBridgeLogInfo(log: BridgeLog): BridgeLogInfo {
-    return {
-      id: log.id[0] || 0n,
-      user: log.user.toText(),
-      token: this.#token?.symbol || '',
-      from: getChainName(log.from),
-      to: getChainName(log.to),
-      amount: this.displayAmount(log.icp_amount),
-      fee: this.displayAmount(log.fee),
-      fromTx: getTx(log.from_tx),
-      fromTxUrl: getTxUrl(this.#token?.canisterId!, log.from, log.from_tx)!,
-      toTx: log.to_tx[0] && getTx(log.to_tx[0]),
-      toTxUrl: getTxUrl(this.#token?.canisterId!, log.to, log.to_tx[0]),
-      toAddr: log.to_addr[0],
-      createdAt: Number(log.created_at),
-      finalizedAt: Number(log.finalized_at),
-      status: getBridgingStatus(log),
-      error: log.error[0]
-    } as BridgeLogInfo
-  }
+  //#endregion
 }
 
 export class BridgingProgress {
@@ -683,23 +794,9 @@ export class TransferingProgress {
   }
 
   get txUrl(): string {
-    switch (this.#tx?.chain) {
-      case 'ICP':
-        // can not link to specific transaction on ICP explorer by id
-        return `https://www.icexplorer.io/token/details/${this.#api.token?.canisterId!}`
-      case 'BNB':
-        if ('Evm' in this.#tx) {
-          return `https://bscscan.com/tx/${this.#tx.Evm}`
-        }
-        return ''
-      case 'SOL':
-        if ('Sol' in this.#tx) {
-          return `https://solscan.io/tx/${this.#tx.Sol}`
-        }
-        return ''
-      default:
-        return ''
-    }
+    const chain = this.#tx?.chain
+    if (!chain) return ''
+    return getChain(chain).txUrl(this.tx, this.#api.tokenOn(chain)[0])
   }
 
   get message(): string {
@@ -710,69 +807,6 @@ export class TransferingProgress {
       return ''
     }
     return `waiting for confirmation on ${this.#tx!.chain}`
-  }
-}
-
-function getChain(chain: string): Chain {
-  switch (chain) {
-    case 'ICP':
-      return {
-        id: 0,
-        name: 'ICP',
-        fullName: 'Internet Computer',
-        nativeToken: 'ICP',
-        explorerUrl: 'https://www.icexplorer.io',
-        logo: '/_assets/icp.webp',
-        averageFinalitySeconds: 2
-      }
-    case 'BNB':
-      return {
-        id: 56,
-        name: 'BNB',
-        fullName: 'BNB Chain',
-        nativeToken: 'BNB',
-        explorerUrl: 'https://bscscan.com',
-        logo: '/_assets/bnb.png',
-        averageFinalitySeconds: 11
-      }
-    case 'SOL':
-      return {
-        id: 0,
-        name: 'SOL',
-        fullName: 'Solana',
-        nativeToken: 'SOL',
-        explorerUrl: 'https://solscan.io',
-        logo: '/_assets/sol.webp',
-        averageFinalitySeconds: 11
-      }
-    default:
-      throw new Error(`unsupported chain ${chain}`)
-  }
-}
-
-function getTxUrl(
-  tokenledger: string,
-  target: BridgeTarget,
-  tx?: BridgeTx
-): string | undefined {
-  if (!tx) return undefined
-  switch (getChainName(target)) {
-    case 'ICP': {
-      // can not link to specific transaction on ICP explorer by id
-      return `https://www.icexplorer.io/token/details/${tokenledger}`
-    }
-    case 'BNB': {
-      const hash = getTx(tx)
-      if (!hash) return undefined
-      return `https://bscscan.com/tx/${hash}`
-    }
-    case 'SOL': {
-      const hash = getTx(tx)
-      if (!hash) return undefined
-      return `https://solscan.io/tx/${hash}`
-    }
-    default:
-      return undefined
   }
 }
 
@@ -803,15 +837,15 @@ function getTx(tx: BridgeTx): string {
 
 function getBridgingStatus(log?: BridgeLog | null): BridgingStatus {
   if (!log) {
-    return 'Accepted' as BridgingStatus
+    return 'Accepted'
   }
   if (isFinalized(log.to_tx[0])) {
-    return 'Completed' as BridgingStatus
+    return 'Completed'
   }
   if (log.error.length > 0) {
-    return 'Error' as BridgingStatus
+    return 'Error'
   }
-  return 'Pending' as BridgingStatus
+  return 'Pending'
 }
 
 function isFinalized(tx?: BridgeTx): boolean {

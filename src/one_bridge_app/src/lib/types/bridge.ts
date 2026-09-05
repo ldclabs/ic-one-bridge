@@ -1,15 +1,6 @@
-export type Chain = {
-  id: number // EVM chain ID
-  name: string
-  fullName: string
-  nativeToken: string
-  explorerUrl: string
-  logo: string
-  averageFinalitySeconds: number
-}
-
 export type BridgingStatus = 'Accepted' | 'Pending' | 'Completed' | 'Error'
 
+// one finalized or in-flight bridge transfer, ready to render
 export type BridgeLogInfo = {
   id: bigint
   user: string

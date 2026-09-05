@@ -13,13 +13,20 @@ Users sign in with Internet Identity (`https://id.ai` in production, the local I
 development). The app then reads the bridge canister's state to show the user's derived EVM and
 Solana deposit addresses, submits `bridge` calls, and follows the pending and finalized logs.
 
+A sub-bridge holds its own token, ledger and logs, but not its own keys: the main canister derives
+the deposit addresses and signs the transfers for all of them, so the app reads the user's addresses
+from the main bridge and reuses them for every token. Sub-bridge development is paused, so
+`sub_bridges` is empty in production today and the app effectively runs against the main bridge
+alone.
+
 Chain balances are read in the browser straight from the RPC providers the canister publishes in
 `info()` — the app holds no keys and no backend of its own.
 
 ## Develop
 
-Requires Node >= 22 and pnpm. `dfx deploy` writes the canister ids this app reads into `.env` at the
-repository root, so deploy the canisters first.
+Requires Node >= 22 and pnpm. The bridge and Internet Identity canister ids are compiled in from
+[`src/lib/constants.ts`](src/lib/constants.ts); point them at a local deployment to develop against
+`dfx`.
 
 ```bash
 pnpm install            # from the repository root
