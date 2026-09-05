@@ -10,7 +10,8 @@
   } = $props()
 </script>
 
-<!-- `min` keeps a negative amount from ever reaching the parser -->
+<!-- `min` only marks the field invalid; a negative value still reaches the
+     handler, so the callers' `validateAmount` clamps it before parsing -->
 <input
   type="number"
   name="tokenAmount"

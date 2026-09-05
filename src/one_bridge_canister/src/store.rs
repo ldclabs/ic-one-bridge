@@ -78,6 +78,11 @@ const SOL_EXPIRY_MARGIN_BLOCKS: u64 = 32;
 /// The fee a Solana transaction with one signature pays.
 const SOL_TX_FEE_LAMPORTS: u64 = 5_000;
 
+/// Rent-exempt minimum of a 165-byte SPL token account, which the fee payer
+/// puts up when a transfer has to open the recipient's associated account. A
+/// Token-2022 account with extensions costs more, so this is a floor.
+const SPL_ACCOUNT_RENT_LAMPORTS: u64 = 2_039_280;
+
 /// How many pending tasks the public queue query lists.
 pub const PENDING_LOGS_LIMIT: usize = 100;
 
@@ -177,6 +182,10 @@ pub struct State {
     /// through the ledger without eating into what backs the other chains.
     #[serde(default)]
     pub icp_collected_fees: u128,
+    /// Whether `icp_collected_fees` was recovered from the archive already.
+    /// Kept apart from the counter because a share of zero is a valid result.
+    #[serde(default)]
+    pub icp_collected_fees_migrated: bool,
     #[serde(default)]
     pub total_withdrawn_fees: u128,
     #[serde(default)]
@@ -295,6 +304,7 @@ impl State {
             total_bridged_tokens: 0,
             total_collected_fees: 0,
             icp_collected_fees: 0,
+            icp_collected_fees_migrated: false,
             total_withdrawn_fees: 0,
             sub_bridges: BTreeSet::new(),
             error_rounds: 0,
@@ -1125,6 +1135,19 @@ fn calculate_max_fee_per_gas(
         .ok_or_else(|| "max_fee_per_gas overflow".to_string())
 }
 
+/// The smallest amount, in ledger units, a chain carrying `chain_decimals` can
+/// represent exactly, or `None` when the chain is at least as precise as the
+/// ledger and `convert_amount` never has anything to drop.
+fn chain_precision_unit(token_decimals: u8, chain_decimals: u8) -> Result<Option<u128>, String> {
+    if chain_decimals >= token_decimals {
+        return Ok(None);
+    }
+    10u128
+        .checked_pow((token_decimals - chain_decimals) as u32)
+        .map(Some)
+        .ok_or_else(|| "exponent too large".to_string())
+}
+
 /// A deposit is made in the source chain's decimals but credited in the
 /// ledger's. When the chain carries fewer decimals, an amount with more
 /// precision than that would be floored on chain and credited in full.
@@ -1133,18 +1156,28 @@ fn check_source_precision(
     token_decimals: u8,
     chain_decimals: u8,
 ) -> Result<(), String> {
-    if chain_decimals >= token_decimals {
-        return Ok(());
-    }
-    let unit = 10u128
-        .checked_pow((token_decimals - chain_decimals) as u32)
-        .ok_or_else(|| "exponent too large".to_string())?;
-    if icp_amount.is_multiple_of(unit) {
-        Ok(())
-    } else {
-        Err(format!(
+    match chain_precision_unit(token_decimals, chain_decimals)? {
+        Some(unit) if !icp_amount.is_multiple_of(unit) => Err(format!(
             "amount {icp_amount} has more precision than the source chain carries; use a multiple of {unit}"
-        ))
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The payout is converted into the destination chain's decimals, and that
+/// conversion floors. A remainder the destination cannot represent would be
+/// kept by the bridge rather than reaching the user, so the amount after the
+/// fee has to land on the chain's grid.
+fn check_payout_precision(
+    payout_amount: u128,
+    token_decimals: u8,
+    chain_decimals: u8,
+) -> Result<(), String> {
+    match chain_precision_unit(token_decimals, chain_decimals)? {
+        Some(unit) if !payout_amount.is_multiple_of(unit) => Err(format!(
+            "amount {payout_amount} after the fee has more precision than the destination chain carries; the amount left after the fee must be a multiple of {unit}"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1350,13 +1383,21 @@ pub mod state {
 
     /// Fills in `icp_collected_fees` from the archive on the first upgrade
     /// that has the counter.
+    ///
+    /// The flag, not the counter, records that this ran: a share of zero is a
+    /// legitimate answer — fees may have been introduced after the ICP-side
+    /// tasks completed — and without the flag every later upgrade would read
+    /// the whole archive again, which grows without bound.
     pub fn migrate_icp_collected_fees() -> u128 {
-        let needed = STATE.with_borrow(|s| s.icp_collected_fees == 0 && s.total_collected_fees > 0);
+        let needed = STATE.with_borrow(|s| !s.icp_collected_fees_migrated);
         if !needed {
             return 0;
         }
         let fees = BRIDGE_LOGS.with_borrow(|logs| icp_fee_share(logs.iter()));
-        STATE.with_borrow_mut(|s| s.icp_collected_fees = fees);
+        STATE.with_borrow_mut(|s| {
+            s.icp_collected_fees = fees;
+            s.icp_collected_fees_migrated = true;
+        });
         fees
     }
 
@@ -1583,7 +1624,7 @@ pub mod state {
                 icp_amount, s.min_threshold_to_bridge
             ));
         }
-        bridge_amount_after_fee(icp_amount, s.token_bridge_fee)?;
+        let payout_amount = bridge_amount_after_fee(icp_amount, s.token_bridge_fee)?;
 
         let from = parse_target(s, from_chain).map_err(|err| format!("from_chain: {err}"))?;
         let to = parse_target(s, to_chain).map_err(|err| format!("to_chain: {err}"))?;
@@ -1591,6 +1632,9 @@ pub mod state {
         check_keys_for(s, &to)?;
         if let Some(decimals) = chain_decimals(s, &from) {
             check_source_precision(icp_amount, s.token_decimals, decimals)?;
+        }
+        if let Some(decimals) = chain_decimals(s, &to) {
+            check_payout_precision(payout_amount, s.token_decimals, decimals)?;
         }
         let to_addr = validate_destination(s, &to, to_addr)?;
 
@@ -2070,6 +2114,32 @@ pub mod state {
         })
     }
 
+    /// The target and canonical address a retry would redirect a task to, or
+    /// `None` when it leaves the target alone.
+    ///
+    /// Vetted the way a `bridge()` call's destination is: the chain has to be
+    /// one the bridge serves, its master key has to be there, and the address
+    /// has to be one a payout may go to. `admin_retry_bridging_task` and its
+    /// validate twin both go through here so a proposal cannot pass validation
+    /// and then fail when it executes.
+    pub fn plan_retry_redirect(
+        s: &State,
+        task: &BridgeLog,
+        to: Option<&BridgeTarget>,
+        to_addr: Option<&str>,
+    ) -> Result<Option<(BridgeTarget, Option<String>)>, String> {
+        if to.is_none() && to_addr.is_none() {
+            return Ok(None);
+        }
+        let target = match to {
+            Some(target) => parse_target(s, target.name())?,
+            None => task.to.clone(),
+        };
+        check_keys_for(s, &target)?;
+        let to_addr = validate_destination(s, &target, to_addr)?;
+        Ok(Some((target, to_addr)))
+    }
+
     /// Clears the outgoing transaction and the error of a task so that the
     /// next finalization round pays it out afresh, optionally to a different
     /// target: a corrected address, the user's own address on the same chain
@@ -2087,21 +2157,12 @@ pub mod state {
         let stale_running = ensure_finalize_bridging_idle()?;
 
         let redirect = STATE.with_borrow(|s| {
-            if to.is_none() && to_addr.is_none() {
-                return Ok(None);
-            }
             let task = s
                 .pending
                 .iter()
                 .find(|t| t.from_tx == *from_tx)
                 .ok_or_else(|| "no pending bridging task matches the given from_tx".to_string())?;
-            let target = match to {
-                Some(target) => parse_target(s, target.name())?,
-                None => task.to.clone(),
-            };
-            check_keys_for(s, &target)?;
-            let to_addr = validate_destination(s, &target, to_addr.as_deref())?;
-            Ok::<_, String>(Some((target, to_addr)))
+            plan_retry_redirect(s, task, to.as_ref(), to_addr.as_deref())
         })?;
 
         let log = STATE.with_borrow_mut(|s| {
@@ -3146,7 +3207,7 @@ pub mod state {
         icp_amount: u128,
         funding: Funding,
     ) -> Result<SignedSvmTx, String> {
-        let (from_addr, from_ata, amount, ixs) = STATE.with_borrow(|s| {
+        let (from_addr, from_ata, to_ata, amount, ixs) = STATE.with_borrow(|s| {
             let (mint_pubkey, decimals, token_program_id) = s.svm_token_address;
 
             let amount = convert_amount(icp_amount, s.token_decimals, decimals)?;
@@ -3183,14 +3244,20 @@ pub mod state {
                 decimals,
             );
 
-            Ok::<_, String>((from_addr, from_ata, amount, vec![ix0, ix]))
+            Ok::<_, String>((from_addr, from_ata, to_ata, amount, vec![ix0, ix]))
         })?;
 
         let client = svm_client();
         if funding == Funding::Verify {
-            let (lamports, tokens) = futures::future::try_join(
+            let (lamports, tokens, to_ata_exists) = futures::future::try_join3(
                 client.get_balance(&from_addr.to_string()),
                 client.get_token_account_balance(&from_ata.to_string()),
+                async {
+                    client
+                        .get_account_info(&to_ata.to_string())
+                        .await
+                        .map(|account| account.is_some())
+                },
             )
             .await
             .map_err(|err| format!("failed to read the balances of {from_addr}: {err}"))?;
@@ -3199,9 +3266,21 @@ pub mod state {
                     "address {from_addr} holds {tokens} token units, and the transfer needs {amount}"
                 ));
             }
-            if lamports < SOL_TX_FEE_LAMPORTS {
+            // the first instruction opens the recipient's token account when it
+            // is missing, and the fee payer is the one who funds its rent
+            let needed = if to_ata_exists {
+                SOL_TX_FEE_LAMPORTS
+            } else {
+                SOL_TX_FEE_LAMPORTS.saturating_add(SPL_ACCOUNT_RENT_LAMPORTS)
+            };
+            if lamports < needed {
                 return Err(format!(
-                    "address {from_addr} holds {lamports} lamports, and the transaction fee needs {SOL_TX_FEE_LAMPORTS}"
+                    "address {from_addr} holds {lamports} lamports, and the transaction needs {needed} for its fee{}",
+                    if to_ata_exists {
+                        ""
+                    } else {
+                        " and the recipient's new token account"
+                    }
                 ));
             }
         }
@@ -3627,6 +3706,28 @@ mod tests {
         assert!(check_source_precision(123_456_789, 8, 6).is_err());
         assert!(check_source_precision(100_000_000, 8, 0).is_ok());
         assert!(check_source_precision(100_000_001, 8, 0).is_err());
+    }
+
+    #[test]
+    fn a_payout_must_be_exact_in_the_destination_chains_decimals() {
+        // a destination at least as precise as the ledger loses nothing
+        assert!(check_payout_precision(123_456_789, 8, 18).is_ok());
+        assert!(check_payout_precision(123_456_789, 8, 8).is_ok());
+
+        // a coarser one floors, and the remainder would stay with the bridge
+        assert!(check_payout_precision(123_456_700, 8, 6).is_ok());
+        assert!(check_payout_precision(123_456_789, 8, 6).is_err());
+
+        // the amount checked is the one after the fee, not the one deposited
+        let fee = 1u128;
+        assert!(
+            check_payout_precision(bridge_amount_after_fee(123_456_700, fee).unwrap(), 8, 6)
+                .is_err()
+        );
+        assert!(
+            check_payout_precision(bridge_amount_after_fee(123_456_701, fee).unwrap(), 8, 6)
+                .is_ok()
+        );
     }
 
     #[test]

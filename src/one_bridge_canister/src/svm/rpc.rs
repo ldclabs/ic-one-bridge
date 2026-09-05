@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use super::types::*;
 use crate::outcall::{
     Agreement, HttpOutcall, LARGE_RESPONSE, RpcCall, SMALL_RESPONSE, as_is, json_rpc_call, lower,
-    same,
+    same, two_provider_verdict,
 };
 
 /// Commitment a blockhash is fetched and a transaction is sent at, and that
@@ -84,7 +84,8 @@ impl<H: HttpOutcall> SvmClient<H> {
     ///
     /// Both facts are read from the same provider, one provider at a time —
     /// a provider whose finalized height is past the deadline has the
-    /// transaction if it landed — and two providers have to reach the verdict.
+    /// transaction if it landed — and two providers have to reach the verdict,
+    /// see [`two_provider_verdict`].
     pub async fn expired(
         &self,
         signature: &str,
@@ -92,67 +93,46 @@ impl<H: HttpOutcall> SvmClient<H> {
         margin: u64,
     ) -> Result<bool, String> {
         let deadline = last_valid_block_height.saturating_add(margin);
-        let mut verdicts: Vec<bool> = Vec::with_capacity(2);
-        let mut last_err = "no provider answered".to_string();
-        for provider in &self.providers {
-            let one = std::slice::from_ref(provider);
-            let verdict = async {
-                let height: u64 = json_rpc_call(
-                    &self.outcall,
-                    one,
-                    RpcCall {
-                        method: "getBlockHeight",
-                        params: &[json!({ "commitment": FINALIZED })],
-                        max_response_bytes: SMALL_RESPONSE,
-                    },
-                    as_is,
-                    Agreement::First,
-                )
-                .await?;
-                if height <= deadline {
-                    return Ok::<bool, String>(false);
-                }
-                let status = json_rpc_call(
-                    &self.outcall,
-                    one,
-                    RpcCall {
-                        method: "getSignatureStatuses",
-                        params: &[
-                            Value::Array(vec![signature.into()]),
-                            json!({ "searchTransactionHistory": true }),
-                        ],
-                        max_response_bytes: SMALL_RESPONSE,
-                    },
-                    |res: RpcContextValue<Vec<Option<SignatureStatus>>>| {
-                        res.value
-                            .into_iter()
-                            .next()
-                            .map(SolTxStatus::from_signature_status)
-                            .ok_or_else(|| "missing signature status".to_string())
-                    },
-                    Agreement::First,
-                )
-                .await?;
-                Ok(status == SolTxStatus::Unknown)
+        two_provider_verdict(&self.providers, "expiry check", |one| async move {
+            let height: u64 = json_rpc_call(
+                &self.outcall,
+                one,
+                RpcCall {
+                    method: "getBlockHeight",
+                    params: &[json!({ "commitment": FINALIZED })],
+                    max_response_bytes: SMALL_RESPONSE,
+                },
+                as_is,
+                Agreement::First,
+            )
+            .await?;
+            if height <= deadline {
+                return Ok(false);
             }
-            .await;
-            match verdict {
-                Ok(verdict) => {
-                    verdicts.push(verdict);
-                    if verdicts.len() == 2 {
-                        break;
-                    }
-                }
-                Err(err) => last_err = err,
-            }
-        }
-        match verdicts.as_slice() {
-            [a, b] => Ok(*a && *b),
-            _ => Err(format!(
-                "only {} provider(s) answered the expiry check; last failure: {last_err}",
-                verdicts.len()
-            )),
-        }
+            let status = json_rpc_call(
+                &self.outcall,
+                one,
+                RpcCall {
+                    method: "getSignatureStatuses",
+                    params: &[
+                        Value::Array(vec![signature.into()]),
+                        json!({ "searchTransactionHistory": true }),
+                    ],
+                    max_response_bytes: SMALL_RESPONSE,
+                },
+                |res: RpcContextValue<Vec<Option<SignatureStatus>>>| {
+                    res.value
+                        .into_iter()
+                        .next()
+                        .map(SolTxStatus::from_signature_status)
+                        .ok_or_else(|| "missing signature status".to_string())
+                },
+                Agreement::First,
+            )
+            .await?;
+            Ok(status == SolTxStatus::Unknown)
+        })
+        .await
     }
 
     /// The lamports `pubkey` holds, the lower of two providers' views.

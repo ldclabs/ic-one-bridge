@@ -107,10 +107,7 @@
     return toastRun(async (_signal) => {
       if (!selectedBridge || !selectedBridge.state) return
 
-      bridgeError =
-        selectedBridge.state.error_rounds >= 42n
-          ? 'the bridge is temporarily disabled due to errors, please contact the administrator'
-          : null
+      bridgeError = selectedBridge.pausedReason
 
       selectedToken = selectedBridge.token!
       supportChains = await selectedBridge.supportChains()

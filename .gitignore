@@ -12,6 +12,8 @@
 
 # generated files
 # src/declarations
+# the asset canister's own interface: dfx generates it, nothing imports it
+src/declarations/one_bridge_app/
 
 # rust
 target/

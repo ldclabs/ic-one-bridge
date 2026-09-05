@@ -35,9 +35,18 @@ const SVM_UNSET = '11111111111111111111111111111111'
 
 // the ICP ledger's own transfer fee, in e8s
 const ICP_TX_FEE = 10_000n
+// `MAX_ERROR_ROUNDS` in the canister: the consecutive failing rounds after
+// which it refuses new tasks. It is not published in `info()`, so it is
+// repeated here and has to be kept in step with the canister
+const MAX_ERROR_ROUNDS = 42n
 // the canister needs 5 000 lamports for a Solana transfer and makes the user's
 // derived address the fee payer; the margin keeps a rounded-down "max" from
-// landing exactly on that limit
+// landing exactly on that limit.
+//
+// A transfer to an address that has never held the token also opens its token
+// account, and the fee payer puts up ~0.00204 SOL of rent for it. That is not
+// added here: a bridge deposit always goes to the bridge's existing account,
+// and the canister refuses the wallet case with a message that says so
 const SOL_TX_FEE = 10_000n
 
 // the three addresses one identity has across the chains a bridge reaches
@@ -128,6 +137,19 @@ export class BridgeCanisterAPI {
 
   get bridgeFee(): bigint {
     return this.#state?.token_bridge_fee ?? 0n
+  }
+
+  /**
+   * Why the bridge is refusing new tasks, or null.
+   *
+   * The pause is the canister's circuit breaker. It is not a dead end: the
+   * rounds keep going on an hourly cooldown and a clean one lifts it, so the
+   * message says to retry rather than to find an administrator.
+   */
+  get pausedReason(): string | null {
+    return (this.#state?.error_rounds ?? 0n) >= MAX_ERROR_ROUNDS
+      ? 'the bridge is paused after repeated errors and retries by itself, please try again later'
+      : null
   }
 
   //#region amounts
@@ -297,12 +319,16 @@ export class BridgeCanisterAPI {
         state.svm_providers.length > 0 &&
         state.svm_token_address[0] !== SVM_UNSET
       ) {
-        this.#svmRpc = new SvmRpc(
+        // cache only once a provider answered: an unawaited selection leaves
+        // the client on providers[0] and turns a total outage into an
+        // unhandled rejection
+        const rpc = new SvmRpc(
           state.svm_providers,
           state.svm_token_address[0],
           state.svm_token_address[2]
         )
-        this.#svmRpc.selectProvider()
+        await rpc.selectProvider()
+        this.#svmRpc = rpc
       }
     }
 
@@ -329,8 +355,10 @@ export class BridgeCanisterAPI {
     }
 
     const api = new EvmRpc(providerUrls, contract[1][0])
-    this.#evmRPC.set(chain, api)
+    // same as above: a client whose provider selection threw must not be
+    // cached, or every later call silently uses providers[0]
     await api.selectProvider()
+    this.#evmRPC.set(chain, api)
     return api
   }
 
@@ -408,11 +436,14 @@ export class BridgeCanisterAPI {
         }
       }
       default: {
+        const state = await this.loadState()
         const evm = await this.loadEVMTokenAPI(chain)
         const [erc20Balance, nativeBalance, nativeFee] = await Promise.all([
           evm.getErc20Balance(my.evm),
           evm.getBalance(my.evm),
-          evm.gasFeeEstimation()
+          // the gas limit the canister will sign with, so the form and the
+          // canister agree on what the address has to hold
+          evm.gasFeeEstimation(state.erc20_gas_limit)
         ])
         return {
           chain,
@@ -428,6 +459,7 @@ export class BridgeCanisterAPI {
   // what the bridge itself holds on `chain`, in the token's units — the pool a
   // transfer out of that chain is paid from
   async reserveOn(chain: string): Promise<bigint> {
+    const state = await this.loadState()
     switch (chain) {
       case 'ICP': {
         const icp = await this.loadICPTokenAPI()
@@ -436,12 +468,12 @@ export class BridgeCanisterAPI {
       case 'SOL': {
         const svm = await this.loadSvmTokenAPI()
         if (!svm) throw new Error('SOL is not supported by this bridge')
-        const balance = await svm.getSplBalance(this.#state?.svm_address!)
+        const balance = await svm.getSplBalance(state.svm_address)
         return this.toTokenAmount(chain, balance)
       }
       default: {
         const evm = await this.loadEVMTokenAPI(chain)
-        const balance = await evm.getErc20Balance(this.#state?.evm_address!)
+        const balance = await evm.getErc20Balance(state.evm_address)
         return this.toTokenAmount(chain, balance)
       }
     }
@@ -743,6 +775,11 @@ export class TransferingProgress {
         const status = sol ? await sol.getTransactionStatus(this.#tx.Sol) : ''
         if (status === 'finalized') {
           this.#tx.isFinalized = true
+          return
+        }
+        if (status === 'failed') {
+          // it landed and failed, so it moved nothing and will never finalize
+          this.#error = `transaction failed on ${this.#tx.chain}`
           return
         }
 

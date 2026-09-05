@@ -3,6 +3,7 @@ export const idlFactory = ({ IDL }) => {
     'min_threshold_to_bridge' : IDL.Opt(IDL.Nat),
     'token_symbol' : IDL.Opt(IDL.Text),
     'governance_canister' : IDL.Opt(IDL.Principal),
+    'erc20_gas_limit' : IDL.Opt(IDL.Nat64),
     'token_bridge_fee' : IDL.Opt(IDL.Nat),
     'token_ledger' : IDL.Opt(IDL.Principal),
     'token_logo' : IDL.Opt(IDL.Text),
@@ -12,6 +13,7 @@ export const idlFactory = ({ IDL }) => {
     'min_threshold_to_bridge' : IDL.Nat,
     'token_symbol' : IDL.Text,
     'governance_canister' : IDL.Opt(IDL.Principal),
+    'erc20_gas_limit' : IDL.Opt(IDL.Nat64),
     'token_bridge_fee' : IDL.Nat,
     'key_name' : IDL.Text,
     'token_decimals' : IDL.Nat8,
@@ -34,26 +36,42 @@ export const idlFactory = ({ IDL }) => {
     'Icp' : IDL.Null,
     'Sol' : IDL.Null,
   });
+  const TxDeadline = IDL.Variant({
+    'Nonce' : IDL.Nat64,
+    'BlockHeight' : IDL.Nat64,
+  });
+  const TxMeta = IDL.Record({
+    'raw' : IDL.Opt(IDL.Vec(IDL.Nat8)),
+    'deadline' : TxDeadline,
+  });
   const BridgeLog = IDL.Record({
     'id' : IDL.Opt(IDL.Nat64),
     'to' : BridgeTarget,
     'fee' : IDL.Nat,
+    'payout_started_at' : IDL.Nat64,
     'to_tx' : IDL.Opt(BridgeTx),
+    'from_meta' : IDL.Opt(TxMeta),
     'to_addr' : IDL.Opt(IDL.Text),
+    'to_meta' : IDL.Opt(TxMeta),
     'from' : BridgeTarget,
     'user' : IDL.Principal,
     'from_tx' : BridgeTx,
     'created_at' : IDL.Nat64,
     'error' : IDL.Opt(IDL.Text),
+    'stuck' : IDL.Bool,
     'icp_amount' : IDL.Nat,
     'finalized_at' : IDL.Nat64,
   });
   const Result_1 = IDL.Variant({ 'Ok' : BridgeLog, 'Err' : IDL.Text });
   const Result_2 = IDL.Variant({ 'Ok' : BridgeTx, 'Err' : IDL.Text });
-  const Result_3 = IDL.Variant({ 'Ok' : IDL.Nat64, 'Err' : IDL.Text });
-  const Result_4 = IDL.Variant({ 'Ok' : IDL.Text, 'Err' : IDL.Text });
-  const Result_5 = IDL.Variant({ 'Ok' : IDL.Vec(IDL.Nat8), 'Err' : IDL.Text });
-  const Result_6 = IDL.Variant({ 'Ok' : IDL.Vec(BridgeLog), 'Err' : IDL.Text });
+  const Result_3 = IDL.Variant({
+    'Ok' : IDL.Tuple(IDL.Text, IDL.Text),
+    'Err' : IDL.Text,
+  });
+  const Result_4 = IDL.Variant({ 'Ok' : IDL.Nat64, 'Err' : IDL.Text });
+  const Result_5 = IDL.Variant({ 'Ok' : IDL.Text, 'Err' : IDL.Text });
+  const Result_6 = IDL.Variant({ 'Ok' : IDL.Vec(IDL.Nat8), 'Err' : IDL.Text });
+  const Result_7 = IDL.Variant({ 'Ok' : IDL.Vec(BridgeLog), 'Err' : IDL.Text });
   const StateInfo = IDL.Record({
     'total_withdrawn_fees' : IDL.Nat,
     'error_rounds' : IDL.Nat64,
@@ -72,6 +90,7 @@ export const idlFactory = ({ IDL }) => {
     'evm_token_contracts' : IDL.Vec(
       IDL.Tuple(IDL.Text, IDL.Tuple(IDL.Text, IDL.Nat8, IDL.Nat64))
     ),
+    'erc20_gas_limit' : IDL.Nat64,
     'svm_providers' : IDL.Vec(IDL.Text),
     'svm_token_address' : IDL.Tuple(IDL.Text, IDL.Nat8, IDL.Text),
     'token_bridge_fee' : IDL.Nat,
@@ -84,9 +103,10 @@ export const idlFactory = ({ IDL }) => {
     'token_ledger' : IDL.Principal,
     'token_logo' : IDL.Text,
     'token_name' : IDL.Text,
+    'icp_collected_fees' : IDL.Nat,
     'sub_bridges' : IDL.Vec(IDL.Principal),
   });
-  const Result_7 = IDL.Variant({ 'Ok' : StateInfo, 'Err' : IDL.Text });
+  const Result_8 = IDL.Variant({ 'Ok' : StateInfo, 'Err' : IDL.Text });
   return IDL.Service({
     'admin_add_bridges' : IDL.Func([IDL.Vec(IDL.Principal)], [Result], []),
     'admin_add_evm_contract' : IDL.Func(
@@ -95,11 +115,20 @@ export const idlFactory = ({ IDL }) => {
         [],
       ),
     'admin_add_svm_contract' : IDL.Func([IDL.Text], [Result], []),
-    'admin_close_bridging_task' : IDL.Func([BridgeTx], [Result_1], []),
+    'admin_close_bridging_task' : IDL.Func(
+        [BridgeTx, IDL.Opt(IDL.Bool)],
+        [Result_1],
+        [],
+      ),
     'admin_collect_fees' : IDL.Func([IDL.Principal, IDL.Nat], [Result_2], []),
+    'admin_init_public_keys' : IDL.Func([], [Result_3], []),
     'admin_remove_bridges' : IDL.Func([IDL.Vec(IDL.Principal)], [Result], []),
-    'admin_restart_bridging' : IDL.Func([], [Result_3], []),
-    'admin_retry_bridging_task' : IDL.Func([BridgeTx], [Result_1], []),
+    'admin_restart_bridging' : IDL.Func([], [Result_4], []),
+    'admin_retry_bridging_task' : IDL.Func(
+        [BridgeTx, IDL.Opt(BridgeTarget), IDL.Opt(IDL.Text)],
+        [Result_1],
+        [],
+      ),
     'admin_set_evm_providers' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Vec(IDL.Text)],
         [Result],
@@ -111,64 +140,73 @@ export const idlFactory = ({ IDL }) => {
         [Result_2],
         [],
       ),
-    'erc20_transfer' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [Result_4], []),
+    'erc20_transfer' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [Result_5], []),
     'erc20_transfer_tx' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat],
-        [Result_4],
+        [Result_5],
         [],
       ),
-    'evm_address' : IDL.Func([IDL.Opt(IDL.Principal)], [Result_4], ['query']),
-    'evm_sign' : IDL.Func([IDL.Vec(IDL.Nat8)], [Result_5], []),
-    'evm_transfer_tx' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [Result_4], []),
+    'evm_address' : IDL.Func([IDL.Opt(IDL.Principal)], [Result_5], ['query']),
+    'evm_sign' : IDL.Func([IDL.Vec(IDL.Nat8)], [Result_6], []),
+    'evm_transfer_tx' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [Result_5], []),
     'finalized_logs' : IDL.Func(
         [IDL.Nat32, IDL.Opt(IDL.Nat64)],
-        [Result_6],
+        [Result_7],
         ['query'],
       ),
-    'info' : IDL.Func([], [Result_7], ['query']),
+    'info' : IDL.Func([], [Result_8], ['query']),
     'my_bridge_log' : IDL.Func([BridgeTx], [Result_1], ['query']),
     'my_finalized_logs' : IDL.Func(
         [IDL.Nat32, IDL.Opt(IDL.Nat64)],
-        [Result_6],
+        [Result_7],
         ['query'],
       ),
-    'my_pending_logs' : IDL.Func([], [Result_6], ['query']),
-    'pending_logs' : IDL.Func([], [Result_6], ['query']),
-    'sol_transfer_tx' : IDL.Func([IDL.Text, IDL.Nat64], [Result_4], []),
-    'spl_transfer_tx' : IDL.Func([IDL.Text, IDL.Nat], [Result_4], []),
-    'svm_address' : IDL.Func([IDL.Opt(IDL.Principal)], [Result_4], ['query']),
+    'my_pending_logs' : IDL.Func([], [Result_7], ['query']),
+    'pending_logs' : IDL.Func([], [Result_7], ['query']),
+    'sol_transfer_tx' : IDL.Func([IDL.Text, IDL.Nat64], [Result_5], []),
+    'spl_transfer_tx' : IDL.Func([IDL.Text, IDL.Nat], [Result_5], []),
+    'svm_address' : IDL.Func([IDL.Opt(IDL.Principal)], [Result_5], ['query']),
     'validate_admin_add_bridges' : IDL.Func(
         [IDL.Vec(IDL.Principal)],
-        [Result_4],
+        [Result_5],
         [],
       ),
     'validate_admin_add_evm_contract' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Text],
-        [Result_4],
+        [Result_5],
         [],
       ),
-    'validate_admin_add_svm_contract' : IDL.Func([IDL.Text], [Result_4], []),
-    'validate_admin_close_bridging_task' : IDL.Func([BridgeTx], [Result_4], []),
+    'validate_admin_add_svm_contract' : IDL.Func([IDL.Text], [Result_5], []),
+    'validate_admin_close_bridging_task' : IDL.Func(
+        [BridgeTx, IDL.Opt(IDL.Bool)],
+        [Result_5],
+        [],
+      ),
     'validate_admin_collect_fees' : IDL.Func(
         [IDL.Principal, IDL.Nat],
-        [Result_4],
+        [Result_5],
         [],
       ),
+    'validate_admin_init_public_keys' : IDL.Func([], [Result_5], []),
     'validate_admin_remove_bridges' : IDL.Func(
         [IDL.Vec(IDL.Principal)],
-        [Result_4],
+        [Result_5],
         [],
       ),
-    'validate_admin_restart_bridging' : IDL.Func([], [Result_4], []),
-    'validate_admin_retry_bridging_task' : IDL.Func([BridgeTx], [Result_4], []),
+    'validate_admin_restart_bridging' : IDL.Func([], [Result_5], []),
+    'validate_admin_retry_bridging_task' : IDL.Func(
+        [BridgeTx, IDL.Opt(BridgeTarget), IDL.Opt(IDL.Text)],
+        [Result_5],
+        [],
+      ),
     'validate_admin_set_evm_providers' : IDL.Func(
         [IDL.Text, IDL.Nat64, IDL.Vec(IDL.Text)],
-        [Result_4],
+        [Result_5],
         [],
       ),
     'validate_admin_set_svm_providers' : IDL.Func(
         [IDL.Vec(IDL.Text)],
-        [Result_4],
+        [Result_5],
         [],
       ),
   });
@@ -178,6 +216,7 @@ export const init = ({ IDL }) => {
     'min_threshold_to_bridge' : IDL.Opt(IDL.Nat),
     'token_symbol' : IDL.Opt(IDL.Text),
     'governance_canister' : IDL.Opt(IDL.Principal),
+    'erc20_gas_limit' : IDL.Opt(IDL.Nat64),
     'token_bridge_fee' : IDL.Opt(IDL.Nat),
     'token_ledger' : IDL.Opt(IDL.Principal),
     'token_logo' : IDL.Opt(IDL.Text),
@@ -187,6 +226,7 @@ export const init = ({ IDL }) => {
     'min_threshold_to_bridge' : IDL.Nat,
     'token_symbol' : IDL.Text,
     'governance_canister' : IDL.Opt(IDL.Principal),
+    'erc20_gas_limit' : IDL.Opt(IDL.Nat64),
     'token_bridge_fee' : IDL.Nat,
     'key_name' : IDL.Text,
     'token_decimals' : IDL.Nat8,

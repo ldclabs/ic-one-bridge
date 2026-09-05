@@ -71,12 +71,20 @@ export class SvmRpc {
     }
   }
 
-  // 'processed', 'confirmed', 'finalized', ''
+  /**
+   * 'processed', 'confirmed', 'finalized', 'failed', or '' when no provider
+   * has the signature yet.
+   *
+   * A transaction that failed still reaches the `finalized` commitment level
+   * while having moved nothing, so `err` decides before the commitment does.
+   */
   async getTransactionStatus(sig: string): Promise<string> {
     const { value } = await this.#rpc
       .getSignatureStatuses([sig as Signature])
       .send()
-    return value?.[0]?.confirmationStatus || ''
+    const status = value?.[0]
+    if (!status) return ''
+    return status.err ? 'failed' : status.confirmationStatus || ''
   }
 
   async sendRawTransaction(signedTx: string): Promise<string> {
