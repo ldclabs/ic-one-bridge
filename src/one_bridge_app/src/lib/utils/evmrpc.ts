@@ -31,12 +31,26 @@ export class EvmRpc {
     return BigInt((await jsonRPC<string>(this.#endpoint, method, params)) ?? 0)
   }
 
-  async gasFeeEstimation(gas: bigint = 54000n): Promise<bigint> {
+  /**
+   * What the canister will require the sender to hold before it signs.
+   *
+   * It refuses to sign for an address that cannot pay `gas_limit *
+   * max_fee_per_gas`, and it builds that ceiling itself: the priority fee is
+   * bumped by a fifth and the base is doubled for headroom. Estimating with
+   * the plain `gasPrice + priorityFee` would clear a balance the canister then
+   * rejects, so the same arithmetic is repeated here.
+   *
+   * `gas` is the canister's `erc20_gas_limit`, the larger of the two limits it
+   * uses; a native transfer needs less, and over-estimating there is the safe
+   * direction.
+   */
+  async gasFeeEstimation(gas: bigint): Promise<bigint> {
     const [gasPrice, maxPriorityFeePerGas] = await Promise.all([
       this.#hex('eth_gasPrice'),
       this.#hex('eth_maxPriorityFeePerGas')
     ])
-    return gas * (gasPrice + maxPriorityFeePerGas)
+    const priority = maxPriorityFeePerGas + maxPriorityFeePerGas / 5n
+    return gas * (gasPrice * 2n + priority)
   }
 
   async getBalance(address: string): Promise<bigint> {

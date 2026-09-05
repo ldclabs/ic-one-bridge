@@ -364,13 +364,9 @@ fn validate_admin_retry_bridging_task(
     if log.to_tx.as_ref().is_some_and(|tx| tx.is_finalized()) {
         return Err("the outgoing transaction is already finalized, nothing to retry".to_string());
     }
-    if let Some(target) = to.as_ref().or(if to_addr.is_some() {
-        Some(&log.to)
-    } else {
-        None
-    }) {
-        store::state::with(|s| store::state::validate_destination(s, target, to_addr.as_deref()))?;
-    }
+    store::state::with(|s| {
+        store::state::plan_retry_redirect(s, &log, to.as_ref(), to_addr.as_deref())
+    })?;
     pretty_format(&(log, to, to_addr))
 }
 

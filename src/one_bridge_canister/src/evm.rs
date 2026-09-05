@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::outcall::{
     Agreement, HttpOutcall, LARGE_RESPONSE, RpcCall, SMALL_RESPONSE, as_is, json_rpc_call, lower,
-    same,
+    same, two_provider_verdict,
 };
 
 pub use alloy_primitives::{Address, TxHash};
@@ -238,65 +238,44 @@ impl<H: HttpOutcall> EvmClient<H> {
     /// the receipt, if the transaction is what spent it, so a mixed view —
     /// the nonce from one provider and the receipt from another that lags
     /// behind — is exactly the view that would declare a mined deposit dead.
-    /// Two providers have to reach the verdict.
+    /// Two providers have to reach the verdict, see [`two_provider_verdict`].
     pub async fn replaced(
         &self,
         sender: &Address,
         nonce: u64,
         tx_hash: &TxHash,
     ) -> Result<bool, String> {
-        let mut verdicts: Vec<bool> = Vec::with_capacity(2);
-        let mut last_err = "no provider answered".to_string();
-        for provider in &self.providers {
-            let one = std::slice::from_ref(provider);
-            let verdict = async {
-                let current: u64 = json_rpc_call(
-                    &self.outcall,
-                    one,
-                    RpcCall {
-                        method: "eth_getTransactionCount",
-                        params: &[sender.to_string().into(), "latest".into()],
-                        max_response_bytes: SMALL_RESPONSE,
-                    },
-                    hex_to_u64,
-                    Agreement::First,
-                )
-                .await?;
-                if current <= nonce {
-                    return Ok::<bool, String>(false);
-                }
-                let receipt: Option<EvmReceipt> = json_rpc_call(
-                    &self.outcall,
-                    one,
-                    RpcCall {
-                        method: "eth_getTransactionReceipt",
-                        params: &[tx_hash.to_string().into()],
-                        max_response_bytes: LARGE_RESPONSE,
-                    },
-                    as_is,
-                    Agreement::First,
-                )
-                .await?;
-                Ok(receipt.is_none())
+        two_provider_verdict(&self.providers, "replacement check", |one| async move {
+            let current: u64 = json_rpc_call(
+                &self.outcall,
+                one,
+                RpcCall {
+                    method: "eth_getTransactionCount",
+                    params: &[sender.to_string().into(), "latest".into()],
+                    max_response_bytes: SMALL_RESPONSE,
+                },
+                hex_to_u64,
+                Agreement::First,
+            )
+            .await?;
+            if current <= nonce {
+                return Ok(false);
             }
-            .await;
-            match verdict {
-                Ok(verdict) => {
-                    verdicts.push(verdict);
-                    if verdicts.len() == 2 {
-                        break;
-                    }
-                }
-                Err(err) => last_err = err,
-            }
-        }
-        match verdicts.as_slice() {
-            [a, b] => Ok(*a && *b),
-            _ => Err(format!(
-                "only {} provider(s) answered the replacement check; last failure: {last_err}",
-                verdicts.len()
-            )),
-        }
+            let receipt: Option<EvmReceipt> = json_rpc_call(
+                &self.outcall,
+                one,
+                RpcCall {
+                    method: "eth_getTransactionReceipt",
+                    params: &[tx_hash.to_string().into()],
+                    max_response_bytes: LARGE_RESPONSE,
+                },
+                as_is,
+                Agreement::First,
+            )
+            .await?;
+            Ok(receipt.is_none())
+        })
+        .await
     }
 
     async fn eth_call<T>(

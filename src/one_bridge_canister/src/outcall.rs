@@ -4,6 +4,7 @@ use ic_cdk_management_canister::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::future::Future;
 
 use crate::{
     helper::APP_AGENT,
@@ -99,6 +100,51 @@ pub fn lower<T: Ord>(a: T, b: T) -> Result<T, String> {
 /// The decoded result, as it is.
 pub fn as_is<T>(value: T) -> Result<T, String> {
     Ok(value)
+}
+
+/// A verdict that two providers have to reach separately, each from its own
+/// view alone.
+///
+/// `verdict` is handed one provider at a time and answers whether, as far as
+/// that provider can see, the thing being asked about is true. Only a `true`
+/// both of them reached counts, so one provider lagging behind the other
+/// cannot carry a decision on its own. `what` names the check in the error a
+/// shortage of answers produces.
+///
+/// The alternative — asking one question of two providers and the next
+/// question of two others — is what this exists to avoid: a verdict that
+/// combines a fact from a provider that has caught up with a fact from one
+/// that has not is exactly the mixed view that reads a live transaction as
+/// dead.
+pub async fn two_provider_verdict<'a, F, Fut>(
+    providers: &'a [String],
+    what: &str,
+    verdict: F,
+) -> Result<bool, String>
+where
+    F: Fn(&'a [String]) -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    let mut verdicts: Vec<bool> = Vec::with_capacity(2);
+    let mut last_err = "no provider answered".to_string();
+    for provider in providers {
+        match verdict(std::slice::from_ref(provider)).await {
+            Ok(answer) => {
+                verdicts.push(answer);
+                if verdicts.len() == 2 {
+                    break;
+                }
+            }
+            Err(err) => last_err = err,
+        }
+    }
+    match verdicts.as_slice() {
+        [a, b] => Ok(*a && *b),
+        _ => Err(format!(
+            "only {} provider(s) answered the {what}; last failure: {last_err}",
+            verdicts.len()
+        )),
+    }
 }
 
 /// Sends a JSON-RPC request to the providers in turn until enough of them have
