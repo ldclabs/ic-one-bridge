@@ -13,7 +13,7 @@ codegen-units = 1
 
 [workspace.package]
 edition = "2024"
-version = "0.5.1"
+version = "0.5.2"
 repository = "https://github.com/ldclabs/ic-one-bridge"
 keywords = ["canister", "icp", "bridge", "erc20", "icrc"]
 categories = ["web-programming"]

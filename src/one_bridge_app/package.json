@@ -10,22 +10,23 @@
     "ncu": "npx npm-check-updates -u"
   },
   "type": "module",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "dependencies": {
     "@icp-sdk/auth": "^8.0.3",
     "@icp-sdk/core": "^6.1.0",
     "@ldclabs/cose-ts": "^1.7.0",
-    "@solana/kit": "^8.0.0"
+    "@solana/kit": "^8.2.0"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.70.3",
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
     "@tailwindcss/vite": "^4.3.3",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "prettier": "^3.9.6",
     "prettier-plugin-svelte": "^4.1.1",
     "prettier-plugin-tailwindcss": "^0.8.1",
-    "svelte": "^5.56.10",
+    "svelte": "^5.57.0",
     "svelte-check": "^4.7.6",
     "tailwindcss": "^4.3.3",
     "typescript": "~6.0.3",
