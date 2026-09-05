@@ -2,7 +2,7 @@ use alloy_primitives::{U64, U256, hex::FromHex};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use crate::outcall::{HttpOutcall, LARGE_RESPONSE, SMALL_RESPONSE, json_rpc_call};
+use crate::outcall::{HttpOutcall, LARGE_RESPONSE, Replication, SMALL_RESPONSE, json_rpc_call};
 
 pub use alloy_primitives::{Address, TxHash};
 
@@ -55,10 +55,11 @@ impl<H: HttpOutcall> EvmClient<H> {
     pub async fn chain_id(&self, now_ms: u64) -> Result<u64, String> {
         let res: String = self
             .call(
-                format!("eth_chainId-{}", now_ms),
+                now_ms,
                 "eth_chainId",
                 &[],
                 SMALL_RESPONSE,
+                Replication::Single,
             )
             .await?;
         hex_to_u64(&res)
@@ -67,10 +68,11 @@ impl<H: HttpOutcall> EvmClient<H> {
     pub async fn gas_price(&self, now_ms: u64) -> Result<u128, String> {
         let res: String = self
             .call(
-                format!("eth_gasPrice-{}", now_ms),
+                now_ms,
                 "eth_gasPrice",
                 &[],
                 SMALL_RESPONSE,
+                Replication::Single,
             )
             .await?;
         hex_to_u128(&res)
@@ -79,10 +81,11 @@ impl<H: HttpOutcall> EvmClient<H> {
     pub async fn max_priority_fee_per_gas(&self, now_ms: u64) -> Result<u128, String> {
         let res: String = self
             .call(
-                format!("eth_maxPriorityFeePerGas-{}", now_ms),
+                now_ms,
                 "eth_maxPriorityFeePerGas",
                 &[],
                 SMALL_RESPONSE,
+                Replication::Single,
             )
             .await?;
         hex_to_u128(&res)
@@ -91,10 +94,11 @@ impl<H: HttpOutcall> EvmClient<H> {
     pub async fn block_number(&self, now_ms: u64) -> Result<u64, String> {
         let res: String = self
             .call(
-                format!("eth_blockNumber-{}", now_ms),
+                now_ms,
                 "eth_blockNumber",
                 &[],
                 SMALL_RESPONSE,
+                Replication::Single,
             )
             .await?;
         hex_to_u64(&res)
@@ -107,10 +111,11 @@ impl<H: HttpOutcall> EvmClient<H> {
     ) -> Result<u64, String> {
         let res: String = self
             .call(
-                format!("eth_getTransactionCount-{}", now_ms),
+                now_ms,
                 "eth_getTransactionCount",
                 &[address.to_string().into(), "latest".into()],
                 SMALL_RESPONSE,
+                Replication::Single,
             )
             .await?;
         hex_to_u64(&res)
@@ -122,10 +127,11 @@ impl<H: HttpOutcall> EvmClient<H> {
         tx_hash: &TxHash,
     ) -> Result<Option<EvmReceipt>, String> {
         self.call(
-            format!("eth_getTransactionReceipt-{}", now_ms),
+            now_ms,
             "eth_getTransactionReceipt",
             &[tx_hash.to_string().into()],
             LARGE_RESPONSE,
+            Replication::Single,
         )
         .await
     }
@@ -144,10 +150,11 @@ impl<H: HttpOutcall> EvmClient<H> {
         signed_tx: String,
     ) -> Result<Value, String> {
         self.call(
-            format!("eth_sendRawTransaction-{}", now_ms),
+            now_ms,
             "eth_sendRawTransaction",
             &[signed_tx.into()],
             SMALL_RESPONSE,
+            Replication::Single,
         )
         .await
     }
@@ -165,10 +172,11 @@ impl<H: HttpOutcall> EvmClient<H> {
 
         let res: String = self
             .call(
-                format!("eth_call-{}", now_ms),
+                now_ms,
                 "eth_call",
                 &[call_object, "latest".into()],
                 SMALL_RESPONSE,
+                Replication::Single,
             )
             .await?;
         let res = res.strip_prefix("0x").unwrap_or(&res);
@@ -185,18 +193,20 @@ impl<H: HttpOutcall> EvmClient<H> {
 
     pub async fn call<T: DeserializeOwned>(
         &self,
-        idempotency_key: String,
+        now_ms: u64,
         method: &str,
         params: &[Value],
         max_response_bytes: u64,
+        replication: Replication,
     ) -> Result<T, String> {
         json_rpc_call(
             &self.outcall,
             &self.providers,
-            idempotency_key,
+            now_ms,
             method,
             params,
             max_response_bytes,
+            replication,
         )
         .await
     }
@@ -321,10 +331,11 @@ mod tests {
         let client = EvmClient::new(vec!["https://rpc".to_string()], 5, mock);
 
         let result: Result<u64, _> = futures::executor::block_on(client.call(
-            "id-key".to_string(),
+            1,
             "method",
             &[],
             SMALL_RESPONSE,
+            Replication::Single,
         ));
         assert!(result.unwrap_err().contains("execution reverted"));
     }

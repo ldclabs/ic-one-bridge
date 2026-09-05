@@ -12,6 +12,11 @@ pub static APP_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
 );
 
+/// The current IC time in milliseconds, the unit every timestamp in the state uses.
+pub fn now_ms() -> u64 {
+    ic_cdk::api::time() / 1_000_000
+}
+
 pub fn msg_caller() -> Result<Principal, String> {
     let caller = ic_cdk::api::msg_caller();
     check_auth(&caller)?;

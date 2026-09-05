@@ -7,7 +7,7 @@ use ic_auth_types::ByteBufB64;
 use serde_bytes::ByteBuf;
 
 use crate::{
-    helper::{check_auth, msg_caller},
+    helper::{check_auth, msg_caller, now_ms},
     store,
     svm::Pubkey,
 };
@@ -88,7 +88,7 @@ async fn bridge(
     to: Option<String>,
 ) -> Result<store::BridgeTx, String> {
     let caller = msg_caller()?;
-    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let now_ms = now_ms();
     store::state::bridge(from_chain, to_chain, icp_amount, to, caller, now_ms).await
 }
 
@@ -98,7 +98,7 @@ async fn erc20_transfer_tx(chain: String, to: String, icp_amount: u128) -> Resul
         .parse::<Address>()
         .map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
-    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let now_ms = now_ms();
     let (_, signed_tx) =
         store::state::build_erc20_transfer_tx(&chain, &caller, &to_addr, icp_amount, now_ms)
             .await?;
@@ -112,7 +112,7 @@ async fn erc20_transfer(chain: String, to: String, icp_amount: u128) -> Result<S
         .parse::<Address>()
         .map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
-    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let now_ms = now_ms();
     let (cli, signed_tx) =
         store::state::build_erc20_transfer_tx(&chain, &caller, &to_addr, icp_amount, now_ms)
             .await?;
@@ -132,7 +132,7 @@ async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<
         .parse::<Address>()
         .map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
-    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let now_ms = now_ms();
     let (_, signed_tx) =
         store::state::build_evm_transfer_tx(&chain, &caller, &to_addr, evm_amount, now_ms).await?;
     let data = signed_tx.encoded_2718();
@@ -143,7 +143,7 @@ async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<
 async fn spl_transfer_tx(to: String, icp_amount: u128) -> Result<String, String> {
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
-    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let now_ms = now_ms();
     let (_, signed_tx) =
         store::state::build_spl_transfer_tx(&caller, &to_addr, icp_amount, now_ms).await?;
     let data = bincode::serialize(&signed_tx)
@@ -155,7 +155,7 @@ async fn spl_transfer_tx(to: String, icp_amount: u128) -> Result<String, String>
 async fn sol_transfer_tx(to: String, sol_amount: u64) -> Result<String, String> {
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
-    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let now_ms = now_ms();
     let (_, signed_tx) =
         store::state::build_sol_transfer_tx(&caller, &to_addr, sol_amount, now_ms).await?;
     let data = bincode::serialize(&signed_tx)

@@ -17,7 +17,7 @@ impl PublicKeyOutput {
             .map_err(|_| "Failed to convert to SVM pubkey".to_string())
     }
 
-    pub fn to_evm_adress(&self) -> Result<Address, String> {
+    pub fn to_evm_address(&self) -> Result<Address, String> {
         use k256::elliptic_curve::sec1::ToEncodedPoint;
         let key = k256::PublicKey::from_sec1_bytes(self.public_key.as_slice())
             .map_err(|_| "Failed to convert to EVM address".to_string())?;
@@ -69,7 +69,7 @@ mod tests {
         );
         let evm = derive_public_key(&ecdsa, path.clone())
             .unwrap()
-            .to_evm_adress()
+            .to_evm_address()
             .unwrap();
 
         let ed25519 = master(
@@ -77,7 +77,7 @@ mod tests {
                 .serialize_raw()
                 .to_vec(),
         );
-        let svm = derive_schnorr_public_key(&ed25519, path, None)
+        let svm = derive_schnorr_public_key(&ed25519, path)
             .unwrap()
             .to_svm_pubkey()
             .unwrap();

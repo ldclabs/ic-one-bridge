@@ -4,10 +4,16 @@ use http::Uri;
 use std::collections::BTreeSet;
 
 use crate::{
-    helper::{pretty_format, validate_principals},
+    helper::{now_ms, pretty_format, validate_principals},
     store,
     svm::{Pubkey, get_mint_decimals},
 };
+
+/// Chain names are keys of the EVM configuration and prefixes of the errors
+/// the chain gate in `bridge()` matches on, so they are short, uppercase and
+/// never one of the built-in targets.
+const EVM_CHAIN_NAME_MAX_LEN: usize = 8;
+const RESERVED_CHAIN_NAMES: [&str; 2] = ["ICP", "SOL"];
 
 #[ic_cdk::update(guard = "is_controller")]
 fn admin_add_bridges(args: BTreeSet<Principal>) -> Result<(), String> {
@@ -47,8 +53,8 @@ async fn admin_add_evm_contract(
     address: String,
 ) -> Result<(), String> {
     let address = check_admin_add_evm_contract(&chain_name, chain_id, &address)?;
-    let cli = store::state::evm_client(&chain_name);
-    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let cli = store::state::evm_client(&chain_name)?;
+    let now_ms = now_ms();
     let (cid, gas_price, max_priority_fee_per_gas, decimals) = futures::future::try_join4(
         cli.chain_id(now_ms),
         cli.gas_price(now_ms),
@@ -88,19 +94,14 @@ fn check_admin_add_evm_contract(
     chain_id: u64,
     address: &str,
 ) -> Result<Address, String> {
-    if chain_name.trim().to_ascii_uppercase() != chain_name
-        || chain_name.is_empty()
-        || chain_name.len() > 8
-    {
-        return Err("chain_name must be non-empty, up to 8 chars, and all uppercase".to_string());
-    }
+    check_evm_chain_name(chain_name)?;
 
     let addr = Address::parse_checksummed(address, None)
         .map_err(|err| format!("invalid address {address}: {err:?}"))?;
 
     store::state::with(|s| {
         if s.evm_token_contracts.contains_key(chain_name) {
-            return Err("chain_id already exists".to_string());
+            return Err("chain_name already exists".to_string());
         }
 
         if s.evm_token_contracts
@@ -118,7 +119,7 @@ fn check_admin_add_evm_contract(
 async fn admin_add_svm_contract(address: String) -> Result<(), String> {
     let addr = check_admin_add_svm_contract(&address)?;
     let cli = store::state::svm_client();
-    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let now_ms = now_ms();
     let account = cli.get_account_info(now_ms, &address).await?;
     let account = account.ok_or_else(|| format!("account {address} does not exist"))?;
     let token_program = Pubkey::try_from(account.owner.as_str())
@@ -136,6 +137,23 @@ async fn admin_add_svm_contract(address: String) -> Result<(), String> {
 fn validate_admin_add_svm_contract(address: String) -> Result<String, String> {
     check_admin_add_svm_contract(&address)?;
     pretty_format(&(address,))
+}
+
+fn check_evm_chain_name(chain_name: &str) -> Result<(), String> {
+    if chain_name.is_empty()
+        || chain_name.len() > EVM_CHAIN_NAME_MAX_LEN
+        || !chain_name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return Err(format!(
+            "chain_name must be 1 to {EVM_CHAIN_NAME_MAX_LEN} uppercase letters or digits, got: {chain_name}"
+        ));
+    }
+    if RESERVED_CHAIN_NAMES.contains(&chain_name) {
+        return Err(format!("chain_name {chain_name} is reserved"));
+    }
+    Ok(())
 }
 
 fn check_admin_add_svm_contract(address: &str) -> Result<Pubkey, String> {
@@ -157,7 +175,7 @@ fn admin_set_evm_providers(
     max_confirmations: u64,
     providers: Vec<String>,
 ) -> Result<(), String> {
-    check_evm_providers(max_confirmations, &providers)?;
+    check_evm_providers(&chain_name, max_confirmations, &providers)?;
 
     store::state::with_mut(|s| {
         s.evm_providers
@@ -172,11 +190,16 @@ fn validate_admin_set_evm_providers(
     max_confirmations: u64,
     providers: Vec<String>,
 ) -> Result<String, String> {
-    check_evm_providers(max_confirmations, &providers)?;
+    check_evm_providers(&chain_name, max_confirmations, &providers)?;
     pretty_format(&(chain_name, max_confirmations, providers))
 }
 
-fn check_evm_providers(max_confirmations: u64, providers: &[String]) -> Result<(), String> {
+fn check_evm_providers(
+    chain_name: &str,
+    max_confirmations: u64,
+    providers: &[String],
+) -> Result<(), String> {
+    check_evm_chain_name(chain_name)?;
     check_providers(providers)?;
     if max_confirmations < 2 {
         return Err("max_confirmations must be at least 2".to_string());
@@ -315,7 +338,7 @@ fn validate_admin_retry_bridging_task(from_tx: store::BridgeTx) -> Result<String
 /// the totals, and settling with the user is up to the administrator.
 #[ic_cdk::update(guard = "is_controller")]
 fn admin_close_bridging_task(from_tx: store::BridgeTx) -> Result<store::BridgeLog, String> {
-    let now_ms = ic_cdk::api::time() / 1_000_000;
+    let now_ms = now_ms();
     store::state::close_pending_task(&from_tx, now_ms)
 }
 
@@ -359,5 +382,20 @@ mod tests {
         assert!(check_providers(&["http://rpc.example".to_string()]).is_err());
         assert!(check_providers(&["/relative/rpc".to_string()]).is_err());
         assert!(check_providers(&["https:/missing-host".to_string()]).is_err());
+    }
+
+    #[test]
+    fn evm_chain_names_are_short_uppercase_and_not_built_in() {
+        assert!(check_evm_chain_name("BNB").is_ok());
+        assert!(check_evm_chain_name("ARB1").is_ok());
+        assert!(check_evm_chain_name("ABCDEFGH").is_ok());
+
+        assert!(check_evm_chain_name("").is_err());
+        assert!(check_evm_chain_name("ABCDEFGHI").is_err());
+        assert!(check_evm_chain_name("bnb").is_err());
+        assert!(check_evm_chain_name("BNB ").is_err());
+        assert!(check_evm_chain_name("B-NB").is_err());
+        assert!(check_evm_chain_name("ICP").is_err());
+        assert!(check_evm_chain_name("SOL").is_err());
     }
 }

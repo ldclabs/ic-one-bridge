@@ -8,7 +8,7 @@ use ic_http_certification::{
     cel::{DefaultCelBuilder, create_cel_expr},
 };
 use ic_stable_structures::{
-    DefaultMemoryImpl, StableBTreeMap, StableCell, StableLog, Storable,
+    DefaultMemoryImpl, Memory as _, StableBTreeMap, StableCell, StableLog, Storable,
     memory_manager::{MemoryId, MemoryManager, VirtualMemory},
     storable::Bound,
 };
@@ -21,11 +21,13 @@ use icrc_ledger_types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteArray;
+use solana_instruction::Instruction;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    future::Future,
     rc::Rc,
     sync::LazyLock,
     time::Duration,
@@ -64,6 +66,35 @@ const MAX_LOG_LOOKBACK: usize = 100;
 /// can plausibly take is therefore treated as stale and taken over.
 const FINALIZE_BRIDGING_LOCK_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 
+/// Gas limit of an ERC-20 `transfer` unless the token sets its own: an
+/// OpenZeppelin transfer uses ~54k, and the headroom is for a token with a
+/// little more logic in it.
+const DEFAULT_ERC20_GAS_LIMIT: u64 = 84_000;
+
+/// Gas limit of a native transfer. A plain one costs exactly 21k, and the
+/// headroom is for a recipient contract with a small receive hook.
+const NATIVE_TRANSFER_GAS_LIMIT: u64 = 32_000;
+
+/// Sanity bounds on a configured ERC-20 gas limit: below the 21k intrinsic
+/// cost no transaction is valid, and above a million the value is a typo.
+const ERC20_GAS_LIMIT_RANGE: std::ops::RangeInclusive<u64> = 21_000..=1_000_000;
+
+fn default_erc20_gas_limit() -> u64 {
+    DEFAULT_ERC20_GAS_LIMIT
+}
+
+pub fn validate_erc20_gas_limit(gas_limit: u64) -> Result<(), String> {
+    if ERC20_GAS_LIMIT_RANGE.contains(&gas_limit) {
+        Ok(())
+    } else {
+        Err(format!(
+            "erc20_gas_limit {gas_limit} must be between {} and {}",
+            ERC20_GAS_LIMIT_RANGE.start(),
+            ERC20_GAS_LIMIT_RANGE.end()
+        ))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
     pub key_name: String,
@@ -79,6 +110,9 @@ pub struct State {
     #[serde(default)]
     pub token_bridge_fee: u128, // with the same decimals as token
     pub min_threshold_to_bridge: u128,
+    /// Gas limit of this token's ERC-20 `transfer`, on every EVM chain.
+    #[serde(default = "default_erc20_gas_limit")]
+    pub erc20_gas_limit: u64,
     // chain_name => (contract_address, decimals, chain_id)
     pub evm_token_contracts: HashMap<String, (Address, u8, u64)>,
     // chain_name => (gas_updated_at, gas_price, max_priority_fee_per_gas)
@@ -128,6 +162,7 @@ pub struct StateInfo {
     pub token_ledger: Principal,
     pub token_bridge_fee: u128,
     pub min_threshold_to_bridge: u128,
+    pub erc20_gas_limit: u64,
     pub evm_token_contracts: HashMap<String, (String, u8, u64)>,
     pub evm_latest_gas: HashMap<String, (u64, u128, u128)>,
     pub evm_providers: HashMap<String, (u64, Vec<String>)>,
@@ -143,8 +178,8 @@ pub struct StateInfo {
     pub governance_canister: Option<Principal>,
 }
 
-impl From<&State> for StateInfo {
-    fn from(s: &State) -> Self {
+impl StateInfo {
+    fn new(s: &State, total_bridge_count: u64) -> Self {
         Self {
             key_name: s.key_name.clone(),
             icp_address: s.icp_address,
@@ -157,6 +192,7 @@ impl From<&State> for StateInfo {
             token_ledger: s.token_ledger,
             token_bridge_fee: s.token_bridge_fee,
             min_threshold_to_bridge: s.min_threshold_to_bridge,
+            erc20_gas_limit: s.erc20_gas_limit,
             evm_token_contracts: s
                 .evm_token_contracts
                 .iter()
@@ -183,7 +219,7 @@ impl From<&State> for StateInfo {
             total_bridged_tokens: s.total_bridged_tokens,
             total_collected_fees: s.total_collected_fees,
             total_withdrawn_fees: s.total_withdrawn_fees,
-            total_bridge_count: 0,
+            total_bridge_count,
             sub_bridges: s.sub_bridges.clone(),
             error_rounds: s.error_rounds,
             governance_canister: s.governance_canister,
@@ -205,6 +241,7 @@ impl State {
             token_ledger: Principal::from_text("druyg-tyaaa-aaaaq-aactq-cai").unwrap(), // mainnet ledger
             token_bridge_fee: 0,
             min_threshold_to_bridge: 100_000_000, // 1 Token (8 decimals)
+            erc20_gas_limit: DEFAULT_ERC20_GAS_LIMIT,
             evm_token_contracts: HashMap::new(),
             evm_providers: HashMap::new(),
             evm_latest_gas: HashMap::new(),
@@ -240,6 +277,8 @@ pub enum BridgeTx {
     Sol(bool, ByteArray<64>), // (finalized, tx_signature)
 }
 
+/// Two records of one transaction are the same transaction whether or not
+/// either of them has seen it finalize, so equality ignores the flag.
 impl cmp::PartialEq for BridgeTx {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -268,15 +307,6 @@ impl BridgeTx {
             BridgeTx::Icp(finalized, _) => *finalized,
             BridgeTx::Evm(finalized, _) => *finalized,
             BridgeTx::Sol(finalized, _) => *finalized,
-        }
-    }
-
-    pub fn same_with(&self, other: &BridgeTx) -> bool {
-        match (self, other) {
-            (BridgeTx::Icp(_, tx1), BridgeTx::Icp(_, tx2)) => tx1 == tx2,
-            (BridgeTx::Evm(_, tx1), BridgeTx::Evm(_, tx2)) => tx1 == tx2,
-            (BridgeTx::Sol(_, tx1), BridgeTx::Sol(_, tx2)) => tx1 == tx2,
-            _ => false,
         }
     }
 }
@@ -384,7 +414,7 @@ impl BridgeLog {
             && self.from == other.from
             && self.to == other.to
             && self.icp_amount == other.icp_amount
-            && self.from_tx.same_with(&other.from_tx)
+            && self.from_tx == other.from_tx
     }
 }
 
@@ -404,31 +434,125 @@ impl Storable for BridgeLogLocal {
     }
 }
 
-#[derive(Clone, CandidType, Default, Serialize, Deserialize)]
-pub struct UserLogs {
-    pub logs: BTreeSet<u64>,
+/// A user's archive index in the layout that predates [`UserLogKey`]: all of
+/// the user's log ids in one value, rewritten whole on every append. Only read
+/// now, to copy it into the current layout.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct LegacyUserLogs {
+    logs: BTreeSet<u64>,
 }
 
-impl Storable for UserLogs {
+impl Storable for LegacyUserLogs {
     const BOUND: Bound = Bound::Unbounded;
 
     fn into_bytes(self) -> Vec<u8> {
-        cbor_into_vec(&self).expect("failed to encode UserLogs data")
+        cbor_into_vec(&self).expect("failed to encode LegacyUserLogs data")
     }
 
     fn to_bytes(&self) -> Cow<'_, [u8]> {
-        Cow::Owned(cbor_into_vec(self).expect("failed to encode UserLogs data"))
+        Cow::Owned(cbor_into_vec(self).expect("failed to encode LegacyUserLogs data"))
     }
 
     fn from_bytes(bytes: Cow<'_, [u8]>) -> Self {
-        cbor_from_slice(&bytes).expect("failed to decode UserLogs data")
+        cbor_from_slice(&bytes).expect("failed to decode LegacyUserLogs data")
     }
 }
 
+/// Key of the per-user archive index: a user, then one of their log ids.
+///
+/// The map orders keys by their bytes, so the encoding leads with the
+/// principal's length and pads the principal to its maximum length: every id of
+/// one user is then contiguous and in id order, and no other principal's keys
+/// fall in between, so a user's history is one range scan. Appending a log
+/// inserts one fixed-size key instead of rewriting the user's whole id set.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct UserLogKey([u8; UserLogKey::SIZE]);
+
+impl UserLogKey {
+    const SIZE: usize = 1 + Principal::MAX_LENGTH_IN_BYTES + 8;
+
+    fn new(user: &Principal, log_id: u64) -> Self {
+        let mut bytes = [0u8; Self::SIZE];
+        let user = user.as_slice();
+        bytes[0] = user.len() as u8;
+        bytes[1..1 + user.len()].copy_from_slice(user);
+        bytes[Self::SIZE - 8..].copy_from_slice(&log_id.to_be_bytes());
+        Self(bytes)
+    }
+
+    fn log_id(&self) -> u64 {
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&self.0[Self::SIZE - 8..]);
+        u64::from_be_bytes(id)
+    }
+}
+
+impl Storable for UserLogKey {
+    const BOUND: Bound = Bound::Bounded {
+        max_size: Self::SIZE as u32,
+        is_fixed_size: true,
+    };
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+
+    fn to_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(&self.0)
+    }
+
+    fn from_bytes(bytes: Cow<'_, [u8]>) -> Self {
+        Self(
+            bytes
+                .as_ref()
+                .try_into()
+                .expect("UserLogKey has a fixed size"),
+        )
+    }
+}
+
+/// The ids of `user`'s archived logs below `before`, newest first, at most
+/// `take` of them.
+fn user_log_ids<M: ic_stable_structures::Memory>(
+    index: &StableBTreeMap<UserLogKey, (), M>,
+    user: &Principal,
+    before: u64,
+    take: usize,
+) -> Vec<u64> {
+    index
+        .keys_range(UserLogKey::new(user, 0)..UserLogKey::new(user, before))
+        .rev()
+        .take(take)
+        .map(|key| key.log_id())
+        .collect()
+}
+
+/// Copies every id of the legacy per-user index into `index`, unless `index`
+/// already holds something, and returns how many ids were copied.
+fn copy_legacy_user_log_index<M: ic_stable_structures::Memory>(
+    legacy: &StableBTreeMap<Principal, LegacyUserLogs, M>,
+    index: &mut StableBTreeMap<UserLogKey, (), M>,
+) -> u64 {
+    if !index.is_empty() {
+        return 0;
+    }
+
+    let mut copied = 0;
+    for entry in legacy.iter() {
+        let (user, logs) = entry.into_pair();
+        for log_id in logs.logs {
+            index.insert(UserLogKey::new(&user, log_id), ());
+            copied += 1;
+        }
+    }
+    copied
+}
+
 const STATE_MEMORY_ID: MemoryId = MemoryId::new(0);
-const USER_LOGS_MEMORY_ID: MemoryId = MemoryId::new(1);
+const LEGACY_USER_LOGS_MEMORY_ID: MemoryId = MemoryId::new(1);
 const BRIDGE_LOGS_INDEX_MEMORY_ID: MemoryId = MemoryId::new(2);
 const BRIDGE_LOGS_DATA_MEMORY_ID: MemoryId = MemoryId::new(3);
+const USER_LOG_INDEX_MEMORY_ID: MemoryId = MemoryId::new(4);
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::new());
@@ -447,9 +571,9 @@ thread_local! {
         )
     );
 
-    static USER_LOGS: RefCell<StableBTreeMap<Principal, UserLogs, Memory>> = RefCell::new(
+    static USER_LOG_INDEX: RefCell<StableBTreeMap<UserLogKey, (), Memory>> = RefCell::new(
         StableBTreeMap::init(
-            MEMORY_MANAGER.with_borrow(|m| m.get(USER_LOGS_MEMORY_ID)),
+            MEMORY_MANAGER.with_borrow(|m| m.get(USER_LOG_INDEX_MEMORY_ID)),
         )
     );
 
@@ -564,10 +688,7 @@ fn claim_payout_in(
     from_tx: &BridgeTx,
     candidate: &BridgeTx,
 ) -> PayoutClaim {
-    let Some(task) = pending
-        .iter_mut()
-        .find(|task| task.from_tx.same_with(from_tx))
-    else {
+    let Some(task) = pending.iter_mut().find(|task| task.from_tx == *from_tx) else {
         return PayoutClaim::TaskGone;
     };
 
@@ -768,7 +889,7 @@ pub mod state {
     }
 
     async fn init_ed25519_public_key(key_name: String) {
-        match schnorr_public_key(key_name, vec![], None).await {
+        match schnorr_public_key(key_name, vec![]).await {
             Ok(root_pk) => {
                 STATE.with_borrow_mut(|s| match derive_svm_address(&root_pk, &s.icp_address) {
                     Ok(svm_address) => {
@@ -829,9 +950,22 @@ pub mod state {
     }
 
     pub fn info() -> StateInfo {
-        let mut info = STATE.with_borrow(|s| StateInfo::from(s));
-        info.total_bridge_count = BRIDGE_LOGS.with_borrow(|r| r.len());
-        info
+        let total_bridge_count = BRIDGE_LOGS.with_borrow(|r| r.len());
+        STATE.with_borrow(|s| StateInfo::new(s, total_bridge_count))
+    }
+
+    /// Copies the per-user archive index into its current layout, once, on
+    /// the first upgrade that has the layout. The legacy map is left as it
+    /// is, so an earlier version can still be reinstalled over this one.
+    pub fn migrate_user_log_index() -> u64 {
+        let legacy_memory = MEMORY_MANAGER.with_borrow(|m| m.get(LEGACY_USER_LOGS_MEMORY_ID));
+        if legacy_memory.size() == 0 {
+            // never written: a canister installed after the legacy layout
+            return 0;
+        }
+        let legacy: StableBTreeMap<Principal, LegacyUserLogs, Memory> =
+            StableBTreeMap::init(legacy_memory);
+        USER_LOG_INDEX.with_borrow_mut(|index| copy_legacy_user_log_index(&legacy, index))
     }
 
     fn derive_evm_address(
@@ -840,25 +974,25 @@ pub mod state {
     ) -> Result<Address, String> {
         let pk = derive_public_key(public_key, vec![user.as_slice().to_vec()])
             .map_err(|err| format!("derive_public_key failed: {err}"))?;
-        pk.to_evm_adress()
+        pk.to_evm_address()
     }
 
     pub fn evm_address(user: &Principal) -> Result<Address, String> {
         STATE.with_borrow(|s| derive_evm_address(&s.ecdsa_public_key, user))
     }
 
-    pub fn evm_client(chain: &str) -> EvmClient<DefaultHttpOutcall> {
+    pub fn evm_client(chain: &str) -> Result<EvmClient<DefaultHttpOutcall>, String> {
         STATE.with_borrow(|s| {
             let (max_confirmations, providers) = s
                 .evm_providers
                 .get(chain)
                 .cloned()
-                .unwrap_or((1, Vec::new()));
-            EvmClient::new(
+                .ok_or_else(|| format!("no RPC providers configured for chain {chain}"))?;
+            Ok(EvmClient::new(
                 providers,
                 max_confirmations,
                 DefaultHttpOutcall::new(s.icp_address),
-            )
+            ))
         })
     }
 
@@ -888,7 +1022,7 @@ pub mod state {
         public_key: &PublicKeyOutput,
         user: &Principal,
     ) -> Result<Pubkey, String> {
-        let pk = derive_schnorr_public_key(public_key, vec![user.as_slice().to_vec()], None)
+        let pk = derive_schnorr_public_key(public_key, vec![user.as_slice().to_vec()])
             .map_err(|err| format!("derive_schnorr_public_key failed: {err}"))?;
         pk.to_svm_pubkey()
     }
@@ -1095,13 +1229,14 @@ pub mod state {
             return pending;
         }
 
-        let archived = USER_LOGS.with_borrow(|r| r.get(&user).unwrap_or_default());
+        let recent = USER_LOG_INDEX
+            .with_borrow(|index| user_log_ids(index, &user, u64::MAX, MAX_LOG_LOOKBACK));
         BRIDGE_LOGS.with_borrow(|log_store| {
-            for id in archived.logs.iter().rev().take(MAX_LOG_LOOKBACK) {
-                if let Some(mut log) = log_store.get(*id)
+            for id in recent {
+                if let Some(mut log) = log_store.get(id)
                     && log.from_tx == from_tx
                 {
-                    log.id = Some(*id);
+                    log.id = Some(id);
                     return Some(log.into());
                 }
             }
@@ -1110,33 +1245,16 @@ pub mod state {
     }
 
     pub fn user_logs(user: Principal, take: usize, prev: Option<u64>) -> Vec<BridgeLog> {
-        USER_LOGS.with_borrow(|r| {
-            let item = r.get(&user).unwrap_or_default();
-            if item.logs.is_empty() {
-                return vec![];
-            }
-            let ids = item
-                .logs
-                .range(..prev.unwrap_or(u64::MAX))
-                .rev()
-                .take(take)
-                .cloned()
-                .collect::<Vec<u64>>();
-
-            if ids.is_empty() {
-                return vec![];
-            }
-
-            BRIDGE_LOGS.with_borrow(|log_store| {
-                let mut logs: Vec<BridgeLog> = Vec::with_capacity(ids.len());
-                for id in ids {
-                    if let Some(mut log) = log_store.get(id) {
-                        log.id = Some(id);
-                        logs.push(log.into());
-                    }
-                }
-                logs
-            })
+        let ids = USER_LOG_INDEX
+            .with_borrow(|index| user_log_ids(index, &user, prev.unwrap_or(u64::MAX), take));
+        BRIDGE_LOGS.with_borrow(|log_store| {
+            ids.into_iter()
+                .filter_map(|id| {
+                    let mut log = log_store.get(id)?;
+                    log.id = Some(id);
+                    Some(log.into())
+                })
+                .collect()
         })
     }
 
@@ -1176,13 +1294,15 @@ pub mod state {
             s.finalize_bridging_started_at = started_at;
             // take up to 3 pending tasks to process in parallel
             let mut tasks = Vec::with_capacity(3);
-            // 针对 EVM 出口，按链互斥，避免同一 from 地址的 nonce 冲突
+            // Every EVM payout spends from the bridge's one address per
+            // chain, so a round takes at most one task per destination chain
+            // to keep their nonces apart.
             let mut evm_outgoing_locked: HashSet<&str> = HashSet::new();
             for task in s.pending.iter() {
                 if let BridgeTarget::Evm(chain) = &task.to
                     && !evm_outgoing_locked.insert(chain.as_str())
                 {
-                    // 已有同链任务在本轮处理，跳过以避免 nonce 冲突
+                    // another task already pays out on this chain this round
                     continue;
                 }
 
@@ -1260,8 +1380,7 @@ pub mod state {
                     }
                 }
 
-                s.pending
-                    .retain(|t| !abandoned.iter().any(|tx| t.from_tx.same_with(tx)));
+                s.pending.retain(|t| !abandoned.contains(&t.from_tx));
                 s.pending.retain(|t| !t.is_finalized());
                 s.finalize_bridging_round = (s.finalize_bridging_round.0.saturating_add(1), false);
                 s.finalize_bridging_started_at = 0;
@@ -1306,10 +1425,8 @@ pub mod state {
         let log_id = BRIDGE_LOGS
             .with_borrow_mut(|r| r.append(&log.clone().into()))
             .map_err(|err| format!("failed to append to BRIDGE_LOGS: {}", format_error(err)))?;
-        USER_LOGS.with_borrow_mut(|r| {
-            let mut logs = r.get(&log.user).unwrap_or_default();
-            logs.logs.insert(log_id);
-            r.insert(log.user, logs);
+        USER_LOG_INDEX.with_borrow_mut(|index| {
+            index.insert(UserLogKey::new(&log.user, log_id), ());
         });
         Ok(log_id)
     }
@@ -1363,7 +1480,7 @@ pub mod state {
         STATE.with_borrow(|s| {
             s.pending
                 .iter()
-                .find(|t| t.from_tx.same_with(from_tx))
+                .find(|t| t.from_tx == *from_tx)
                 .cloned()
                 .ok_or_else(|| "no pending bridging task matches the given from_tx".to_string())
         })
@@ -1383,7 +1500,7 @@ pub mod state {
             let task = s
                 .pending
                 .iter_mut()
-                .find(|t| t.from_tx.same_with(from_tx))
+                .find(|t| t.from_tx == *from_tx)
                 .ok_or_else(|| "no pending bridging task matches the given from_tx".to_string())?;
 
             if task.to_tx.as_ref().is_some_and(|tx| tx.is_finalized()) {
@@ -1427,7 +1544,7 @@ pub mod state {
             let idx = s
                 .pending
                 .iter()
-                .position(|t| t.from_tx.same_with(from_tx))
+                .position(|t| t.from_tx == *from_tx)
                 .ok_or_else(|| "no pending bridging task matches the given from_tx".to_string())?;
 
             if s.pending[idx].is_finalized() {
@@ -1789,7 +1906,6 @@ pub mod state {
         icp_amount: u128,
         now_ms: u64,
     ) -> BroadcastResult {
-        // let to_addr = evm_address(&user);
         let (client, signed_tx) = build_erc20_transfer_tx(
             chain,
             &ic_cdk::api::canister_self(),
@@ -1802,16 +1918,37 @@ pub mod state {
 
         let tx_hash: [u8; 32] = (*signed_tx.hash()).into();
         let tx = BridgeTx::Evm(false, tx_hash.into());
-        let data = signed_tx.encoded_2718();
+        let data = Bytes::from(signed_tx.encoded_2718()).to_string();
+        broadcast_payout(run_generation, from_tx, tx, chain, || {
+            client.send_raw_transaction(now_ms, data)
+        })
+        .await
+    }
 
+    /// Records `tx` as the task's payout, then hands it to the provider.
+    ///
+    /// The claim comes first so that a broadcast whose outcome is unknown is
+    /// never rebuilt: the error carries the claimed transaction for exactly
+    /// that case. A claim that finds the slot taken, the round superseded or
+    /// the task gone returns without broadcasting, see [`PayoutClaim`].
+    async fn broadcast_payout<F, Fut, T>(
+        run_generation: u64,
+        from_tx: &BridgeTx,
+        tx: BridgeTx,
+        chain: &str,
+        send: F,
+    ) -> BroadcastResult
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, String>>,
+    {
         match claim_pending_payout(run_generation, from_tx, &tx) {
             PayoutClaim::Claimed => {}
             PayoutClaim::Existing(existing) => return Ok(Some(existing)),
             PayoutClaim::RunSuperseded | PayoutClaim::TaskGone => return Ok(None),
         }
 
-        client
-            .send_raw_transaction(now_ms, Bytes::from(data).to_string())
+        send()
             .await
             .map_err(|err| (Some(tx.clone()), format!("{chain}: {err}")))?;
         Ok(Some(tx))
@@ -1839,7 +1976,6 @@ pub mod state {
         icp_amount: u128,
         now_ms: u64,
     ) -> BroadcastResult {
-        // let to_addr = evm_address(&user);
         let (client, signed_tx) =
             build_spl_transfer_tx(&ic_cdk::api::canister_self(), &to_addr, icp_amount, now_ms)
                 .await
@@ -1848,18 +1984,10 @@ pub mod state {
         let tx_hash: [u8; 64] = signed_tx.signatures[0].into();
         let tx = BridgeTx::Sol(false, tx_hash.into());
         let data = bincode::serialize(&signed_tx).map_err(|err| (None, format!("SOL: {err}")))?;
-
-        match claim_pending_payout(run_generation, from_tx, &tx) {
-            PayoutClaim::Claimed => {}
-            PayoutClaim::Existing(existing) => return Ok(Some(existing)),
-            PayoutClaim::RunSuperseded | PayoutClaim::TaskGone => return Ok(None),
-        }
-
-        client
-            .send_transaction(now_ms, data.into())
-            .await
-            .map_err(|err| (Some(tx.clone()), format!("SOL: {err}")))?;
-        Ok(Some(tx))
+        broadcast_payout(run_generation, from_tx, tx, "SOL", || {
+            client.send_transaction(now_ms, data.into())
+        })
+        .await
     }
 
     /// What an EVM transaction should do, before the nonce, the gas price and
@@ -1924,12 +2052,12 @@ pub mod state {
             ))
         })?;
 
-        let from_addr = from_pk.to_evm_adress()?;
+        let from_addr = from_pk.to_evm_address()?;
         if from_addr == recipient {
             return Err("from and to cannot be the same".to_string());
         }
 
-        let client = evm_client(chain);
+        let client = evm_client(chain)?;
         if gas_updated_at.saturating_add(120_000) >= now_ms {
             tx.nonce = client.get_transaction_count(now_ms, &from_addr).await?;
         } else {
@@ -1990,7 +2118,7 @@ pub mod state {
                 recipient: *to_addr,
                 value: 0,
                 input: encode_erc20_transfer(to_addr, value),
-                gas_limit: 84_000, // sample: ~53,696
+                gas_limit: s.erc20_gas_limit,
             })
         })?;
 
@@ -2013,7 +2141,7 @@ pub mod state {
             recipient: *to_addr,
             value: amount,
             input: Vec::new(),
-            gas_limit: 32_000, // sample: ~21,000
+            gas_limit: NATIVE_TRANSFER_GAS_LIMIT,
         };
 
         sign_evm_tx(chain, from, plan, now_ms).await
@@ -2025,7 +2153,7 @@ pub mod state {
         tx_hash: &TxHash,
         now_ms: u64,
     ) -> Result<EvmTxStatus, String> {
-        let client = evm_client(chain);
+        let client = evm_client(chain).map_err(|err| format!("{chain}: {err}"))?;
         let receipt = client
             .get_transaction_receipt(now_ms, tx_hash)
             .await
@@ -2039,12 +2167,11 @@ pub mod state {
             return Ok(EvmTxStatus::Pending);
         };
 
-        // We don't need to check the logs here.
-        // log.address == 代币合约地址
-        // log.topics[0] == keccak256("Transfer(address,address,uint256)") = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
-        // log.topics[1] == from 地址（32 字节左填充）
-        // log.topics[2] == to 地址（32 字节左填充）
-        // log.data 为 uint256 的转账数量（ABI 编码）
+        // The receipt's logs are not inspected: this canister built the
+        // transaction, so a successful status is its ERC-20 `transfer` having
+        // run. The event it would carry is `Transfer(address,address,uint256)`
+        // from the token contract, with the from and to addresses left-padded
+        // in topics 1 and 2 and the amount ABI-encoded in the data.
         let latest = context
             .evm_block_number(chain, &client, now_ms)
             .await
@@ -2082,7 +2209,7 @@ pub mod state {
         icp_amount: u128,
         now_ms: u64,
     ) -> Result<(SvmClient<DefaultHttpOutcall>, Transaction), String> {
-        let (key_name, from_addr, ixs) = STATE.with_borrow(|s| {
+        let (from_addr, ixs) = STATE.with_borrow(|s| {
             let (mint_pubkey, decimals, token_program_id) = s.svm_token_address;
 
             let amount = convert_amount(icp_amount, s.token_decimals, decimals)?;
@@ -2094,13 +2221,7 @@ pub mod state {
             let amount: u64 = amount
                 .try_into()
                 .map_err(|_| format!("amount is too large: {}", amount))?;
-            let from_pk = derive_schnorr_public_key(
-                &s.ed25519_public_key,
-                vec![from.as_slice().to_vec()],
-                None,
-            )
-            .map_err(|e| format!("derive_schnorr_public_key failed: {e}"))?;
-            let from_addr = from_pk.to_svm_pubkey()?;
+            let from_addr = derive_svm_address(&s.ed25519_public_key, from)?;
             if &from_addr == to_addr {
                 return Err("from and to cannot be the same".to_string());
             }
@@ -2125,25 +2246,10 @@ pub mod state {
                 decimals,
             );
 
-            Ok::<_, String>((s.key_name.clone(), from_addr, vec![ix0, ix]))
+            Ok::<_, String>((from_addr, vec![ix0, ix]))
         })?;
 
-        let client = svm_client();
-        let block = client
-            .get_latest_blockhash(now_ms)
-            .await
-            .map_err(|err| format!("SOL: failed to get latest blockhash, error: {}", err))?;
-
-        let message = Message::new_with_blockhash(&ixs, Some(&from_addr), &block);
-        let msg = bincode::serialize(&message).map_err(|err| format!("SOL: {err}"))?;
-        let sig = sign_with_schnorr(key_name, vec![from.as_slice().to_vec()], msg, None).await?;
-        let signature: [u8; 64] = sig.try_into().map_err(|_| "invalid signature length")?;
-        let transaction = Transaction {
-            message,
-            signatures: vec![signature.into()],
-        };
-
-        Ok((client, transaction))
+        sign_svm_tx(from, from_addr, &ixs, now_ms).await
     }
 
     pub async fn build_sol_transfer_tx(
@@ -2156,32 +2262,41 @@ pub mod state {
             return Err("amount must be greater than 0".to_string());
         }
 
-        let (key_name, from_addr, ixs) = STATE.with_borrow(|s| {
-            let from_pk = derive_schnorr_public_key(
-                &s.ed25519_public_key,
-                vec![from.as_slice().to_vec()],
-                None,
-            )
-            .map_err(|_e| "derive_schnorr_public_key failed".to_string())?;
-            let from_addr = from_pk.to_svm_pubkey()?;
+        let (from_addr, ixs) = STATE.with_borrow(|s| {
+            let from_addr = derive_svm_address(&s.ed25519_public_key, from)?;
             if &from_addr == to_addr {
                 return Err("from and to cannot be the same".to_string());
             }
 
             let ix = system_transfer_instruction(&from_addr, to_addr, sol_amount);
-            Ok::<_, String>((s.key_name.clone(), from_addr, vec![ix]))
+            Ok::<_, String>((from_addr, vec![ix]))
         })?;
 
+        sign_svm_tx(from, from_addr, &ixs, now_ms).await
+    }
+
+    /// Attaches a recent blockhash and the signature of `from` to the planned
+    /// instructions, with `from_addr` — the address `from` derives to — as
+    /// the fee payer.
+    async fn sign_svm_tx(
+        from: &Principal,
+        from_addr: Pubkey,
+        ixs: &[Instruction],
+        now_ms: u64,
+    ) -> Result<(SvmClient<DefaultHttpOutcall>, Transaction), String> {
+        let key_name = STATE.with_borrow(|s| s.key_name.clone());
         let client = svm_client();
         let block = client
             .get_latest_blockhash(now_ms)
             .await
-            .map_err(|err| format!("failed to get latest blockhash, error: {}", err))?;
+            .map_err(|err| format!("failed to get latest blockhash, error: {err}"))?;
 
-        let message = Message::new_with_blockhash(&ixs, Some(&from_addr), &block);
-        let msg = bincode::serialize(&message).map_err(|err| format!("SOL: {err}"))?;
-        let sig = sign_with_schnorr(key_name, vec![from.as_slice().to_vec()], msg, None).await?;
-        let signature: [u8; 64] = sig.try_into().map_err(|_| "invalid signature length")?;
+        let message = Message::new_with_blockhash(ixs, Some(&from_addr), &block);
+        let msg = bincode::serialize(&message).map_err(|err| err.to_string())?;
+        let sig = sign_with_schnorr(key_name, vec![from.as_slice().to_vec()], msg).await?;
+        let signature: [u8; 64] = sig
+            .try_into()
+            .map_err(|_| "invalid signature length".to_string())?;
         let transaction = Transaction {
             message,
             signatures: vec![signature.into()],
@@ -2200,7 +2315,7 @@ fn y_parity(prehash: &[u8], sig: &[u8], pubkey: &[u8]) -> Result<bool, String> {
         let recid = RecoveryId::try_from(parity).map_err(format_error)?;
         let recovered_key = match VerifyingKey::recover_from_prehash(prehash, &signature, recid) {
             Ok(k) => k,
-            Err(_) => continue, // 尝试另一 parity
+            Err(_) => continue, // try the other parity
         };
         if recovered_key == orig_key {
             return Ok(parity == 1);
@@ -2218,6 +2333,91 @@ fn y_parity(prehash: &[u8], sig: &[u8], pubkey: &[u8]) -> Result<bool, String> {
 mod tests {
     use super::*;
     use crate::outcall::tests::{MockHttpOutcall, success_response};
+    use ic_stable_structures::VectorMemory;
+
+    fn principal(bytes: &[u8]) -> Principal {
+        Principal::from_slice(bytes)
+    }
+
+    #[test]
+    fn user_log_index_keeps_each_users_ids_contiguous_and_ordered() {
+        let mut index: StableBTreeMap<UserLogKey, (), VectorMemory> =
+            StableBTreeMap::new(VectorMemory::default());
+
+        // principals of different lengths, one a byte-prefix of another: the
+        // length-first encoding must keep their ranges apart
+        let short = principal(&[1, 2, 3]);
+        let long = principal(&[1, 2, 3, 4, 5]);
+        let longest = principal(&[0xff; Principal::MAX_LENGTH_IN_BYTES]);
+        for (user, ids) in [
+            (&short, vec![1, 5, 9]),
+            (&long, vec![2, 3, 8]),
+            (&longest, vec![4, 6, 7]),
+        ] {
+            for id in ids {
+                index.insert(UserLogKey::new(user, id), ());
+            }
+        }
+
+        assert_eq!(user_log_ids(&index, &short, u64::MAX, 10), vec![9, 5, 1]);
+        assert_eq!(user_log_ids(&index, &long, u64::MAX, 10), vec![8, 3, 2]);
+        assert_eq!(user_log_ids(&index, &longest, u64::MAX, 10), vec![7, 6, 4]);
+
+        // `before` is exclusive and `take` is a page size, as `my_finalized_logs` needs
+        assert_eq!(user_log_ids(&index, &short, 9, 10), vec![5, 1]);
+        assert_eq!(user_log_ids(&index, &short, u64::MAX, 2), vec![9, 5]);
+        assert_eq!(user_log_ids(&index, &short, 0, 10), Vec::<u64>::new());
+        assert_eq!(
+            user_log_ids(&index, &Principal::anonymous(), u64::MAX, 10),
+            Vec::<u64>::new()
+        );
+
+        let key = UserLogKey::new(&longest, u64::MAX - 1);
+        assert_eq!(key.log_id(), u64::MAX - 1);
+        assert_eq!(UserLogKey::from_bytes(key.to_bytes()), key);
+    }
+
+    #[test]
+    fn legacy_user_log_index_is_copied_exactly_once() {
+        let mut legacy: StableBTreeMap<Principal, LegacyUserLogs, VectorMemory> =
+            StableBTreeMap::new(VectorMemory::default());
+        let mut index: StableBTreeMap<UserLogKey, (), VectorMemory> =
+            StableBTreeMap::new(VectorMemory::default());
+
+        let alice = principal(&[1; 29]);
+        let bob = principal(&[2; 10]);
+        legacy.insert(
+            alice,
+            LegacyUserLogs {
+                logs: BTreeSet::from([0, 2, 5]),
+            },
+        );
+        legacy.insert(
+            bob,
+            LegacyUserLogs {
+                logs: BTreeSet::from([1, 3, 4]),
+            },
+        );
+
+        assert_eq!(copy_legacy_user_log_index(&legacy, &mut index), 6);
+        assert_eq!(user_log_ids(&index, &alice, u64::MAX, 10), vec![5, 2, 0]);
+        assert_eq!(user_log_ids(&index, &bob, u64::MAX, 10), vec![4, 3, 1]);
+
+        // a second upgrade finds the index filled and leaves it alone
+        index.insert(UserLogKey::new(&bob, 6), ());
+        assert_eq!(copy_legacy_user_log_index(&legacy, &mut index), 0);
+        assert_eq!(user_log_ids(&index, &bob, u64::MAX, 10), vec![6, 4, 3, 1]);
+    }
+
+    #[test]
+    fn erc20_gas_limit_must_be_plausible() {
+        assert!(validate_erc20_gas_limit(21_000).is_ok());
+        assert!(validate_erc20_gas_limit(DEFAULT_ERC20_GAS_LIMIT).is_ok());
+        assert!(validate_erc20_gas_limit(1_000_000).is_ok());
+        assert!(validate_erc20_gas_limit(20_999).is_err());
+        assert!(validate_erc20_gas_limit(1_000_001).is_err());
+        assert!(validate_erc20_gas_limit(0).is_err());
+    }
 
     #[test]
     fn finalization_shares_latest_block_outcalls_per_chain() {

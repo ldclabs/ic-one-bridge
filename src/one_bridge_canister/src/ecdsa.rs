@@ -3,7 +3,8 @@ use serde_bytes::ByteBuf;
 
 use crate::{helper::format_error, types::PublicKeyOutput};
 
-/// Returns a valid extended BIP-32 derivation path from an Account (Principal + subaccount)
+/// Derives the public key at `derivation_path` under `ecdsa_public_key`, the
+/// same way the management canister derives the key it signs with.
 pub fn derive_public_key(
     ecdsa_public_key: &PublicKeyOutput,
     derivation_path: Vec<Vec<u8>>,

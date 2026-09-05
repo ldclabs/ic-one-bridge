@@ -100,6 +100,10 @@ dfx deploy one_bridge_canister --argument "(opt variant {Init =
 100 PANDA and 10,000 PANDA. Neither has a setter: changing them later means an upgrade that passes
 new `UpgradeArgs`, and an omitted field keeps its stored value.
 
+`erc20_gas_limit` is the gas limit of the token's ERC-20 `transfer` on every EVM chain. It is
+optional and defaults to 84,000, which fits a plain OpenZeppelin token; a token with more logic in
+its transfer needs a higher one, set the same way, at init or through `UpgradeArgs`.
+
 #### 2. Check info:
 ```bash
 dfx canister call one_bridge_canister info '()' --ic

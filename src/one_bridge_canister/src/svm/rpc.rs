@@ -3,7 +3,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use super::types::*;
-use crate::outcall::{HttpOutcall, LARGE_RESPONSE, SMALL_RESPONSE, json_rpc_call};
+use crate::outcall::{HttpOutcall, LARGE_RESPONSE, Replication, SMALL_RESPONSE, json_rpc_call};
 
 /// Commitment every request is made at. `confirmed` is the level a blockhash is
 /// fetched and a transaction is sent at; finality is checked separately against
@@ -34,10 +34,11 @@ impl<H: HttpOutcall> SvmClient<H> {
     pub async fn get_latest_blockhash(&self, now_ms: u64) -> Result<Hash, String> {
         let res: RpcContextValue<LatestBlockhash> = self
             .call(
-                format!("getLatestBlockhash-{now_ms}"),
+                now_ms,
                 "getLatestBlockhash",
                 &[json!({ "commitment": COMMITMENT })],
                 SMALL_RESPONSE,
+                Replication::Single,
             )
             .await?;
 
@@ -51,13 +52,14 @@ impl<H: HttpOutcall> SvmClient<H> {
     ) -> Result<Option<SignatureStatus>, String> {
         let res: RpcContextValue<Vec<Option<SignatureStatus>>> = self
             .call(
-                format!("getSignatureStatuses-{now_ms}"),
+                now_ms,
                 "getSignatureStatuses",
                 &[
                     Value::Array(vec![signature.into()]),
                     json!({ "searchTransactionHistory": true }),
                 ],
                 SMALL_RESPONSE,
+                Replication::Single,
             )
             .await?;
         res.value
@@ -76,7 +78,7 @@ impl<H: HttpOutcall> SvmClient<H> {
         transaction: ByteBufB64,
     ) -> Result<String, String> {
         self.call(
-            format!("sendTransaction-{now_ms}"),
+            now_ms,
             "sendTransaction",
             &[
                 Value::String(transaction.to_base64()),
@@ -87,6 +89,7 @@ impl<H: HttpOutcall> SvmClient<H> {
                 }),
             ],
             SMALL_RESPONSE,
+            Replication::Single,
         )
         .await
     }
@@ -98,13 +101,14 @@ impl<H: HttpOutcall> SvmClient<H> {
     ) -> Result<Option<UiAccount>, String> {
         let res: RpcContextValue<Option<UiAccount>> = self
             .call(
-                format!("getAccountInfo-{now_ms}-{pubkey}"),
+                now_ms,
                 "getAccountInfo",
                 &[
                     Value::String(pubkey.to_string()),
                     json!({ "commitment": COMMITMENT, "encoding": "jsonParsed" }),
                 ],
                 LARGE_RESPONSE,
+                Replication::Single,
             )
             .await?;
 
@@ -113,18 +117,20 @@ impl<H: HttpOutcall> SvmClient<H> {
 
     pub async fn call<T: DeserializeOwned>(
         &self,
-        idempotency_key: String,
+        now_ms: u64,
         method: &str,
         params: &[Value],
         max_response_bytes: u64,
+        replication: Replication,
     ) -> Result<T, String> {
         json_rpc_call(
             &self.outcall,
             &self.providers,
-            idempotency_key,
+            now_ms,
             method,
             params,
             max_response_bytes,
+            replication,
         )
         .await
     }
@@ -200,10 +206,11 @@ mod tests {
         let client = SvmClient::new(vec!["https://sol".to_string()], mock);
 
         let result: Result<Value, _> = futures::executor::block_on(client.call(
-            "key".to_string(),
+            1,
             "method",
             &[],
             SMALL_RESPONSE,
+            Replication::Single,
         ));
         assert!(result.unwrap_err().contains("custom error"));
     }

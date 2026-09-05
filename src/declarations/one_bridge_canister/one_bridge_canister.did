@@ -23,6 +23,9 @@ type InitArgs = record {
   min_threshold_to_bridge : nat;
   token_symbol : text;
   governance_canister : opt principal;
+  // Gas limit of the token's ERC-20 `transfer`; omitted, a limit that fits
+  // a plain OpenZeppelin token is used.
+  erc20_gas_limit : opt nat64;
   token_bridge_fee : nat;
   key_name : text;
   token_decimals : nat8;
@@ -52,6 +55,7 @@ type StateInfo = record {
   icp_address : principal;
   total_bridge_count : nat64;
   evm_token_contracts : vec record { text; record { text; nat8; nat64 } };
+  erc20_gas_limit : nat64;
   svm_providers : vec text;
   svm_token_address : record { text; nat8; text };
   token_bridge_fee : nat;
@@ -68,6 +72,7 @@ type UpgradeArgs = record {
   min_threshold_to_bridge : opt nat;
   token_symbol : opt text;
   governance_canister : opt principal;
+  erc20_gas_limit : opt nat64;
   token_bridge_fee : opt nat;
   token_ledger : opt principal;
   token_logo : opt text;

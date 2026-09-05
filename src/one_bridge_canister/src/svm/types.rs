@@ -34,7 +34,7 @@ impl LatestBlockhash {
 pub struct SignatureStatus {
     pub slot: u64,
     pub confirmations: Option<u64>,
-    // processed、confirmed 或 finalized
+    // `processed`, `confirmed` or `finalized`
     pub confirmation_status: Option<String>,
     pub err: Option<Value>,
 }

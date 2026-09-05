@@ -28,6 +28,11 @@ export interface InitArgs {
   'min_threshold_to_bridge' : bigint,
   'token_symbol' : string,
   'governance_canister' : [] | [Principal],
+  /**
+   * Gas limit of the token's ERC-20 `transfer`; omitted, a limit that fits
+   * a plain OpenZeppelin token is used.
+   */
+  'erc20_gas_limit' : [] | [bigint],
   'token_bridge_fee' : bigint,
   'key_name' : string,
   'token_decimals' : number,
@@ -65,6 +70,7 @@ export interface StateInfo {
   'icp_address' : Principal,
   'total_bridge_count' : bigint,
   'evm_token_contracts' : Array<[string, [string, number, bigint]]>,
+  'erc20_gas_limit' : bigint,
   'svm_providers' : Array<string>,
   'svm_token_address' : [string, number, string],
   'token_bridge_fee' : bigint,
@@ -81,6 +87,7 @@ export interface UpgradeArgs {
   'min_threshold_to_bridge' : [] | [bigint],
   'token_symbol' : [] | [string],
   'governance_canister' : [] | [Principal],
+  'erc20_gas_limit' : [] | [bigint],
   'token_bridge_fee' : [] | [bigint],
   'token_ledger' : [] | [Principal],
   'token_logo' : [] | [string],
