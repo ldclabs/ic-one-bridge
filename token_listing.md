@@ -2,7 +2,7 @@
 
 One Bridge is a cross-chain token bridge project based on a "lock/release" mechanism, running entirely on the Internet Computer (ICP) blockchain.
 
-Each token asset is managed by a dedicated ICP smart contract (canister). This canister already enables seamless multi-chain token transfers between ICP, Ethereum, BNB Chain, and other EVM-compatible networks, with future support planned for Solana and more blockchain networks.
+Each token asset is managed by a dedicated ICP smart contract (canister). This canister already enables seamless multi-chain token transfers between ICP, Ethereum, BNB Chain, and other EVM-compatible networks, and Solana.
 
 ## Application Requirements
 
@@ -23,3 +23,11 @@ Each token asset is managed by a dedicated ICP smart contract (canister). This c
 ## Deployment Guidelines
 
 TODO
+
+
+Supported assets must have fixed-unit transfer semantics. Solana mint extensions such as transfer
+fees and hooks are rejected for bridging; the ledger decimals and minting account are checked at
+initialization. The project must fund the tracked ICP ledger-fee budget and native gas reserves,
+configure independent official core RPC providers, and publish separate anonymous browser RPC
+endpoints when the internal providers require credentials. Governance must register any newly used
+admin methods and their matching validation functions before invoking them through SNS proposals.

@@ -12,6 +12,9 @@ fix:
 test:
 	@cargo test --workspace -- --nocapture
 
+integration-test:
+	@bash scripts/test-canister.sh
+
 # cargo install ic-wasm
 build-wasm:
 	cargo build --release --target wasm32-unknown-unknown --package one_bridge_canister

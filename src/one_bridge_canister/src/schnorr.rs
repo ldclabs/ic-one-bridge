@@ -35,11 +35,11 @@ pub fn derive_schnorr_public_key(
     })
 }
 
-pub async fn sign_with_schnorr(
+pub async fn sign_with_schnorr_result(
     key_name: String,
     derivation_path: Vec<Vec<u8>>,
     message: Vec<u8>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, crate::helper::CallFailure> {
     let args = mgt::SignWithSchnorrArgs {
         message,
         derivation_path,
@@ -52,7 +52,7 @@ pub async fn sign_with_schnorr(
 
     let rt = mgt::sign_with_schnorr(&args)
         .await
-        .map_err(|err| format!("sign_with_schnorr failed: {:?}", err))?;
+        .map_err(crate::helper::signature_failure)?;
 
     Ok(rt.signature)
 }

@@ -4,16 +4,21 @@ on:
     tags:
       - "v*"
 jobs:
+  verify:
+    uses: ./.github/workflows/test.yml
   test:
-    runs-on: ubuntu-latest
+    needs: verify
+    runs-on: ubuntu-24.04
+    container: rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build canisters
         run: |
           mkdir -p out
-          rustup update --no-self-update stable
-          rustup target add wasm32-unknown-unknown
+          rustup show active-toolchain
           # ic-wasm dropped its bundled wasm-opt in 0.11, so the optimize
           # subcommand no longer exists; both tools are pinned so a release
           # rebuilt later produces the same bytes.
@@ -55,12 +60,12 @@ jobs:
               --inline-functions-with-loops \
               "$WASM" -o "$WASM.optimized"
             mv "$WASM.optimized" "$WASM"
-            gzip $WASM
+            gzip -n $WASM
             SHA256="$(sha256sum < "out/$CAN.wasm.gz" | sed 's/ .*$//g')"
             echo $SHA256 > "out/$CAN.wasm.gz.$SHA256.txt"
           done
           ls -lah out
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: out/*

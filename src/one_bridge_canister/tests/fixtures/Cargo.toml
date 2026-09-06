@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "bridge-test-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+legacy = []
+
+[dependencies]
+candid = "=0.10.35"
+ic-cdk = "=0.20.0"
+ic-stable-structures = "=0.7.2"
+ic_auth_types = "=0.10.1"
+icrc-ledger-types = "=0.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+alloy-primitives = { version = "=1.6.1", features = ["serde"] }
+ic-dummy-getrandom-for-wasm = "0.1"
+
+[profile.release]
+lto = true
+opt-level = "s"
+codegen-units = 1
+strip = true

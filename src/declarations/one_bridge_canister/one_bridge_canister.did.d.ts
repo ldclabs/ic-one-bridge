@@ -2,14 +2,14 @@ import type { Principal } from '@icp-sdk/core/principal';
 import type { ActorMethod } from '@icp-sdk/core/agent';
 import type { IDL } from '@icp-sdk/core/candid';
 
+export interface Account {
+  'owner' : Principal,
+  'subaccount' : [] | [Uint8Array | number[]],
+}
 export interface BridgeLog {
   'id' : [] | [bigint],
   'to' : BridgeTarget,
   'fee' : bigint,
-  /**
-   * When the payout was first attempted, in ms, or 0. The ledger dedup key
-   * of an ICP payout is built from it, so every attempt shares it.
-   */
   'payout_started_at' : bigint,
   'to_tx' : [] | [BridgeTx],
   'from_meta' : [] | [TxMeta],
@@ -20,13 +20,9 @@ export interface BridgeLog {
   'from_tx' : BridgeTx,
   'created_at' : bigint,
   'error' : [] | [string],
-  /**
-   * The error is the task's own and will not clear by itself: an
-   * administrator has to retry or close the task. It blocks nothing else
-   * meanwhile.
-   */
   'stuck' : boolean,
   'icp_amount' : bigint,
+  'runtime' : [] | [LogRuntime],
   'finalized_at' : bigint,
 }
 export type BridgeTarget = { 'Evm' : string } |
@@ -37,14 +33,26 @@ export type BridgeTx = { 'Evm' : [boolean, Uint8Array | number[]] } |
   { 'Sol' : [boolean, Uint8Array | number[]] };
 export type CanisterArgs = { 'Upgrade' : UpgradeArgs } |
   { 'Init' : InitArgs };
+export interface DepositPlan {
+  'to' : BridgeTarget,
+  'fee' : bigint,
+  'to_addr' : [] | [string],
+  'from' : BridgeTarget,
+  'user' : Principal,
+  'ledger' : Principal,
+  'amount' : bigint,
+}
+export interface EvmFeeLimits {
+  'max_priority_fee_per_gas' : bigint,
+  'max_hourly_fee' : bigint,
+  'max_fee_per_gas' : bigint,
+  'max_transaction_fee' : bigint,
+}
 export interface InitArgs {
+  'resource_limits' : [] | [ResourceLimits],
   'min_threshold_to_bridge' : bigint,
   'token_symbol' : string,
   'governance_canister' : [] | [Principal],
-  /**
-   * Gas limit of the token's ERC-20 `transfer`; omitted, a limit that fits
-   * a plain OpenZeppelin token is used.
-   */
   'erc20_gas_limit' : [] | [bigint],
   'token_bridge_fee' : bigint,
   'key_name' : string,
@@ -52,6 +60,68 @@ export interface InitArgs {
   'token_ledger' : Principal,
   'token_logo' : string,
   'token_name' : string,
+}
+export interface LogRuntime {
+  'next_poll_at' : bigint,
+  'task_id' : bigint,
+  'poll_attempts' : number,
+  'payout_attempt' : [] | [bigint],
+  'payout_resolution' : [] | [PayoutResolution],
+  'ledger' : [] | [Principal],
+  'error_chain' : [] | [BridgeTarget],
+}
+export interface OperationInfo {
+  'id' : bigint,
+  'owner' : Principal,
+  'request' : [] | [RequestInfo],
+  'kind' : string,
+  'signed_tx' : [] | [BridgeTx],
+  'deposit' : [] | [DepositPlan],
+  'created_at' : bigint,
+  'error' : [] | [string],
+  'related_task' : [] | [BridgeLog],
+  'phase' : Phase,
+  'revision' : bigint,
+  'reconciliation' : [] | [Reconciliation],
+}
+export type PayoutResolution = { 'Failed' : null } |
+  { 'Completed' : null } |
+  { 'Expired' : null } |
+  { 'Incomplete' : null };
+export type Phase = { 'Prepared' : null } |
+  { 'Recorded' : null } |
+  { 'Rejected' : string } |
+  { 'NeedsReview' : string } |
+  { 'Submitted' : null } |
+  { 'Planning' : null } |
+  { 'Signed' : null } |
+  { 'Completed' : BridgeTx };
+export interface Reconciliation {
+  'controller' : Principal,
+  'resolution' : Resolution,
+  'evidence' : string,
+}
+export type RequestInfo = { 'LegacyPayout' : BridgeLog } |
+  { 'Transfer' : [Principal, TransferArg] } |
+  {
+    'Signature' : {
+      'validity' : [] | [SolValidity],
+      'scheme' : string,
+      'deadline' : TxDeadline,
+      'sender' : Principal,
+      'message_hash' : Uint8Array | number[],
+    }
+  } |
+  { 'TransferFrom' : [Principal, TransferFromArgs] };
+export type Resolution = { 'NotExecuted' : null } |
+  { 'Completed' : BridgeTx };
+export interface ResourceLimits {
+  'max_pending' : number,
+  'requests_per_user_hour' : number,
+  'max_pending_per_user' : number,
+  'min_cycles_reserve' : bigint,
+  'requests_per_hour' : number,
+  'max_active_requests' : number,
 }
 export type Result = { 'Ok' : null } |
   { 'Err' : string };
@@ -71,6 +141,13 @@ export type Result_7 = { 'Ok' : Array<BridgeLog> } |
   { 'Err' : string };
 export type Result_8 = { 'Ok' : StateInfo } |
   { 'Err' : string };
+export type Result_9 = { 'Ok' : Array<OperationInfo> } |
+  { 'Err' : string };
+export interface SolValidity {
+  'blockhash' : string,
+  'last_valid_block_height' : bigint,
+  'context_slot' : bigint,
+}
 export interface StateInfo {
   'total_withdrawn_fees' : bigint,
   'error_rounds' : bigint,
@@ -96,37 +173,54 @@ export interface StateInfo {
   'token_ledger' : Principal,
   'token_logo' : string,
   'token_name' : string,
+  'runtime' : [] | [StateRuntimeInfo],
   'icp_collected_fees' : bigint,
   'sub_bridges' : Array<Principal>,
 }
-/**
- * The point past which a transaction can never be included any more.
- */
-export type TxDeadline = {
-    /**
-     * EVM: the nonce it spends. Once the sender's nonce has moved past it
-     * without it being mined, another transaction took its place.
-     */
-    'Nonce' : bigint
-  } |
-  {
-    /**
-     * Solana: the last block height its blockhash is valid at.
-     */
-    'BlockHeight' : bigint
-  };
-/**
- * What a round needs to know about a transaction besides its hash: how to
- * tell that it is dead, and how to broadcast it again while it is not.
- */
+export interface StateRuntimeInfo {
+  'icp_transfer_fees' : bigint,
+  'resource_limits' : ResourceLimits,
+  'pending_count' : bigint,
+  'ledger_verified' : boolean,
+  'keys_ready' : [boolean, boolean],
+  'legacy_fees_recognized' : bigint,
+  'ledger_fee_credit' : bigint,
+  'migration_remaining' : bigint,
+  'evm_provider_hosts' : Array<[string, Array<string>]>,
+  'svm_provider_hosts' : Array<string>,
+  'available_icp_fees' : bigint,
+  'reserved_icp_fees' : bigint,
+  'evm_fee_limits' : Array<[string, EvmFeeLimits]>,
+  'spendable_icp_fees' : bigint,
+  'unresolved_operations' : bigint,
+  'svm_mint_verified' : boolean,
+}
+export interface TransferArg {
+  'to' : Account,
+  'fee' : [] | [bigint],
+  'memo' : [] | [Uint8Array | number[]],
+  'from_subaccount' : [] | [Uint8Array | number[]],
+  'created_at_time' : [] | [bigint],
+  'amount' : bigint,
+}
+export interface TransferFromArgs {
+  'to' : Account,
+  'fee' : [] | [bigint],
+  'spender_subaccount' : [] | [Uint8Array | number[]],
+  'from' : Account,
+  'memo' : [] | [Uint8Array | number[]],
+  'created_at_time' : [] | [bigint],
+  'amount' : bigint,
+}
+export type TxDeadline = { 'Nonce' : bigint } |
+  { 'BlockHeight' : bigint };
 export interface TxMeta {
-  /**
-   * The signed transaction, kept while it is unconfirmed.
-   */
   'raw' : [] | [Uint8Array | number[]],
+  'svm_validity' : [] | [SolValidity],
   'deadline' : TxDeadline,
 }
 export interface UpgradeArgs {
+  'resource_limits' : [] | [ResourceLimits],
   'min_threshold_to_bridge' : [] | [bigint],
   'token_symbol' : [] | [string],
   'governance_canister' : [] | [Principal],
@@ -140,83 +234,64 @@ export interface _SERVICE {
   'admin_add_bridges' : ActorMethod<[Array<Principal>], Result>,
   'admin_add_evm_contract' : ActorMethod<[string, bigint, string], Result>,
   'admin_add_svm_contract' : ActorMethod<[string], Result>,
-  /**
-   * Removes a stuck bridging task from the pending queue and archives it with its
-   * error preserved, unblocking the chains it references.
-   * 
-   * The task is recorded as not bridged: the amount and the fee are left out of
-   * the totals, and settling with the user is up to the administrator — prefer
-   * `admin_retry_bridging_task` with a refund target. A task whose payout is
-   * broadcast but not confirmed is refused unless `force` is set.
-   */
   'admin_close_bridging_task' : ActorMethod<
     [BridgeTx, [] | [boolean]],
     Result_1
   >,
-  /**
-   * Withdraws collected fees. Only the fees that sit on the ICP ledger — those
-   * of tasks deposited on ICP — can be taken from it; a task deposited on
-   * another chain left its fee there.
-   */
   'admin_collect_fees' : ActorMethod<[Principal, bigint], Result_2>,
-  /**
-   * Fetches whichever of the subnet master keys the canister is still
-   * missing, and returns the bridge's EVM and Solana addresses. Bridging that
-   * needs a missing key is refused until it is there.
-   */
   'admin_init_public_keys' : ActorMethod<[], Result_3>,
+  'admin_operations' : ActorMethod<
+    [Principal, number, [] | [bigint]],
+    Array<OperationInfo>
+  >,
+  'admin_recheck_task' : ActorMethod<[BridgeTx], Result>,
+  'admin_recognize_legacy_fees' : ActorMethod<[bigint, string], Result>,
   'admin_remove_bridges' : ActorMethod<[Array<Principal>], Result>,
-  /**
-   * Resets the error circuit breaker and re-arms the finalization timer chain.
-   * 
-   * Once `error_rounds` reaches its limit, new tasks are refused and the rounds
-   * slow to an hourly cooldown that lifts the pause by itself after a clean
-   * round. Use this to lift it right away once the cause has been dealt with.
-   */
+  'admin_resolve_legacy_payout' : ActorMethod<
+    [BridgeTx, bigint, Resolution, string],
+    Result
+  >,
+  'admin_resolve_operation' : ActorMethod<
+    [bigint, bigint, Resolution, string],
+    Result
+  >,
   'admin_restart_bridging' : ActorMethod<[], Result_4>,
-  /**
-   * Drops the outgoing transaction and the error of a stuck bridging task so
-   * the next finalization round pays it out afresh, optionally somewhere else.
-   * 
-   * `to` and `to_addr` replace the task's target: a corrected address, the
-   * user's own address on the same chain (`to_addr = null`), or the chain the
-   * deposit came from — a refund. They are vetted like a `bridge()` call's.
-   * 
-   * Only use this after verifying on chain that the recorded outgoing
-   * transaction moved no funds (an EVM transaction that reverted, or a Solana
-   * transaction whose blockhash expired without landing). Retrying a payout that
-   * did go through pays the recipient twice.
-   */
   'admin_retry_bridging_task' : ActorMethod<
     [BridgeTx, [] | [BridgeTarget], [] | [string]],
     Result_1
   >,
-  /**
-   * Sets the RPC providers of an EVM chain and when a transaction on it counts
-   * as final: after `max_confirmations` blocks, or, when it is `0`, once the
-   * chain's own `finalized` block tag has passed it. The tag is the safer
-   * choice on every chain that supports it.
-   */
+  'admin_set_evm_fee_limits' : ActorMethod<[string, EvmFeeLimits], Result>,
   'admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
     Result
   >,
+  'admin_set_public_providers' : ActorMethod<[string, Array<string>], Result>,
+  'admin_set_resource_limits' : ActorMethod<[ResourceLimits], Result>,
   'admin_set_svm_providers' : ActorMethod<[Array<string>], Result>,
   'bridge' : ActorMethod<[string, string, bigint, [] | [string]], Result_2>,
+  'bridge_with_id' : ActorMethod<
+    [string, string, bigint, [] | [string], Uint8Array | number[]],
+    Result_2
+  >,
+  'cancel_operation' : ActorMethod<[bigint], Result>,
   'erc20_transfer' : ActorMethod<[string, string, bigint], Result_5>,
   'erc20_transfer_tx' : ActorMethod<[string, string, bigint], Result_5>,
   'evm_address' : ActorMethod<[[] | [Principal]], Result_5>,
   'evm_sign' : ActorMethod<[Uint8Array | number[]], Result_6>,
   'evm_transfer_tx' : ActorMethod<[string, string, bigint], Result_5>,
   'finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_7>,
+  'fund_ledger_fees' : ActorMethod<[bigint], Result_2>,
   'info' : ActorMethod<[], Result_8>,
   'my_bridge_log' : ActorMethod<[BridgeTx], Result_1>,
   'my_finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_7>,
+  'my_operations' : ActorMethod<[number, [] | [bigint]], Result_9>,
   'my_pending_logs' : ActorMethod<[], Result_7>,
-  /**
-   * The oldest pending tasks, at most `PENDING_LOGS_LIMIT` of them.
-   */
+  'my_pending_logs_page' : ActorMethod<[number, [] | [bigint]], Result_7>,
   'pending_logs' : ActorMethod<[], Result_7>,
+  'pending_logs_page' : ActorMethod<[number, [] | [bigint]], Result_7>,
+  'recheck_task' : ActorMethod<[BridgeTx], Result>,
+  'resume_deposit' : ActorMethod<[bigint], Result_2>,
+  'resume_operation' : ActorMethod<[bigint], Result_2>,
   'sol_transfer_tx' : ActorMethod<[string, bigint], Result_5>,
   'spl_transfer_tx' : ActorMethod<[string, bigint], Result_5>,
   'svm_address' : ActorMethod<[[] | [Principal]], Result_5>,
@@ -232,14 +307,39 @@ export interface _SERVICE {
   >,
   'validate_admin_collect_fees' : ActorMethod<[Principal, bigint], Result_5>,
   'validate_admin_init_public_keys' : ActorMethod<[], Result_5>,
+  'validate_admin_recheck_task' : ActorMethod<[BridgeTx], Result_5>,
+  'validate_admin_recognize_legacy_fees' : ActorMethod<
+    [bigint, string],
+    Result_5
+  >,
   'validate_admin_remove_bridges' : ActorMethod<[Array<Principal>], Result_5>,
+  'validate_admin_resolve_legacy_payout' : ActorMethod<
+    [BridgeTx, bigint, Resolution, string],
+    Result_5
+  >,
+  'validate_admin_resolve_operation' : ActorMethod<
+    [bigint, bigint, Resolution, string],
+    Result_5
+  >,
   'validate_admin_restart_bridging' : ActorMethod<[], Result_5>,
   'validate_admin_retry_bridging_task' : ActorMethod<
     [BridgeTx, [] | [BridgeTarget], [] | [string]],
     Result_5
   >,
+  'validate_admin_set_evm_fee_limits' : ActorMethod<
+    [string, EvmFeeLimits],
+    Result_5
+  >,
   'validate_admin_set_evm_providers' : ActorMethod<
     [string, bigint, Array<string>],
+    Result_5
+  >,
+  'validate_admin_set_public_providers' : ActorMethod<
+    [string, Array<string>],
+    Result_5
+  >,
+  'validate_admin_set_resource_limits' : ActorMethod<
+    [ResourceLimits],
     Result_5
   >,
   'validate_admin_set_svm_providers' : ActorMethod<[Array<string>], Result_5>,

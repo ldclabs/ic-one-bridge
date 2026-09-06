@@ -50,8 +50,21 @@ pub async fn sign_with_ecdsa(
     derivation_path: Vec<Vec<u8>>,
     message_hash: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
+    sign_with_ecdsa_result(key_name, derivation_path, message_hash)
+        .await
+        .map_err(|e| e.message)
+}
+
+pub async fn sign_with_ecdsa_result(
+    key_name: String,
+    derivation_path: Vec<Vec<u8>>,
+    message_hash: Vec<u8>,
+) -> Result<Vec<u8>, crate::helper::CallFailure> {
     if message_hash.len() != 32 {
-        return Err("message must be 32 bytes".to_string());
+        return Err(crate::helper::CallFailure {
+            ambiguous: false,
+            message: "message must be 32 bytes".to_string(),
+        });
     }
 
     let args = mgt::SignWithEcdsaArgs {
@@ -65,7 +78,7 @@ pub async fn sign_with_ecdsa(
 
     let rt = mgt::sign_with_ecdsa(&args)
         .await
-        .map_err(|err| format!("sign_with_ecdsa failed {:?}", err))?;
+        .map_err(crate::helper::signature_failure)?;
 
     Ok(rt.signature)
 }

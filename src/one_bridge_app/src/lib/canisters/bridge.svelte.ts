@@ -351,7 +351,7 @@ export class BridgeCanisterAPI {
     }
     const [_maxConfirmations, providerUrls] = provider[1]
     if (providerUrls.length === 0) {
-      throw new Error(`EVM provider URLs for chain ${chain} is empty`)
+      throw new Error(`Public browser RPC endpoints for ${chain} are not configured; the bridge administrator must publish anonymous endpoints`)
     }
 
     const api = new EvmRpc(providerUrls, contract[1][0])

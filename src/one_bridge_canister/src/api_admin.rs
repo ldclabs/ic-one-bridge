@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use crate::{
     helper::{now_ms, pretty_format, validate_principals},
     store,
-    svm::{Pubkey, get_mint_decimals},
+    svm::Pubkey,
 };
 
 /// Chain names are keys of the EVM configuration and prefixes of the errors
@@ -76,6 +76,24 @@ async fn admin_add_evm_contract(
     }
 
     store::state::with_mut(|s| {
+        if s.evm_token_contracts.len() >= 32 {
+            return Err("at most 32 EVM chains are supported".into());
+        }
+        if s.evm_token_contracts.contains_key(&chain_name)
+            || s.evm_token_contracts
+                .values()
+                .any(|(_, _, id)| *id == chain_id)
+        {
+            return Err("chain was registered while validation was in flight".into());
+        }
+        if s.evm_providers
+            .get(&chain_name)
+            .is_none_or(|(confirmations, providers)| {
+                *confirmations != cli.max_confirmations || *providers != cli.providers
+            })
+        {
+            return Err("providers changed while validating the chain".into());
+        }
         s.evm_token_contracts
             .insert(chain_name.clone(), (address, decimals, chain_id));
         s.evm_latest_gas
@@ -105,6 +123,9 @@ fn check_admin_add_evm_contract(
         .map_err(|err| format!("invalid address {address}: {err:?}"))?;
 
     store::state::with(|s| {
+        if s.evm_token_contracts.len() >= 32 {
+            return Err("at most 32 EVM chains are supported".into());
+        }
         if s.evm_token_contracts.contains_key(chain_name) {
             return Err("chain_name already exists".to_string());
         }
@@ -124,17 +145,18 @@ fn check_admin_add_evm_contract(
 async fn admin_add_svm_contract(address: String) -> Result<(), String> {
     let addr = check_admin_add_svm_contract(&address)?;
     let cli = store::state::svm_client();
-    let account = cli.get_account_info(&address).await?;
-    let account = account.ok_or_else(|| format!("account {address} does not exist"))?;
-    let token_program = Pubkey::try_from(account.owner.as_str())
-        .map_err(|err| format!("invalid token program address {}: {:?}", account.owner, err))?;
-    let decimals = get_mint_decimals(&account)
-        .map_err(|err| format!("account {address} is not a token mint account: {err}"))?;
+    let mint = cli.get_mint_config(&address).await?;
+    let token_program = Pubkey::try_from(mint.program.as_str()).map_err(|err| err.to_string())?;
 
     store::state::with_mut(|s| {
-        s.svm_token_address = (addr, decimals, token_program);
-    });
-    Ok(())
+        if s.svm_token_address.0 != Pubkey::default() || s.svm_providers != cli.providers {
+            return Err("Solana configuration changed while validation was in flight".into());
+        }
+        s.svm_token_address = (addr, mint.decimals, token_program);
+        s.svm_mint_verified = true;
+        s.svm_token_account_size = mint.token_account_size;
+        Ok(())
+    })
 }
 
 #[ic_cdk::update(guard = "is_controller")]
@@ -241,11 +263,24 @@ fn check_providers(providers: &[String]) -> Result<(), String> {
             providers.len()
         ));
     }
+    if providers.len() > 8 {
+        return Err("at most 8 providers are supported".into());
+    }
+    let identities = providers
+        .iter()
+        .map(|p| crate::outcall::provider_identity(p))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if identities.len() != providers.len() {
+        return Err("providers must have independent identities, not aliases of one host".into());
+    }
     let distinct: BTreeSet<&String> = providers.iter().collect();
     if distinct.len() != providers.len() {
         return Err("providers must be distinct".to_string());
     }
     for url in providers {
+        if url.len() > 2048 {
+            return Err("provider URL is too long".into());
+        }
         let uri = url
             .parse::<Uri>()
             .map_err(|err| format!("invalid url {url}, error: {err}"))?;
@@ -264,52 +299,13 @@ fn check_providers(providers: &[String]) -> Result<(), String> {
 /// another chain left its fee there.
 #[ic_cdk::update(guard = "is_controller")]
 async fn admin_collect_fees(to: Principal, icp_amount: u128) -> Result<store::BridgeTx, String> {
-    let ledger = store::state::with_mut(|s| {
-        if icp_amount == 0 {
-            return Err("amount must be greater than 0".to_string());
-        }
-        let available = available_fees(s);
-        if icp_amount > available {
-            return Err(format!(
-                "amount {} exceeds the fees available on the ICP ledger {}",
-                icp_amount, available
-            ));
-        }
-        s.total_withdrawn_fees = s
-            .total_withdrawn_fees
-            .checked_add(icp_amount)
-            .ok_or_else(|| "total_withdrawn_fees overflow".to_string())?;
-
-        Ok(s.token_ledger)
-    })?;
-
-    match store::state::to_icp(ledger, to, icp_amount, None).await {
-        Ok(tx) => Ok(tx),
-        Err(err) => {
-            store::state::with_mut(|s| {
-                s.total_withdrawn_fees = s.total_withdrawn_fees.saturating_sub(icp_amount);
-            });
-            Err(err.to_string())
-        }
-    }
+    store::state::collect_fees(ic_cdk::api::msg_caller(), to, icp_amount).await
 }
 
 #[ic_cdk::update(guard = "is_controller")]
-fn validate_admin_collect_fees(to: Principal, icp_amount: u128) -> Result<String, String> {
-    store::state::with(|s| {
-        if icp_amount == 0 {
-            return Err("icp_amount must be greater than 0".to_string());
-        }
-        let available = available_fees(s);
-        if icp_amount > available {
-            return Err(format!(
-                "icp_amount {} exceeds the fees available on the ICP ledger {}",
-                icp_amount, available
-            ));
-        }
-        Ok(())
-    })?;
-    pretty_format(&(to, icp_amount))
+async fn validate_admin_collect_fees(to: Principal, icp_amount: u128) -> Result<String, String> {
+    let (ledger_fee, available) = store::state::fee_withdrawal_preview(to, icp_amount).await?;
+    pretty_format(&(to, icp_amount, ledger_fee, available))
 }
 
 /// Resets the error circuit breaker and re-arms the finalization timer chain.
@@ -328,7 +324,7 @@ fn validate_admin_restart_bridging() -> Result<String, String> {
         (
             s.finalize_bridging_round,
             s.error_rounds,
-            s.pending.len() as u64,
+            store::pending::len(),
         )
     });
     pretty_format(&(round, error_rounds, pending))
@@ -361,9 +357,7 @@ fn validate_admin_retry_bridging_task(
     to_addr: Option<String>,
 ) -> Result<String, String> {
     let log = store::state::pending_task(&from_tx)?;
-    if log.to_tx.as_ref().is_some_and(|tx| tx.is_finalized()) {
-        return Err("the outgoing transaction is already finalized, nothing to retry".to_string());
-    }
+    store::state::can_retry_task(&log)?;
     store::state::with(|s| {
         store::state::plan_retry_redirect(s, &log, to.as_ref(), to_addr.as_deref())
     })?;
@@ -391,17 +385,7 @@ fn validate_admin_close_bridging_task(
     force: Option<bool>,
 ) -> Result<String, String> {
     let log = store::state::pending_task(&from_tx)?;
-    if log.is_finalized() {
-        return Err(
-            "the bridging task is already finalized and will be archived automatically".to_string(),
-        );
-    }
-    if log.payout_in_flight() && !force.unwrap_or(false) {
-        return Err(
-            "the payout has been broadcast and is not confirmed yet; pass force = true only once it is certain it can no longer land"
-                .to_string(),
-        );
-    }
+    store::state::can_close_task(&log, force.unwrap_or(false))?;
     pretty_format(&(log, force))
 }
 
@@ -411,6 +395,13 @@ fn validate_admin_close_bridging_task(
 #[ic_cdk::update(guard = "is_controller")]
 async fn admin_init_public_keys() -> Result<(String, String), String> {
     store::state::try_init_public_keys().await;
+    if store::state::with(|s| {
+        s.ecdsa_public_key.public_key.is_empty()
+            || s.ed25519_public_key.public_key.is_empty()
+            || !s.ledger_verified
+    }) {
+        return Err("public keys or ledger verification are still unavailable; check canister logs and retry".into());
+    }
     Ok(store::state::with(|s| {
         (s.evm_address.to_string(), s.svm_address.to_string())
     }))
@@ -425,10 +416,6 @@ fn validate_admin_init_public_keys() -> Result<String, String> {
         )
     });
     pretty_format(&(ecdsa, ed25519))
-}
-
-fn available_fees(s: &store::State) -> u128 {
-    s.icp_collected_fees.saturating_sub(s.total_withdrawn_fees)
 }
 
 fn is_controller() -> Result<(), String> {
@@ -486,4 +473,175 @@ mod tests {
         assert!(check_evm_chain_name("ICP").is_err());
         assert!(check_evm_chain_name("SOL").is_err());
     }
+}
+
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_set_resource_limits(limits: store::ResourceLimits) -> Result<(), String> {
+    limits.validate()?;
+    store::state::with_mut(|s| s.resource_limits = limits);
+    Ok(())
+}
+#[ic_cdk::update(guard = "is_controller")]
+fn validate_admin_set_resource_limits(limits: store::ResourceLimits) -> Result<String, String> {
+    limits.validate()?;
+    pretty_format(&(limits,))
+}
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_set_evm_fee_limits(chain: String, limits: store::EvmFeeLimits) -> Result<(), String> {
+    limits.validate()?;
+    store::state::with_mut(|s| {
+        if !s.evm_token_contracts.contains_key(&chain) {
+            return Err("unknown EVM chain".into());
+        }
+        s.evm_latest_gas.remove(&chain);
+        s.evm_fee_limits.insert(chain, limits);
+        Ok(())
+    })
+}
+#[ic_cdk::update(guard = "is_controller")]
+fn validate_admin_set_evm_fee_limits(
+    chain: String,
+    limits: store::EvmFeeLimits,
+) -> Result<String, String> {
+    limits.validate()?;
+    if !store::state::with(|s| s.evm_token_contracts.contains_key(&chain)) {
+        return Err("unknown EVM chain".into());
+    }
+    pretty_format(&(chain, limits))
+}
+#[ic_cdk::query(guard = "is_controller")]
+fn admin_operations(owner: Principal, take: u32, before: Option<u64>) -> Vec<store::OperationInfo> {
+    store::state::operations(owner, take as usize, before)
+}
+
+/// Explicit governance attestation after external accounting. This is not an
+/// automatic proof that an unknown payment failed. The current revision and the
+/// evidence must identify the exact intent; ordinary retry never performs this.
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_resolve_operation(
+    id: u64,
+    revision: u64,
+    resolution: store::Resolution,
+    evidence: String,
+) -> Result<(), String> {
+    store::state::resolve_operation(
+        id,
+        revision,
+        resolution,
+        evidence,
+        ic_cdk::api::msg_caller(),
+    )
+}
+#[ic_cdk::update(guard = "is_controller")]
+fn validate_admin_resolve_operation(
+    id: u64,
+    revision: u64,
+    resolution: store::Resolution,
+    evidence: String,
+) -> Result<String, String> {
+    store::state::validate_resolution(id, revision, &resolution, &evidence)?;
+    pretty_format(&(store::state::operation(id)?, resolution, evidence))
+}
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_resolve_legacy_payout(
+    from_tx: store::BridgeTx,
+    task_id: u64,
+    resolution: store::Resolution,
+    evidence: String,
+) -> Result<(), String> {
+    store::state::resolve_legacy_payout(
+        from_tx,
+        task_id,
+        resolution,
+        evidence,
+        ic_cdk::api::msg_caller(),
+    )
+}
+#[ic_cdk::update(guard = "is_controller")]
+fn validate_admin_resolve_legacy_payout(
+    from_tx: store::BridgeTx,
+    task_id: u64,
+    resolution: store::Resolution,
+    evidence: String,
+) -> Result<String, String> {
+    let operation =
+        store::state::validate_legacy_resolution(&from_tx, task_id, &resolution, &evidence)?;
+    pretty_format(&(operation, resolution, evidence))
+}
+
+/// Cumulative historical fee recognition after external backing reconciliation.
+/// The amount is a verified total, not an increment; duplicate proposals are idempotent.
+#[ic_cdk::update(guard = "is_controller")]
+async fn admin_recognize_legacy_fees(
+    total_verified_legacy_fees: u128,
+    evidence: String,
+) -> Result<(), String> {
+    store::state::recognize_legacy_fees(
+        total_verified_legacy_fees,
+        evidence,
+        ic_cdk::api::msg_caller(),
+    )
+    .await
+}
+#[ic_cdk::update(guard = "is_controller")]
+fn validate_admin_recognize_legacy_fees(
+    total_verified_legacy_fees: u128,
+    evidence: String,
+) -> Result<String, String> {
+    let increment =
+        store::state::validate_legacy_fee_recognition(total_verified_legacy_fees, &evidence)?;
+    pretty_format(&(total_verified_legacy_fees, increment, evidence))
+}
+
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_recheck_task(from_tx: store::BridgeTx) -> Result<(), String> {
+    store::state::recheck_task(&from_tx, ic_cdk::api::msg_caller(), true)
+}
+#[ic_cdk::update(guard = "is_controller")]
+fn validate_admin_recheck_task(from_tx: store::BridgeTx) -> Result<String, String> {
+    pretty_format(&(store::state::pending_task(&from_tx)?,))
+}
+
+fn check_public_providers(chain: &str, providers: &[String]) -> Result<(), String> {
+    if chain != "SOL" && !store::state::with(|s| s.evm_token_contracts.contains_key(chain)) {
+        return Err("unknown EVM chain".into());
+    }
+    if chain != "SOL" {
+        check_evm_chain_name(chain)?;
+    }
+    check_providers(providers)?;
+    for url in providers {
+        let uri = url
+            .parse::<Uri>()
+            .map_err(|_| "invalid public provider URL".to_string())?;
+        if uri.query().is_some() {
+            return Err("public browser RPCs must not contain query credentials".into());
+        }
+    }
+    Ok(())
+}
+/// These URLs are intentionally published for browser balance reads. Use only
+/// anonymous official endpoints; private core RPC URLs remain separate.
+#[ic_cdk::update(guard = "is_controller")]
+fn admin_set_public_providers(chain: String, providers: Vec<String>) -> Result<(), String> {
+    check_public_providers(&chain, &providers)?;
+    store::state::with_mut(|s| {
+        if chain == "SOL" {
+            s.public_svm_providers = Some(providers);
+        } else {
+            if !s.evm_token_contracts.contains_key(&chain) {
+                return Err("unknown EVM chain".into());
+            }
+            s.public_evm_providers.insert(chain, providers);
+        }
+        Ok(())
+    })
+}
+#[ic_cdk::update(guard = "is_controller")]
+fn validate_admin_set_public_providers(
+    chain: String,
+    providers: Vec<String>,
+) -> Result<String, String> {
+    check_public_providers(&chain, &providers)?;
+    pretty_format(&(chain, providers))
 }

@@ -36,13 +36,7 @@ fn svm_address(user: Option<Principal>) -> Result<String, String> {
 #[ic_cdk::query]
 fn my_pending_logs() -> Result<Vec<store::BridgeLog>, String> {
     let caller = msg_caller()?;
-    let rt = store::state::with(|s| {
-        s.pending
-            .iter()
-            .filter(|item| item.user == caller)
-            .cloned()
-            .collect()
-    });
+    let rt = store::pending::page(Some(caller), store::PENDING_LOGS_LIMIT, None);
     Ok(rt)
 }
 
@@ -70,13 +64,7 @@ fn my_bridge_log(from_tx: store::BridgeTx) -> Result<store::BridgeLog, String> {
 /// The oldest pending tasks, at most `PENDING_LOGS_LIMIT` of them.
 #[ic_cdk::query]
 fn pending_logs() -> Result<Vec<store::BridgeLog>, String> {
-    let rt = store::state::with(|s| {
-        s.pending
-            .iter()
-            .take(store::PENDING_LOGS_LIMIT)
-            .cloned()
-            .collect::<Vec<store::BridgeLog>>()
-    });
+    let rt = store::pending::page(None, store::PENDING_LOGS_LIMIT, None);
     Ok(rt)
 }
 
@@ -87,7 +75,7 @@ fn finalized_logs(take: u32, prev: Option<u64>) -> Result<Vec<store::BridgeLog>,
     Ok(rt)
 }
 
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "admit_request")]
 async fn bridge(
     from_chain: String,
     to_chain: String,
@@ -98,7 +86,7 @@ async fn bridge(
     store::state::bridge(from_chain, to_chain, icp_amount, to, caller, now_ms()).await
 }
 
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "admit_request")]
 async fn erc20_transfer_tx(chain: String, to: String, icp_amount: u128) -> Result<String, String> {
     let to_addr = parse_evm_address(&to)?;
     let caller = msg_caller()?;
@@ -116,7 +104,7 @@ async fn erc20_transfer_tx(chain: String, to: String, icp_amount: u128) -> Resul
     Ok(Bytes::from(data).to_string())
 }
 
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "admit_request")]
 async fn erc20_transfer(chain: String, to: String, icp_amount: u128) -> Result<String, String> {
     let to_addr = parse_evm_address(&to)?;
     let caller = msg_caller()?;
@@ -140,7 +128,7 @@ async fn erc20_transfer(chain: String, to: String, icp_amount: u128) -> Result<S
     Ok(tx_hash)
 }
 
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "admit_request")]
 async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<String, String> {
     let to_addr = parse_evm_address(&to)?;
     let caller = msg_caller()?;
@@ -158,7 +146,7 @@ async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<
     Ok(Bytes::from(data).to_string())
 }
 
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "admit_request")]
 async fn spl_transfer_tx(to: String, icp_amount: u128) -> Result<String, String> {
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
@@ -170,7 +158,7 @@ async fn spl_transfer_tx(to: String, icp_amount: u128) -> Result<String, String>
     Ok(ByteBufB64::from(data).to_base64())
 }
 
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "admit_request")]
 async fn sol_transfer_tx(to: String, sol_amount: u64) -> Result<String, String> {
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
@@ -182,7 +170,7 @@ async fn sol_transfer_tx(to: String, sol_amount: u64) -> Result<String, String> 
     Ok(ByteBufB64::from(data).to_base64())
 }
 
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "admit_request")]
 async fn evm_sign(message_hash: ByteBuf) -> Result<ByteBuf, String> {
     let caller = msg_caller()?;
     if message_hash.len() != 32 {
@@ -191,4 +179,85 @@ async fn evm_sign(message_hash: ByteBuf) -> Result<ByteBuf, String> {
 
     let sig = store::state::evm_sign(&caller, message_hash.into_vec()).await?;
     Ok(sig.into())
+}
+
+fn admit_request() -> Result<(), String> {
+    let caller = msg_caller()?;
+    if ic_cdk::api::is_controller(&caller)
+        || store::state::with(|s| s.governance_canister == Some(caller))
+    {
+        return Ok(());
+    }
+    store::budget::admit(caller)
+}
+
+#[ic_cdk::query]
+fn my_pending_logs_page(take: u32, after: Option<u64>) -> Result<Vec<store::BridgeLog>, String> {
+    Ok(store::pending::page(
+        Some(msg_caller()?),
+        take.clamp(1, 100) as usize,
+        after,
+    ))
+}
+
+#[ic_cdk::query]
+fn pending_logs_page(take: u32, after: Option<u64>) -> Result<Vec<store::BridgeLog>, String> {
+    Ok(store::pending::page(
+        None,
+        take.clamp(1, 100) as usize,
+        after,
+    ))
+}
+
+#[ic_cdk::query]
+fn my_operations(take: u32, before: Option<u64>) -> Result<Vec<store::OperationInfo>, String> {
+    Ok(store::state::operations(
+        msg_caller()?,
+        take as usize,
+        before,
+    ))
+}
+
+#[ic_cdk::update(guard = "admit_request")]
+async fn bridge_with_id(
+    from_chain: String,
+    to_chain: String,
+    amount: u128,
+    to: Option<String>,
+    request_id: ByteBuf,
+) -> Result<store::BridgeTx, String> {
+    store::state::bridge_with_id(
+        from_chain,
+        to_chain,
+        amount,
+        to,
+        msg_caller()?,
+        now_ms(),
+        Some(request_id),
+    )
+    .await
+}
+
+#[ic_cdk::update(guard = "admit_request")]
+async fn resume_deposit(operation_id: u64) -> Result<store::BridgeTx, String> {
+    store::state::resume_deposit(operation_id, msg_caller()?).await
+}
+
+#[ic_cdk::update(guard = "admit_request")]
+async fn fund_ledger_fees(amount: u128) -> Result<store::BridgeTx, String> {
+    store::state::fund_ledger_fees(msg_caller()?, amount).await
+}
+
+#[ic_cdk::update(guard = "admit_request")]
+async fn resume_operation(id: u64) -> Result<store::BridgeTx, String> {
+    store::state::resume_operation(id, msg_caller()?).await
+}
+#[ic_cdk::update]
+fn cancel_operation(id: u64) -> Result<(), String> {
+    store::state::cancel_operation(id, msg_caller()?)
+}
+
+#[ic_cdk::update(guard = "admit_request")]
+fn recheck_task(from_tx: store::BridgeTx) -> Result<(), String> {
+    store::state::recheck_task(&from_tx, msg_caller()?, false)
 }

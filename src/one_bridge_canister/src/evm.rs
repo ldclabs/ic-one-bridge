@@ -35,6 +35,8 @@ pub struct EvmLog {
 pub struct EvmReceipt {
     pub transaction_hash: TxHash,
     #[serde(default)]
+    pub block_hash: Option<B256>,
+    #[serde(default)]
     block_number: Option<U64>,
     status: U64,
     #[serde(default)]
@@ -85,9 +87,11 @@ pub fn same_or_absent(
     Ok(if a == b { a } else { None })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 struct BlockHeader {
     number: U64,
+    #[serde(default)]
+    hash: Option<B256>,
 }
 
 pub struct EvmClient<T: HttpOutcall> {
@@ -125,7 +129,7 @@ impl<H: HttpOutcall> EvmClient<H> {
             &[],
             SMALL_RESPONSE,
             hex_to_u128,
-            Agreement::First,
+            Agreement::Two(lower),
         )
         .await
     }
@@ -136,7 +140,7 @@ impl<H: HttpOutcall> EvmClient<H> {
             &[],
             SMALL_RESPONSE,
             hex_to_u128,
-            Agreement::First,
+            Agreement::Two(lower),
         )
         .await
     }
@@ -211,6 +215,26 @@ impl<H: HttpOutcall> EvmClient<H> {
         .await
     }
 
+    /// Called after the finality-height check. A receipt captured before an
+    /// intervening reorg must still belong to the canonical finalized prefix.
+    pub async fn receipt_is_canonical(&self, receipt: &EvmReceipt) -> Result<bool, String> {
+        let (Some(number), Some(hash)) = (receipt.block_number(), receipt.block_hash) else {
+            return Err("receipt is missing its block identity".into());
+        };
+        let header = self
+            .call(
+                "eth_getBlockByNumber",
+                &[format!("0x{number:x}").into(), false.into()],
+                LARGE_RESPONSE,
+                |header: Option<BlockHeader>| {
+                    header.ok_or_else(|| "receipt block is unavailable".to_string())
+                },
+                Agreement::Two(same),
+            )
+            .await?;
+        Ok(header.number.to::<u64>() == number && header.hash == Some(hash))
+    }
+
     /// Broadcasts a signed transaction.
     ///
     /// The result is deliberately decoded as an untyped [`Value`]: by the time it
@@ -246,12 +270,29 @@ impl<H: HttpOutcall> EvmClient<H> {
         tx_hash: &TxHash,
     ) -> Result<bool, String> {
         two_provider_verdict(&self.providers, "replacement check", |one| async move {
+            let tag = if self.max_confirmations == 0 {
+                "finalized".to_string()
+            } else {
+                let tip = json_rpc_call(
+                    &self.outcall,
+                    one,
+                    RpcCall {
+                        method: "eth_blockNumber",
+                        params: &[],
+                        max_response_bytes: SMALL_RESPONSE,
+                    },
+                    hex_to_u64,
+                    Agreement::First,
+                )
+                .await?;
+                format!("0x{:x}", tip.saturating_sub(self.max_confirmations))
+            };
             let current: u64 = json_rpc_call(
                 &self.outcall,
                 one,
                 RpcCall {
                     method: "eth_getTransactionCount",
-                    params: &[sender.to_string().into(), "latest".into()],
+                    params: &[sender.to_string().into(), tag.into()],
                     max_response_bytes: SMALL_RESPONSE,
                 },
                 hex_to_u64,
@@ -409,7 +450,7 @@ mod tests {
     fn client(mock: &MockHttpOutcall, providers: usize) -> EvmClient<MockHttpOutcall> {
         EvmClient::new(
             (0..providers).map(|i| format!("https://rpc{i}")).collect(),
-            5,
+            0,
             mock.clone(),
         )
     }
@@ -473,7 +514,7 @@ mod tests {
         );
 
         let mock = MockHttpOutcall::new(vec![
-            result(serde_json::json!({"number": "0x10", "hash": "0x00"})),
+            result(serde_json::json!({"number": "0x10", "hash": B256::ZERO})),
             result(serde_json::json!({"number": "0xf"})),
         ]);
         assert_eq!(
@@ -484,13 +525,17 @@ mod tests {
     }
 
     #[test]
-    fn gas_and_broadcasts_take_the_first_answer() {
-        let mock = MockHttpOutcall::new(vec![Err("down".into()), result("0x3b9aca00".into())]);
+    fn gas_requires_two_providers_and_broadcasts_require_one() {
+        let mock = MockHttpOutcall::new(vec![
+            Err("down".into()),
+            result("0x3b9aca00".into()),
+            result("0x77359400".into()),
+        ]);
         assert_eq!(
-            futures::executor::block_on(client(&mock, 2).gas_price()),
+            futures::executor::block_on(client(&mock, 3).gas_price()),
             Ok(1_000_000_000)
         );
-        assert_eq!(mock.urls().len(), 2);
+        assert_eq!(mock.urls().len(), 3);
 
         let mock = MockHttpOutcall::new(vec![result(Value::Null)]);
         assert!(
@@ -674,6 +719,29 @@ mod tests {
 
         assert_eq!(receipt.block_number(), Some(42));
         assert!(!receipt.succeeded());
+    }
+
+    #[test]
+    fn a_receipt_from_another_fork_cannot_be_confirmed_by_height_alone() {
+        let a: EvmReceipt = serde_json::from_value(receipt_json("0x1")).unwrap();
+        let mut value = receipt_json("0x1");
+        value["blockHash"] = serde_json::json!(B256::from([7; 32]));
+        let b: EvmReceipt = serde_json::from_value(value).unwrap();
+        assert!(same_or_absent(Some(a.clone()), Some(b)).unwrap().is_none());
+        let other =
+            serde_json::json!({"number":a.block_number().unwrap(),"hash":B256::from([7;32])});
+        let mock = MockHttpOutcall::new(vec![result(other.clone()), result(other)]);
+        assert_eq!(
+            futures::executor::block_on(client(&mock, 2).receipt_is_canonical(&a)),
+            Ok(false)
+        );
+        let canonical =
+            serde_json::json!({"number":a.block_number().unwrap(),"hash":a.block_hash.unwrap()});
+        let mock = MockHttpOutcall::new(vec![result(canonical.clone()), result(canonical)]);
+        assert_eq!(
+            futures::executor::block_on(client(&mock, 2).receipt_is_canonical(&a)),
+            Ok(true)
+        );
     }
 
     #[test]

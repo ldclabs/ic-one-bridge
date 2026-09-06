@@ -1,3 +1,6 @@
+// [Account](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-3/README.md#value)
+// representation of ledgers supporting the ICRC-1 standard.
+type Account = record { owner : principal; subaccount : opt blob };
 type BridgeLog = record {
   id : opt nat64;
   to : BridgeTarget;
@@ -19,6 +22,7 @@ type BridgeLog = record {
   // meanwhile.
   stuck : bool;
   icp_amount : nat;
+  runtime : opt LogRuntime;
   finalized_at : nat64;
 };
 type BridgeTarget = variant { Evm : text; Icp; Sol };
@@ -28,7 +32,23 @@ type BridgeTx = variant {
   Sol : record { bool; blob };
 };
 type CanisterArgs = variant { Upgrade : UpgradeArgs; Init : InitArgs };
+type DepositPlan = record {
+  to : BridgeTarget;
+  fee : nat;
+  to_addr : opt text;
+  from : BridgeTarget;
+  user : principal;
+  ledger : principal;
+  amount : nat;
+};
+type EvmFeeLimits = record {
+  max_priority_fee_per_gas : nat;
+  max_hourly_fee : nat;
+  max_fee_per_gas : nat;
+  max_transaction_fee : nat;
+};
 type InitArgs = record {
+  resource_limits : opt ResourceLimits;
   min_threshold_to_bridge : nat;
   token_symbol : text;
   governance_canister : opt principal;
@@ -42,6 +62,66 @@ type InitArgs = record {
   token_logo : text;
   token_name : text;
 };
+type LogRuntime = record {
+  next_poll_at : nat64;
+  task_id : nat64;
+  poll_attempts : nat32;
+  payout_attempt : opt nat64;
+  payout_resolution : opt PayoutResolution;
+  ledger : opt principal;
+  error_chain : opt BridgeTarget;
+};
+type OperationInfo = record {
+  id : nat64;
+  owner : principal;
+  request : opt RequestInfo;
+  kind : text;
+  signed_tx : opt BridgeTx;
+  deposit : opt DepositPlan;
+  created_at : nat64;
+  error : opt text;
+  related_task : opt BridgeLog;
+  phase : Phase;
+  revision : nat64;
+  reconciliation : opt Reconciliation;
+};
+type PayoutResolution = variant { Failed; Completed; Expired; Incomplete };
+type Phase = variant {
+  Prepared;
+  Recorded;
+  Rejected : text;
+  NeedsReview : text;
+  Submitted;
+  Planning;
+  Signed;
+  Completed : BridgeTx;
+};
+type Reconciliation = record {
+  controller : principal;
+  resolution : Resolution;
+  evidence : text;
+};
+type RequestInfo = variant {
+  LegacyPayout : BridgeLog;
+  Transfer : record { principal; TransferArg };
+  Signature : record {
+    validity : opt SolValidity;
+    scheme : text;
+    deadline : TxDeadline;
+    sender : principal;
+    message_hash : blob;
+  };
+  TransferFrom : record { principal; TransferFromArgs };
+};
+type Resolution = variant { NotExecuted; Completed : BridgeTx };
+type ResourceLimits = record {
+  max_pending : nat32;
+  requests_per_user_hour : nat32;
+  max_pending_per_user : nat32;
+  min_cycles_reserve : nat;
+  requests_per_hour : nat32;
+  max_active_requests : nat32;
+};
 type Result = variant { Ok; Err : text };
 type Result_1 = variant { Ok : BridgeLog; Err : text };
 type Result_2 = variant { Ok : BridgeTx; Err : text };
@@ -51,6 +131,13 @@ type Result_5 = variant { Ok : text; Err : text };
 type Result_6 = variant { Ok : blob; Err : text };
 type Result_7 = variant { Ok : vec BridgeLog; Err : text };
 type Result_8 = variant { Ok : StateInfo; Err : text };
+type Result_9 = variant { Ok : vec OperationInfo; Err : text };
+type SolValidity = record {
+  blockhash : text;
+  // Diagnostic only. Expiry is established for the actual blockhash.
+  last_valid_block_height : nat64;
+  context_slot : nat64;
+};
 type StateInfo = record {
   total_withdrawn_fees : nat;
   error_rounds : nat64;
@@ -76,8 +163,48 @@ type StateInfo = record {
   token_ledger : principal;
   token_logo : text;
   token_name : text;
+  runtime : opt StateRuntimeInfo;
   icp_collected_fees : nat;
   sub_bridges : vec principal;
+};
+type StateRuntimeInfo = record {
+  icp_transfer_fees : nat;
+  resource_limits : ResourceLimits;
+  pending_count : nat64;
+  ledger_verified : bool;
+  keys_ready : record { bool; bool };
+  legacy_fees_recognized : nat;
+  ledger_fee_credit : nat;
+  migration_remaining : nat64;
+  evm_provider_hosts : vec record { text; vec text };
+  svm_provider_hosts : vec text;
+  available_icp_fees : nat;
+  reserved_icp_fees : nat;
+  evm_fee_limits : vec record { text; EvmFeeLimits };
+  spendable_icp_fees : nat;
+  unresolved_operations : nat64;
+  svm_mint_verified : bool;
+};
+// The arguments for the [ICRC-1 `transfer`](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-1/README.md#icrc1_transfer-) endpoint.
+type TransferArg = record {
+  to : Account;
+  fee : opt nat;
+  memo : opt blob;
+  from_subaccount : opt blob;
+  created_at_time : opt nat64;
+  amount : nat;
+};
+// The arguments for the
+// [ICRC-2 `transfer_from`](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-2/README.md#icrc2_transfer_from)
+// endpoint.
+type TransferFromArgs = record {
+  to : Account;
+  fee : opt nat;
+  spender_subaccount : opt blob;
+  from : Account;
+  memo : opt blob;
+  created_at_time : opt nat64;
+  amount : nat;
 };
 // The point past which a transaction can never be included any more.
 type TxDeadline = variant {
@@ -92,9 +219,11 @@ type TxDeadline = variant {
 type TxMeta = record {
   // The signed transaction, kept while it is unconfirmed.
   raw : opt blob;
+  svm_validity : opt SolValidity;
   deadline : TxDeadline;
 };
 type UpgradeArgs = record {
+  resource_limits : opt ResourceLimits;
   min_threshold_to_bridge : opt nat;
   token_symbol : opt text;
   governance_canister : opt principal;
@@ -124,7 +253,17 @@ service : (opt CanisterArgs) -> {
   // missing, and returns the bridge's EVM and Solana addresses. Bridging that
   // needs a missing key is refused until it is there.
   admin_init_public_keys : () -> (Result_3);
+  admin_operations : (principal, nat32, opt nat64) -> (vec OperationInfo) query;
+  admin_recheck_task : (BridgeTx) -> (Result);
+  // Cumulative historical fee recognition after external backing reconciliation.
+  // The amount is a verified total, not an increment; duplicate proposals are idempotent.
+  admin_recognize_legacy_fees : (nat, text) -> (Result);
   admin_remove_bridges : (vec principal) -> (Result);
+  admin_resolve_legacy_payout : (BridgeTx, nat64, Resolution, text) -> (Result);
+  // Explicit governance attestation after external accounting. This is not an
+  // automatic proof that an unknown payment failed. The current revision and the
+  // evidence must identify the exact intent; ordinary retry never performs this.
+  admin_resolve_operation : (nat64, nat64, Resolution, text) -> (Result);
   // Resets the error circuit breaker and re-arms the finalization timer chain.
   // 
   // Once `error_rounds` reaches its limit, new tasks are refused and the rounds
@@ -145,25 +284,39 @@ service : (opt CanisterArgs) -> {
   admin_retry_bridging_task : (BridgeTx, opt BridgeTarget, opt text) -> (
       Result_1,
     );
+  admin_set_evm_fee_limits : (text, EvmFeeLimits) -> (Result);
   // Sets the RPC providers of an EVM chain and when a transaction on it counts
   // as final: after `max_confirmations` blocks, or, when it is `0`, once the
   // chain's own `finalized` block tag has passed it. The tag is the safer
   // choice on every chain that supports it.
   admin_set_evm_providers : (text, nat64, vec text) -> (Result);
+  // These URLs are intentionally published for browser balance reads. Use only
+  // anonymous official endpoints; private core RPC URLs remain separate.
+  admin_set_public_providers : (text, vec text) -> (Result);
+  admin_set_resource_limits : (ResourceLimits) -> (Result);
   admin_set_svm_providers : (vec text) -> (Result);
   bridge : (text, text, nat, opt text) -> (Result_2);
+  bridge_with_id : (text, text, nat, opt text, blob) -> (Result_2);
+  cancel_operation : (nat64) -> (Result);
   erc20_transfer : (text, text, nat) -> (Result_5);
   erc20_transfer_tx : (text, text, nat) -> (Result_5);
   evm_address : (opt principal) -> (Result_5) query;
   evm_sign : (blob) -> (Result_6);
   evm_transfer_tx : (text, text, nat) -> (Result_5);
   finalized_logs : (nat32, opt nat64) -> (Result_7) query;
+  fund_ledger_fees : (nat) -> (Result_2);
   info : () -> (Result_8) query;
   my_bridge_log : (BridgeTx) -> (Result_1) query;
   my_finalized_logs : (nat32, opt nat64) -> (Result_7) query;
+  my_operations : (nat32, opt nat64) -> (Result_9) query;
   my_pending_logs : () -> (Result_7) query;
+  my_pending_logs_page : (nat32, opt nat64) -> (Result_7) query;
   // The oldest pending tasks, at most `PENDING_LOGS_LIMIT` of them.
   pending_logs : () -> (Result_7) query;
+  pending_logs_page : (nat32, opt nat64) -> (Result_7) query;
+  recheck_task : (BridgeTx) -> (Result);
+  resume_deposit : (nat64) -> (Result_2);
+  resume_operation : (nat64) -> (Result_2);
   sol_transfer_tx : (text, nat64) -> (Result_5);
   spl_transfer_tx : (text, nat) -> (Result_5);
   svm_address : (opt principal) -> (Result_5) query;
@@ -173,13 +326,27 @@ service : (opt CanisterArgs) -> {
   validate_admin_close_bridging_task : (BridgeTx, opt bool) -> (Result_5);
   validate_admin_collect_fees : (principal, nat) -> (Result_5);
   validate_admin_init_public_keys : () -> (Result_5);
+  validate_admin_recheck_task : (BridgeTx) -> (Result_5);
+  validate_admin_recognize_legacy_fees : (nat, text) -> (Result_5);
   validate_admin_remove_bridges : (vec principal) -> (Result_5);
+  validate_admin_resolve_legacy_payout : (
+      BridgeTx,
+      nat64,
+      Resolution,
+      text,
+    ) -> (Result_5);
+  validate_admin_resolve_operation : (nat64, nat64, Resolution, text) -> (
+      Result_5,
+    );
   validate_admin_restart_bridging : () -> (Result_5);
   validate_admin_retry_bridging_task : (
       BridgeTx,
       opt BridgeTarget,
       opt text,
     ) -> (Result_5);
+  validate_admin_set_evm_fee_limits : (text, EvmFeeLimits) -> (Result_5);
   validate_admin_set_evm_providers : (text, nat64, vec text) -> (Result_5);
+  validate_admin_set_public_providers : (text, vec text) -> (Result_5);
+  validate_admin_set_resource_limits : (ResourceLimits) -> (Result_5);
   validate_admin_set_svm_providers : (vec text) -> (Result_5);
 }

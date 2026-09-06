@@ -42,72 +42,120 @@ impl<H: HttpOutcall> SvmClient<H> {
         Self { providers, outcall }
     }
 
-    /// A recent blockhash and the last block height it is valid at. The first
-    /// provider's answer is used: a bad one only yields a transaction that
-    /// never lands, which the expiry check recovers from.
+    /// A candidate is obtained once, then two providers must recognize that
+    /// exact hash at a view at least as new as the candidate's context.
     pub async fn get_latest_blockhash(&self) -> Result<LatestBlockhash, String> {
-        self.call(
-            "getLatestBlockhash",
-            &[json!({ "commitment": COMMITMENT })],
-            SMALL_RESPONSE,
-            |res: RpcContextValue<LatestBlockhash>| Ok(res.value),
-            Agreement::First,
-        )
-        .await
+        let candidate = self
+            .call(
+                "getLatestBlockhash",
+                &[json!({ "commitment": COMMITMENT })],
+                SMALL_RESPONSE,
+                |res: RpcContextValue<LatestBlockhash>| {
+                    let mut value = res.value;
+                    value.to_hash()?;
+                    value.context_slot = res.context.slot;
+                    Ok(value)
+                },
+                Agreement::First,
+            )
+            .await?;
+        let valid = self
+            .call(
+                "isBlockhashValid",
+                &[
+                    json!(candidate.blockhash),
+                    json!({"commitment": COMMITMENT, "minContextSlot": candidate.context_slot}),
+                ],
+                SMALL_RESPONSE,
+                |res: RpcContextValue<bool>| {
+                    if res.context.slot < candidate.context_slot {
+                        return Err("blockhash provider is behind its required context".into());
+                    }
+                    Ok(res.value)
+                },
+                Agreement::Two(|a, b| Ok(a && b)),
+            )
+            .await?;
+        if !valid {
+            return Err("two providers must validate the recent blockhash".into());
+        }
+        Ok(candidate)
     }
 
     /// The status of a transaction, as two providers support it together; see
     /// [`SolTxStatus::reconcile`].
     pub async fn get_signature_status(&self, signature: &str) -> Result<SolTxStatus, String> {
+        self.get_signature_statuses(&[signature.to_string()])
+            .await?
+            .pop()
+            .ok_or_else(|| "missing signature status".to_string())
+    }
+
+    pub async fn get_signature_statuses(
+        &self,
+        signatures: &[String],
+    ) -> Result<Vec<SolTxStatus>, String> {
+        if signatures.is_empty() {
+            return Ok(Vec::new());
+        }
+        if signatures.len() > 32 {
+            return Err("at most 32 signatures per batch".into());
+        }
         self.call(
             "getSignatureStatuses",
             &[
-                Value::Array(vec![signature.into()]),
+                json!(signatures),
                 json!({ "searchTransactionHistory": true }),
             ],
             SMALL_RESPONSE,
             |res: RpcContextValue<Vec<Option<SignatureStatus>>>| {
-                res.value
+                if res.value.len() != signatures.len() {
+                    return Err("missing signature status".into());
+                }
+                Ok(res
+                    .value
                     .into_iter()
-                    .next()
                     .map(SolTxStatus::from_signature_status)
-                    .ok_or_else(|| "missing signature status".to_string())
+                    .collect::<Vec<_>>())
             },
-            Agreement::Two(SolTxStatus::reconcile),
+            Agreement::Two(|a: Vec<SolTxStatus>, b: Vec<SolTxStatus>| {
+                if a.len() != b.len() {
+                    return Err("signature batch lengths disagree".into());
+                }
+                a.into_iter()
+                    .zip(b)
+                    .map(|(a, b)| SolTxStatus::reconcile(a, b))
+                    .collect()
+            }),
         )
         .await
     }
 
-    /// Whether a transaction whose blockhash was valid until
-    /// `last_valid_block_height` can no longer land: the finalized block height
-    /// is past it by `margin`, yet the signature is unknown.
-    ///
-    /// Both facts are read from the same provider, one provider at a time —
-    /// a provider whose finalized height is past the deadline has the
-    /// transaction if it landed — and two providers have to reach the verdict,
-    /// see [`two_provider_verdict`].
-    pub async fn expired(
-        &self,
-        signature: &str,
-        last_valid_block_height: u64,
-        margin: u64,
-    ) -> Result<bool, String> {
-        let deadline = last_valid_block_height.saturating_add(margin);
+    /// Never uses the advertised lastValidBlockHeight as evidence. Each provider
+    /// must have finalized the original context, reject the actual hash, retain
+    /// the relevant history and report no signature. Unknown history is an error.
+    pub async fn expired(&self, signature: &str, validity: &SolValidity) -> Result<bool, String> {
         two_provider_verdict(&self.providers, "expiry check", |one| async move {
-            let height: u64 = json_rpc_call(
+            let valid: RpcContextValue<bool> = json_rpc_call(
                 &self.outcall,
                 one,
                 RpcCall {
-                    method: "getBlockHeight",
-                    params: &[json!({ "commitment": FINALIZED })],
+                    method: "isBlockhashValid",
+                    params: &[json!(validity.blockhash), json!({ "commitment": FINALIZED, "minContextSlot": validity.context_slot })],
                     max_response_bytes: SMALL_RESPONSE,
                 },
                 as_is,
                 Agreement::First,
             )
             .await?;
-            if height <= deadline {
+            if valid.context.slot < validity.context_slot || valid.value {
                 return Ok(false);
+            }
+            let first_slot: u64 = json_rpc_call(&self.outcall, one, RpcCall {
+                method: "getFirstAvailableBlock", params: &[], max_response_bytes: SMALL_RESPONSE,
+            }, as_is, Agreement::First).await?;
+            if first_slot > validity.context_slot {
+                return Err("provider history no longer covers this transaction; manual reconciliation required".into());
             }
             let status = json_rpc_call(
                 &self.outcall,
@@ -193,7 +241,7 @@ impl<H: HttpOutcall> SvmClient<H> {
         .await
     }
 
-    pub async fn get_account_info(&self, pubkey: &str) -> Result<Option<UiAccount>, String> {
+    pub async fn get_mint_config(&self, pubkey: &str) -> Result<MintConfig, String> {
         self.call(
             "getAccountInfo",
             &[
@@ -201,7 +249,29 @@ impl<H: HttpOutcall> SvmClient<H> {
                 json!({ "commitment": COMMITMENT, "encoding": "jsonParsed" }),
             ],
             LARGE_RESPONSE,
-            |res: RpcContextValue<Option<UiAccount>>| Ok(res.value),
+            |res: RpcContextValue<Option<UiAccount>>| {
+                mint_config(
+                    &res.value
+                        .ok_or_else(|| "mint account does not exist".to_string())?,
+                )
+            },
+            Agreement::Two(same),
+        )
+        .await
+    }
+
+    pub async fn account_exists(&self, pubkey: &str) -> Result<bool, String> {
+        self.call("getAccountInfo", &[json!(pubkey), json!({"commitment": COMMITMENT, "encoding":"base64", "dataSlice":{"offset":0,"length":0}})],
+            SMALL_RESPONSE, |res: RpcContextValue<Option<Value>>| Ok(res.value.is_some()),
+            Agreement::Two(|a,b| Ok(a && b))).await
+    }
+
+    pub async fn account_rent(&self, size: u64) -> Result<u64, String> {
+        self.call(
+            "getMinimumBalanceForRentExemption",
+            &[json!(size), json!({"commitment": COMMITMENT})],
+            SMALL_RESPONSE,
+            as_is,
             Agreement::Two(same),
         )
         .await
@@ -254,7 +324,11 @@ mod tests {
 
     #[test]
     fn test_get_latest_blockhash() {
-        let mock = MockHttpOutcall::new(vec![result(blockhash_json())]);
+        let mock = MockHttpOutcall::new(vec![
+            result(blockhash_json()),
+            result(json!({"context":{"slot":1234},"value":true})),
+            result(json!({"context":{"slot":1235},"value":true})),
+        ]);
 
         let response =
             futures::executor::block_on(client(&mock, 2).get_latest_blockhash()).unwrap();
@@ -264,19 +338,36 @@ mod tests {
             "3Xdj6drp4pKAM9PH2vZ4w8NHygd8Epp7FKCvzX29VLLH"
         );
         assert_eq!(response.last_valid_block_height, 355385114);
-        assert_eq!(mock.urls(), vec!["https://sol0".to_string()]);
-        assert_eq!(mock.max_response_bytes(), vec![Some(SMALL_RESPONSE)]);
+        assert_eq!(
+            mock.urls(),
+            vec![
+                "https://sol0".to_string(),
+                "https://sol0".to_string(),
+                "https://sol1".to_string()
+            ]
+        );
+        assert_eq!(mock.max_response_bytes(), vec![Some(SMALL_RESPONSE); 3]);
     }
 
     #[test]
     fn test_http_request_fallbacks_between_providers() {
-        let mock = MockHttpOutcall::new(vec![Err("timeout".to_string()), result(blockhash_json())]);
+        let mock = MockHttpOutcall::new(vec![
+            Err("timeout".to_string()),
+            result(blockhash_json()),
+            result(json!({"context":{"slot":1234},"value":true})),
+            result(json!({"context":{"slot":1235},"value":true})),
+        ]);
 
         futures::executor::block_on(client(&mock, 2).get_latest_blockhash()).unwrap();
 
         assert_eq!(
             mock.urls(),
-            vec!["https://sol0".to_string(), "https://sol1".to_string()]
+            vec![
+                "https://sol0".to_string(),
+                "https://sol1".to_string(),
+                "https://sol0".to_string(),
+                "https://sol1".to_string()
+            ]
         );
     }
 
@@ -350,51 +441,81 @@ mod tests {
     }
 
     #[test]
-    fn an_expiry_verdict_needs_two_providers_each_past_the_deadline_without_the_signature() {
-        let unknown = json!({"context": {"slot": 1}, "value": [null]});
-        let landed = json!({
-            "context": {"slot": 1},
-            "value": [{"slot": 1, "confirmations": 3, "confirmationStatus": "confirmed", "err": null}]
-        });
-
+    fn expiry_uses_the_hash_context_and_history_not_an_advertised_height() {
+        let validity = SolValidity {
+            blockhash: "hash".into(),
+            context_slot: 100,
+            last_valid_block_height: 1,
+        };
+        let unknown = json!({"context":{"slot":300},"value":[null]});
+        let expired = json!({"context":{"slot":300},"value":false});
         let mock = MockHttpOutcall::new(vec![
-            result(150.into()),
+            result(expired.clone()),
+            result(json!(50)),
             result(unknown.clone()),
-            result(151.into()),
+            result(expired.clone()),
+            result(json!(50)),
             result(unknown.clone()),
         ]);
         assert_eq!(
-            futures::executor::block_on(client(&mock, 2).expired("sig", 100, 32)),
+            futures::executor::block_on(client(&mock, 2).expired("sig", &validity)),
             Ok(true)
         );
         assert_eq!(
             mock.methods(),
             vec![
-                "getBlockHeight",
+                "isBlockhashValid",
+                "getFirstAvailableBlock",
                 "getSignatureStatuses",
-                "getBlockHeight",
+                "isBlockhashValid",
+                "getFirstAvailableBlock",
                 "getSignatureStatuses"
             ]
         );
-
-        // not past the deadline plus margin yet
-        let mock = MockHttpOutcall::new(vec![result(132.into()), result(132.into())]);
+        let mock = MockHttpOutcall::new(vec![result(json!({"context":{"slot":300},"value":true}))]);
         assert_eq!(
-            futures::executor::block_on(client(&mock, 2).expired("sig", 100, 32)),
+            futures::executor::block_on(client(&mock, 2).expired("sig", &validity)),
             Ok(false)
         );
-
-        // a provider that has the transaction: it landed in time
+        let mock = MockHttpOutcall::new(vec![result(json!({"context":{"slot":99},"value":false}))]);
+        assert_eq!(
+            futures::executor::block_on(client(&mock, 2).expired("sig", &validity)),
+            Ok(false)
+        );
         let mock = MockHttpOutcall::new(vec![
-            result(150.into()),
-            result(landed),
-            result(150.into()),
-            result(unknown),
+            result(expired.clone()),
+            result(json!(101)),
+            result(expired),
+            result(json!(101)),
+        ]);
+        assert!(futures::executor::block_on(client(&mock, 2).expired("sig", &validity)).is_err());
+    }
+
+    #[test]
+    fn ata_existence_does_not_depend_on_a_mutable_balance() {
+        let mock = MockHttpOutcall::new(vec![
+            result(json!({"context":{"slot":1},"value":{"balance":10}})),
+            result(json!({"context":{"slot":2},"value":{"balance":11}})),
         ]);
         assert_eq!(
-            futures::executor::block_on(client(&mock, 2).expired("sig", 100, 32)),
-            Ok(false)
+            futures::executor::block_on(client(&mock, 2).account_exists("ata")),
+            Ok(true)
         );
+    }
+
+    #[test]
+    fn a_signature_batch_uses_only_two_outcalls() {
+        let response = json!({"context":{"slot":1},"value":[null,null,null]});
+        let mock = MockHttpOutcall::new(vec![result(response.clone()), result(response)]);
+        assert_eq!(
+            futures::executor::block_on(client(&mock, 2).get_signature_statuses(&[
+                "a".into(),
+                "b".into(),
+                "c".into()
+            ])),
+            Ok(vec![SolTxStatus::Unknown; 3])
+        );
+        assert_eq!(mock.urls().len(), 2);
     }
 
     #[test]

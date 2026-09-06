@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use candid::CandidType;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::str::FromStr;
 
@@ -21,6 +22,26 @@ pub struct UiAccount {
 pub struct LatestBlockhash {
     pub blockhash: String,
     pub last_valid_block_height: u64,
+    #[serde(default)]
+    pub context_slot: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, CandidType, Serialize, Deserialize)]
+pub struct SolValidity {
+    pub blockhash: String,
+    pub context_slot: u64,
+    /// Diagnostic only. Expiry is established for the actual blockhash.
+    pub last_valid_block_height: u64,
+}
+
+impl From<LatestBlockhash> for SolValidity {
+    fn from(value: LatestBlockhash) -> Self {
+        Self {
+            blockhash: value.blockhash,
+            context_slot: value.context_slot,
+            last_valid_block_height: value.last_valid_block_height,
+        }
+    }
 }
 
 impl LatestBlockhash {
@@ -75,7 +96,10 @@ impl SolTxStatus {
     pub fn from_signature_status(status: Option<SignatureStatus>) -> Self {
         match status {
             None => Self::Unknown,
-            Some(status) if status.is_error() => {
+            Some(status)
+                if status.is_error()
+                    && status.confirmation_status.as_deref() == Some("finalized") =>
+            {
                 Self::Failed(status.err.map(|err| err.to_string()).unwrap_or_default())
             }
             Some(status) if status.is_finalized() => Self::Finalized,
@@ -96,7 +120,40 @@ impl SolTxStatus {
     }
 }
 
+#[cfg(test)]
 pub fn get_mint_decimals(account: &UiAccount) -> Result<u8, String> {
+    Ok(mint_config(account)?.decimals)
+}
+
+pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MintConfig {
+    pub program: String,
+    pub decimals: u8,
+    pub token_account_size: u64,
+}
+
+/// Only fixed-unit tokens without mint extensions are supported. In particular,
+/// fee/hook/interest/confidential-transfer semantics cannot enter the accounting.
+pub fn mint_config(account: &UiAccount) -> Result<MintConfig, String> {
+    if account.owner != TOKEN_PROGRAM && account.owner != TOKEN_2022_PROGRAM {
+        return Err("unsupported token program".into());
+    }
+    if account
+        .data
+        .pointer("/parsed/info/isInitialized")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("mint must be initialized".into());
+    }
+    if let Some(extensions) = account.data.pointer("/parsed/info/extensions")
+        && !extensions.as_array().is_some_and(Vec::is_empty)
+    {
+        return Err("mint extensions are not supported; transfer fees and hooks must not change bridge amounts".into());
+    }
     let account_type = account
         .data
         .pointer("/parsed/type")
@@ -111,7 +168,17 @@ pub fn get_mint_decimals(account: &UiAccount) -> Result<u8, String> {
         .pointer("/parsed/info/decimals")
         .and_then(Value::as_u64)
         .ok_or_else(|| "token mint decimals are missing or invalid".to_string())?;
-    u8::try_from(decimals).map_err(|_| "token mint decimals exceed u8".to_string())
+    let decimals =
+        u8::try_from(decimals).map_err(|_| "token mint decimals exceed u8".to_string())?;
+    Ok(MintConfig {
+        program: account.owner.clone(),
+        decimals,
+        token_account_size: if account.owner == TOKEN_PROGRAM {
+            165
+        } else {
+            170
+        },
+    })
 }
 
 #[cfg(test)]
@@ -139,6 +206,30 @@ mod tests {
         );
         assert!(failed.is_error());
         assert!(!failed.is_finalized());
+    }
+
+    #[test]
+    fn unfinalized_errors_remain_pending_across_forks() {
+        for commitment in ["processed", "confirmed"] {
+            let failed = status(
+                commitment,
+                Some(json!({"InstructionError": [1, "InsufficientFunds"]})),
+            );
+            assert_eq!(
+                SolTxStatus::from_signature_status(Some(failed)),
+                SolTxStatus::Landed
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_fee_mints_are_rejected_before_enabling_bridging() {
+        let account = UiAccount {
+            owner: "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb".into(),
+            data: json!({"parsed":{"type":"mint","info":{"decimals":8,"isInitialized":true,
+                "extensions":[{"extension":"transferFeeConfig","state":{}}]}}}),
+        };
+        assert!(get_mint_decimals(&account).is_err());
     }
 
     #[test]
@@ -172,13 +263,13 @@ mod tests {
     #[test]
     fn extracts_only_the_mint_fields_from_account_info() {
         let account: UiAccount = serde_json::from_value(json!({
-            "owner": "TokenzQdYh...",
+            "owner": TOKEN_2022_PROGRAM,
             "lamports": 1_461_600,
             "data": {
                 "program": "spl-token-2022",
                 "parsed": {
                     "type": "mint",
-                    "info": { "decimals": 8, "supply": "1000000" }
+                    "info": { "decimals": 8, "supply": "1000000", "isInitialized": true }
                 },
                 "space": 82
             }

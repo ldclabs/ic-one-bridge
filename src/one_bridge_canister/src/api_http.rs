@@ -29,6 +29,9 @@ static CERTIFIED_EXPR_PATH: LazyLock<String> = LazyLock::new(|| {
 
 #[ic_cdk::query(hidden = true)]
 fn http_request(request: HttpRequest<'static>) -> HttpResponse {
+    if let Some(response) = crate::http_config::response(&request) {
+        return response;
+    }
     let witness = store::state::http_tree_with(|t| {
         t.witness(&store::state::DEFAULT_CERT_ENTRY, request.url())
             .expect("get witness failed")
@@ -69,8 +72,7 @@ fn http_request(request: HttpRequest<'static>) -> HttpResponse {
     let in_cbor = supports_cbor(request.headers());
 
     let rt = match (request.method().as_str(), req_uri.path()) {
-        ("HEAD", _) => Ok(Vec::new()),
-        ("GET", "/") => {
+        ("GET" | "HEAD", "/") => {
             let info = store::state::info();
             if in_cbor {
                 cbor_into_vec(&info)
@@ -94,16 +96,28 @@ fn http_request(request: HttpRequest<'static>) -> HttpResponse {
             HttpResponse {
                 status_code: 200,
                 headers,
-                body: body.into(),
+                body: if request.method().as_str() == "HEAD" {
+                    Vec::new().into()
+                } else {
+                    body.into()
+                },
                 upgrade: None,
             }
         }
         Err(err) => {
             headers.push(("content-type".to_string(), "text/plain".to_string()));
             HttpResponse {
-                status_code: 400,
+                status_code: if matches!(request.method().as_str(), "GET" | "HEAD") {
+                    404
+                } else {
+                    405
+                },
                 headers,
-                body: err.into_bytes().into(),
+                body: if request.method().as_str() == "HEAD" {
+                    Vec::new().into()
+                } else {
+                    err.into_bytes().into()
+                },
                 upgrade: None,
             }
         }
@@ -124,17 +138,50 @@ fn parse_uri(s: &str) -> Result<Uri, String> {
 }
 
 fn supports_cbor(headers: &[HeaderField]) -> bool {
-    headers.iter().any(|(name, value)| {
-        (name.eq_ignore_ascii_case("accept") || name.eq_ignore_ascii_case("content-type"))
-            && value.split(',').any(|part| {
-                part.trim()
+    let accepts: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("accept"))
+        .collect();
+    if accepts.is_empty() {
+        return headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value
                     .split(';')
                     .next()
                     .unwrap_or_default()
                     .trim()
                     .eq_ignore_ascii_case(CBOR)
-            })
-    })
+        });
+    }
+    let mut cbor = None;
+    let mut json = None;
+    let mut wildcard = 0.0f32;
+    for (_, value) in accepts {
+        for item in value.split(',') {
+            let mut parts = item.split(';');
+            let mime = parts.next().unwrap_or_default().trim();
+            let quality = parts
+                .find_map(|p| {
+                    let (key, value) = p.trim().split_once('=')?;
+                    key.eq_ignore_ascii_case("q")
+                        .then(|| value.trim().parse::<f32>().unwrap_or(0.0))
+                })
+                .unwrap_or(1.0);
+            let quality = if (0.0..=1.0).contains(&quality) {
+                quality
+            } else {
+                0.0
+            };
+            if mime.eq_ignore_ascii_case(CBOR) {
+                cbor = Some(quality);
+            } else if mime.eq_ignore_ascii_case(JSON) {
+                json = Some(quality);
+            } else if mime == "*/*" || mime.eq_ignore_ascii_case("application/*") {
+                wildcard = quality;
+            }
+        }
+    }
+    cbor.is_some_and(|q| q > 0.0 && q >= json.unwrap_or(wildcard))
 }
 
 #[cfg(test)]
@@ -154,6 +201,22 @@ mod tests {
         assert!(!supports_cbor(&[(
             "accept".to_string(),
             "application/json".to_string()
+        )]));
+    }
+
+    #[test]
+    fn explicit_zero_quality_disallows_cbor() {
+        assert!(!supports_cbor(&[(
+            "Accept".into(),
+            "application/cbor;q=0, */*;q=1".into()
+        )]));
+        assert!(!supports_cbor(&[(
+            "Accept".into(),
+            "application/cbor;q=0.1, application/json;q=0.9".into()
+        )]));
+        assert!(supports_cbor(&[(
+            "Accept".into(),
+            "application/cbor;q=1, application/json;q=0.9".into()
         )]));
     }
 

@@ -14,6 +14,11 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Controller-only fault injection, used by the separately built PocketIC Wasm.
+# Production/release builds use the default empty feature set.
+test-hooks = []
+
 [dependencies]
 alloy-consensus = { workspace = true }
 alloy-eips = { workspace = true }
@@ -44,3 +49,6 @@ ic-dummy-getrandom-for-wasm = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
+pocket-ic = "15.0.0"
+ic-certificate-verification = "3.2.0"
+ic-certification = "3"

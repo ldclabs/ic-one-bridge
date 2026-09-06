@@ -35,12 +35,21 @@ to `to` when given, otherwise to the caller's own principal or derived address. 
 deduplicated so a retry cannot pay twice. Polling is paced by finality — every 3s for the first
 minute, then backing off to 15s, 60s and 5min while nothing advances.
 
-**What a round trusts.** Every HTTPS outcall is made by a single replica, and every answer a
-payout depends on — a receipt and its `Transfer` events, a block height, a nonce, a signature
-status, a balance — is asked of two providers and acted on only when they agree. A signed deposit
-or payout is recorded on its task before it is broadcast, and the rounds broadcast it again while
-no provider has seen it; one that can no longer land (its nonce was spent by another transaction,
-or its blockhash expired) is detected and, for a deposit, abandoned, or, for a payout, rebuilt.
+**What a round trusts.** HTTPS outcalls deliberately use non-replicated mode to control cost.
+Controllers configure independent official providers, and financial evidence needs two independent
+provider identities and agreeing or conservative results. This also trusts the IC replicas serving
+those outcalls; two provider URLs do not authenticate a response against a malicious replica.
+A Solana blockhash candidate is checked by two providers, and expiry uses that actual hash and its
+finalized context, never just a provider's advertised last-valid height. EVM receipts carry their
+block hash, are checked against the canonical chain, and must prove the expected token transfer.
+
+**Recovering payments.** Every ledger transfer and bridge signature has a durable operation record
+before the external call. An unknown ledger result retains its original request and reservation;
+retries use the same timestamp and memo. Use `bridge_with_id` with a stable request ID for retries
+across lost replies, `my_operations` to inspect the operation, and `resume_operation` to recover it.
+The original `bridge` API can also resume a matching unresolved deposit. Never reset a payout merely
+because an RPC cannot currently find it: ordinary retry refuses unresolved attempts, while explicit
+governance reconciliation records the evidence and exact operation revision.
 
 **Guards.** `bridge` rejects amounts below `min_threshold_to_bridge` or with more precision than
 the source chain carries, refuses the bridge's own addresses, the token contracts and the anonymous
@@ -53,6 +62,16 @@ provider errors, new tasks are paused and the rounds slow to an hourly cooldown;
 `admin_restart_bridging` lifts the pause.
 
 Track a task with `my_bridge_log(from_tx)`, `my_pending_logs()` and `my_finalized_logs(take, prev)`.
+Pending results are bounded; use `my_pending_logs_page(take, after_task_id)` or
+`pending_logs_page(take, after_task_id)` for later pages. New optional `runtime` fields carry task IDs,
+readiness, resource limits and operating-fee accounting without requiring older bridge instances to
+return those fields.
+
+Public signing/RPC work is subsidized within configurable quotas: 12 requests per user and 120
+requests globally per IC clock hour by default, with a 2T-cycle reserve. Governance can change these
+through `admin_set_resource_limits`. EVM fees also have per-chain transaction/hour caps through
+`admin_set_evm_fee_limits`.
+
 
 ## Repository layout
 
@@ -69,13 +88,15 @@ Track a task with `my_bridge_log(from_tx)`, `my_pending_logs()` and `my_finalize
 ```bash
 make lint   # cargo fmt + clippy
 make test   # cargo test --workspace
+make integration-test  # local PocketIC ledger/RPC, callback traps, watchdog and upgrades
 
 make build-wasm  # cargo build --release --target wasm32-unknown-unknown
 make build-did   # regenerate the .did from the wasm, then dfx generate
 ```
 
 Releases are built by [.github/workflows/release.yml](./.github/workflows/release.yml) on a `v*`
-tag, with `ic-wasm` and `wasm-opt` pinned so the artifact can be rebuilt byte for byte. Each release
+tag, in a digest-pinned Rust build container, with a pinned Rust toolchain, `ic-wasm` and `wasm-opt`,
+and gzip timestamps disabled for reproducible artifacts. Each release
 publishes `one_bridge_canister.wasm.gz` next to a file naming its SHA-256, which is what upgrade
 proposals reference.
 
@@ -151,6 +172,29 @@ dfx canister call one_bridge_canister admin_set_svm_providers '(vec { "https://a
 dfx canister call one_bridge_canister admin_add_svm_contract '("<SPL mint address>")' --ic
 ```
 
+#### Operating fees and browser RPCs
+
+`info().evm_providers` and `info().svm_providers` expose only public browser endpoints. Anonymous
+origin URLs continue to work automatically. If internal URLs contain paths or credentials, publish
+separate anonymous endpoints with `admin_set_public_providers(chain, urls)`; do not publish API keys.
+Core canister RPC configuration remains separate and still requires two independent providers.
+
+Solana bridging supports the classic Token program and Token-2022 mints without mint extensions.
+Transfer-fee/hook and other extension semantics must not enter nominal-amount bridge accounting.
+Previously configured mints are revalidated during upgrade. Users can still withdraw a legacy
+extension mint to an already-created recipient ATA where the existing transfer instruction supports it.
+
+The ICP ledger fee is paid from an explicitly tracked operating budget. A sponsor can approve the
+canister on the token ledger and call `fund_ledger_fees(amount)` to fund it. Earned, verified ICP-side
+bridge fees can also pay those costs. New accounting excludes unknown historical expenses: after
+upgrading from older code, governance must reconcile backing before using
+`admin_recognize_legacy_fees(total_verified_legacy_fees, evidence)`. The argument is a cumulative
+verified total, so repeating the same proposal cannot credit it twice.
+
+`/config` (JSON) and `/config.cbor` provide cached, certified configuration and funds addresses.
+The legacy HTTP `/` endpoint remains an uncertified operational view. Check initialization flags
+before using an address, and use exact integer/CBOR handling for token quantities.
+
 #### 6. Bridge 10,000 PANDA from ICP to BNB Chain:
 - 6.1. The whole PANDA supply on BNB Chain should be held by the bridge canister's EVM address at
   initialization.
@@ -192,42 +236,24 @@ function ids are listed in [sns_functions.md](./sns_functions.md). The scripts u
 
 ## API Reference
 
-```candid
-// state and addresses
-info : () -> (Result_7) query;
-evm_address : (opt principal) -> (Result_4) query;
-svm_address : (opt principal) -> (Result_4) query;
+The generated Candid file is the authoritative interface:
+[one_bridge_canister.did](./src/one_bridge_canister/one_bridge_canister.did).
 
-// bridging
-bridge : (text, text, nat, opt text) -> (Result_2);
-my_bridge_log : (BridgeTx) -> (Result_1) query;
-my_pending_logs : () -> (Result_6) query;
-my_finalized_logs : (nat32, opt nat64) -> (Result_6) query;
-pending_logs : () -> (Result_6) query;
-finalized_logs : (nat32, opt nat64) -> (Result_6) query;
+- Read state and addresses: `info`, `evm_address`, `svm_address`.
+- Bridge and recover: `bridge`, `bridge_with_id`, `my_operations`, `resume_deposit`,
+  `resume_operation`, `cancel_operation`, `recheck_task`.
+- Read history: `my_bridge_log`, `my_pending_logs`, `my_pending_logs_page`, `pending_logs`,
+  `pending_logs_page`, `my_finalized_logs`, `finalized_logs`.
+- Withdraw from a user's derived wallet: `erc20_transfer`, `erc20_transfer_tx`,
+  `evm_transfer_tx`, `spl_transfer_tx`, `sol_transfer_tx`.
+- Fund ledger operating costs: `fund_ledger_fees`.
+- Governance configuration and recovery: the existing admin methods plus
+  `admin_set_resource_limits`, `admin_set_evm_fee_limits`, `admin_set_public_providers`,
+  `admin_recheck_task`, `admin_resolve_operation`, `admin_resolve_legacy_payout`,
+  `admin_recognize_legacy_fees`, and their `validate_*` counterparts.
 
-// moving funds out of a derived address; the *_tx variants return a signed
-// transaction for the caller to broadcast instead of broadcasting it
-erc20_transfer : (text, text, nat) -> (Result_4);
-erc20_transfer_tx : (text, text, nat) -> (Result_4);
-evm_transfer_tx : (text, text, nat) -> (Result_4);
-spl_transfer_tx : (text, nat) -> (Result_4);
-sol_transfer_tx : (text, nat64) -> (Result_4);
-evm_sign : (blob) -> (Result_5);
-
-// admin, controller only; each has a validate_* twin
-admin_set_evm_providers : (text, nat64, vec text) -> (Result);
-admin_add_evm_contract : (text, nat64, text) -> (Result);
-admin_set_svm_providers : (vec text) -> (Result);
-admin_add_svm_contract : (text) -> (Result);
-admin_restart_bridging : () -> (Result_3);
-admin_retry_bridging_task : (BridgeTx, opt BridgeTarget, opt text) -> (Result_1);
-admin_close_bridging_task : (BridgeTx, opt bool) -> (Result_1);
-admin_init_public_keys : () -> (Result_8);
-admin_collect_fees : (principal, nat) -> (Result_2);
-admin_add_bridges : (vec principal) -> (Result);
-admin_remove_bridges : (vec principal) -> (Result);
-```
+See [the migration and recovery guide](./docs/reviews/remediation-2026-09-06.md) for defaults,
+manual reconciliation preconditions and downgrade restrictions.
 
 Full Candid API definition: [one_bridge_canister.did](./src/one_bridge_canister/one_bridge_canister.did)
 

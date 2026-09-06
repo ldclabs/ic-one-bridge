@@ -1,15 +1,41 @@
 name: Test
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
     steps:
-    - uses: actions/checkout@v4
-    - name: Run clippy
-      run: cargo clippy --verbose --all-targets --all-features
-    - name: Run tests
-      run: cargo test --verbose --workspace -- --nocapture
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            . -> target
+            src/one_bridge_canister/tests/fixtures -> target
+      - name: Load the pinned toolchain
+        run: rustup show active-toolchain
+      - name: Format and lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Unit and protocol tests
+        run: cargo test --locked --workspace
+      - name: Real canister recovery and upgrade tests
+        run: bash scripts/test-canister.sh
+      - name: Check the Candid interface
+        run: |
+          cargo install candid-extractor --version 0.1.6 --locked
+          candid-extractor target/test-wasm/bridge.wasm > target/test-wasm/generated.did
+          diff -u src/one_bridge_canister/one_bridge_canister.did target/test-wasm/generated.did
+      - name: Dependency advisories
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit

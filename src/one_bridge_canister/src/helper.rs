@@ -15,7 +15,25 @@ pub static APP_AGENT: &str = concat!(
 
 /// The current IC time in milliseconds, the unit every timestamp in the state uses.
 pub fn now_ms() -> u64 {
-    ic_cdk::api::time() / 1_000_000
+    #[cfg(test)]
+    {
+        1_800_000_000_000
+    }
+    #[cfg(not(test))]
+    {
+        ic_cdk::api::time() / 1_000_000
+    }
+}
+
+pub fn canister_id() -> Principal {
+    #[cfg(test)]
+    {
+        Principal::from_slice(&[0, 1, 2, 3])
+    }
+    #[cfg(not(test))]
+    {
+        ic_cdk::api::canister_self()
+    }
 }
 
 pub fn msg_caller() -> Result<Principal, String> {
@@ -97,26 +115,65 @@ pub fn bridge_amount_after_fee(amount: u128, fee: u128) -> Result<u128, String> 
         .ok_or_else(|| format!("amount {amount} must be greater than bridge fee {fee}"))
 }
 
-/// Calls another canister and decodes its reply.
-///
-/// The call waits unbounded on purpose. Every use of this is a ledger transfer,
-/// and a bounded-wait call that times out reports an unknown outcome: the
-/// transfer may still have gone through, and the finalization round would then
-/// retry it and pay the recipient twice.
-pub async fn call<In, Out>(id: Principal, method: &str, args: In) -> Result<Out, String>
+#[derive(Debug)]
+pub struct CallFailure {
+    pub ambiguous: bool,
+    pub message: String,
+}
+
+pub fn signature_failure(error: ic_cdk_management_canister::SignCallError) -> CallFailure {
+    use ic_cdk::call::CallErrorExt;
+    use ic_cdk_management_canister::SignCallError;
+    let ambiguous = match &error {
+        SignCallError::SignCostError(_) => false,
+        SignCallError::CallFailed(error) => !error.is_clean_reject(),
+        SignCallError::CandidDecodeFailed(_) => true,
+    };
+    CallFailure {
+        ambiguous,
+        message: format!("threshold signature failed: {error}"),
+    }
+}
+
+pub async fn read_call<In, Out>(id: Principal, method: &str, args: In) -> Result<Out, String>
 where
     In: ArgumentEncoder + Send,
     Out: candid::CandidType + for<'a> candid::Deserialize<'a>,
 {
-    let res = ic_cdk::call::Call::unbounded_wait(id, method)
+    ic_cdk::call::Call::bounded_wait(id, method)
         .with_args(&args)
         .await
-        .map_err(|err| format!("failed to call {} on {:?}, error: {:?}", method, id, err))?;
-    res.candid().map_err(|err| {
-        format!(
+        .map_err(|e| format!("{method}: {e}"))?
+        .candid()
+        .map_err(|e| format!("{method}: {e}"))
+}
+
+pub async fn call_result<In, Out>(id: Principal, method: &str, args: In) -> Result<Out, CallFailure>
+where
+    In: ArgumentEncoder + Send,
+    Out: candid::CandidType + for<'a> candid::Deserialize<'a>,
+{
+    use ic_cdk::call::CallErrorExt;
+    // All monetary callers journal a fixed deduplication key. A timeout is an
+    // unknown outcome, not a failure, so a slow ledger cannot hold call slots
+    // forever and the journal can safely reconcile/retry the same request.
+    let request = ic_cdk::call::Call::bounded_wait(id, method).change_timeout(60);
+    #[cfg(feature = "test-hooks")]
+    let request = if crate::test_hooks::unbounded_ledger() {
+        ic_cdk::call::Call::unbounded_wait(id, method)
+    } else {
+        request
+    };
+    let res = request.with_args(&args).await.map_err(|err| CallFailure {
+        ambiguous: !err.is_clean_reject(),
+        message: format!("failed to call {} on {:?}, error: {:?}", method, id, err),
+    })?;
+    res.candid().map_err(|err| CallFailure {
+        ambiguous: true,
+        message: format!(
             "failed to decode response from {} on {:?}, error: {:?}",
             method, id, err
-        )
+        ),
     })
 }
 
