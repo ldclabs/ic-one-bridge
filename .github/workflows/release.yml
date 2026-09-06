@@ -42,8 +42,8 @@ jobs:
             cp "target/wasm32-unknown-unknown/release/$CAN.wasm" out/
             cp "src/$CAN/$CAN.did" "out/$CAN.did"
             WASM="out/$CAN.wasm"
-            ic-wasm $WASM -o $WASM metadata candid:service -f "out/$CAN.did" -v public
-            ic-wasm $WASM -o $WASM shrink
+            ic-wasm "$WASM" -o "$WASM" metadata candid:service -f "out/$CAN.did" -v public
+            ic-wasm "$WASM" -o "$WASM" shrink
             # rustc emits these proposals by default, so wasm-opt has to be told
             # to accept them or it refuses to parse the module.
             "$WASM_OPT" \
@@ -60,9 +60,9 @@ jobs:
               --inline-functions-with-loops \
               "$WASM" -o "$WASM.optimized"
             mv "$WASM.optimized" "$WASM"
-            gzip -n $WASM
+            gzip -n "$WASM"
             SHA256="$(sha256sum < "out/$CAN.wasm.gz" | sed 's/ .*$//g')"
-            echo $SHA256 > "out/$CAN.wasm.gz.$SHA256.txt"
+            echo "$SHA256" > "out/$CAN.wasm.gz.$SHA256.txt"
           done
           ls -lah out
       - name: Release

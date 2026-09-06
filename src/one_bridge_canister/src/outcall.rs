@@ -93,6 +93,13 @@ pub fn lower<T: Ord>(a: T, b: T) -> Result<T, String> {
     Ok(a.min(b))
 }
 
+/// Two fee quotes are reconciled to the higher one. A low quote can leave an
+/// EIP-1559 transaction permanently below the chain's base fee, while the
+/// configured transaction and hourly limits still bound the higher quote.
+pub fn higher<T: Ord>(a: T, b: T) -> Result<T, String> {
+    Ok(a.max(b))
+}
+
 /// The decoded result, as it is.
 pub fn as_is<T>(value: T) -> Result<T, String> {
     Ok(value)

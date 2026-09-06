@@ -744,6 +744,74 @@ fn payment_recovery_traps_watchdog_upgrade_and_certification() {
     assert_eq!(info(&pic, bridge).pending_count, 0);
     assert_eq!(info(&pic, bridge).total_bridge_count, 7);
 
+    // A request ID introduced while adopting an unresolved legacy bridge call
+    // must remain attached after the recovery succeeds. Otherwise a lost reply
+    // to the adoption call would make the next retry debit the ledger again.
+    let adopter = Principal::self_authenticating([8; 32]);
+    let before = stats(&pic, ledger).incoming;
+    update(
+        &pic,
+        &mut rpc,
+        ledger,
+        Principal::anonymous(),
+        "set_mode",
+        encode_one(1u8).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        bridge_result(
+            update(
+                &pic,
+                &mut rpc,
+                bridge,
+                adopter,
+                "bridge",
+                encode_args(("ICP", "ETH", 100u128, Some(destination.clone()))).unwrap(),
+            )
+            .unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(stats(&pic, ledger).incoming, before + 1);
+    let adopted_args = encode_args((
+        "ICP",
+        "ETH",
+        100u128,
+        Some(destination.clone()),
+        ByteBuf::from(b"adopt-unkeyed".to_vec()),
+    ))
+    .unwrap();
+    let adopted = bridge_result(
+        update(
+            &pic,
+            &mut rpc,
+            bridge,
+            adopter,
+            "bridge_with_id",
+            adopted_args.clone(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        adopted,
+        bridge_result(
+            update(
+                &pic,
+                &mut rpc,
+                bridge,
+                adopter,
+                "bridge_with_id",
+                adopted_args,
+            )
+            .unwrap()
+        )
+        .unwrap()
+    );
+    assert_eq!(stats(&pic, ledger).incoming, before + 1);
+    pump(&pic, &mut rpc, 50);
+    assert_eq!(info(&pic, bridge).total_bridge_count, 8);
+
     #[derive(CandidType)]
     struct Limits {
         requests_per_hour: u32,

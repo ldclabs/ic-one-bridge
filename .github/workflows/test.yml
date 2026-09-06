@@ -17,9 +17,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          workspaces: |
-            . -> target
-            src/one_bridge_canister/tests/fixtures -> target
+          workspaces: . -> target
       - name: Load the pinned toolchain
         run: rustup show active-toolchain
       - name: Format and lint

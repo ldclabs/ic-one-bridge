@@ -4,6 +4,12 @@ use super::*;
 
 const HOUR_MS: u64 = 3_600_000;
 
+/// Headroom held for each subsidized request that may still issue HTTPS
+/// outcalls and one threshold signature. Admission counts the current request
+/// as well as every request already suspended at an await, so their remaining
+/// work cannot consume `min_cycles_reserve`.
+const PUBLIC_REQUEST_CYCLES_HEADROOM: u128 = 100_000_000_000;
+
 #[derive(Clone, Debug, CandidType, Serialize, Deserialize)]
 pub struct ResourceLimits {
     pub requests_per_hour: u32,
@@ -111,7 +117,14 @@ fn charge(
     cycles: u128,
     active: usize,
 ) -> Result<(), String> {
-    if cycles < limits.min_cycles_reserve {
+    let active_with_current = (active as u128)
+        .checked_add(1)
+        .ok_or_else(|| "active request count overflow".to_string())?;
+    let required_cycles = active_with_current
+        .checked_mul(PUBLIC_REQUEST_CYCLES_HEADROOM)
+        .and_then(|headroom| limits.min_cycles_reserve.checked_add(headroom))
+        .ok_or_else(|| "cycles reserve calculation overflow".to_string())?;
+    if cycles < required_cycles {
         return Err("public work is paused to preserve cycles for pending payments".into());
     }
     if active >= limits.max_active_requests as usize {
@@ -213,6 +226,40 @@ mod tests {
             limits
                 .transaction_cost(84_000, 3_000_000_000, 1_000_000_000)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn admission_reserves_headroom_for_current_and_suspended_requests() {
+        let limits = ResourceLimits::default();
+        let user = Principal::from_slice(&[11]);
+        let mut usage = Usage::default();
+        assert!(charge(&mut usage, &limits, user, 0, limits.min_cycles_reserve, 0).is_err());
+
+        let mut usage = Usage::default();
+        assert!(
+            charge(
+                &mut usage,
+                &limits,
+                user,
+                0,
+                limits.min_cycles_reserve + PUBLIC_REQUEST_CYCLES_HEADROOM,
+                0
+            )
+            .is_ok()
+        );
+
+        let mut usage = Usage::default();
+        assert!(
+            charge(
+                &mut usage,
+                &limits,
+                user,
+                0,
+                limits.min_cycles_reserve + PUBLIC_REQUEST_CYCLES_HEADROOM,
+                1
+            )
+            .is_err()
         );
     }
 }

@@ -652,6 +652,9 @@ pub async fn bridge_with_id(
                 &ForbiddenDestinations::default(),
             )? == plan.to_addr
         {
+            if let Some(request_id) = request_id.as_deref() {
+                journal::bind_request(user, request_id, entry.id)?;
+            }
             return resume_deposit_entry(entry).await;
         }
         return Err(format!("resume deposit operation {} first", entry.id));
@@ -1107,6 +1110,13 @@ pub fn can_close_task(task: &BridgeLog, force: bool) -> Result<(), String> {
     if !force && (!task.stuck || !task.from_tx.is_finalized() || task.payout_may_execute()) {
         return Err("closing would discard an unresolved deposit or payout; reconcile it first, or explicitly force an externally settled closure".into());
     }
+    if let Some(id) = task.payout_attempt
+        && !journal::get(id).is_some_and(|entry| entry.handled)
+    {
+        return Err(format!(
+            "resolve payout operation {id} before closing its task"
+        ));
+    }
     Ok(())
 }
 
@@ -1155,6 +1165,31 @@ pub fn validate_resolution(
     )
 }
 
+pub(super) fn apply_payout_resolution(id: u64, task_id: u64, resolution: &Resolution) {
+    let task_exists = pending::update(task_id, |task| {
+        match resolution {
+            Resolution::Completed(tx) => {
+                task.to_tx = Some(tx.clone());
+                task.payout_resolution = Some(PayoutResolution::Completed);
+                task.stuck = false;
+                task.error = None;
+                task.error_chain = None;
+            }
+            Resolution::NotExecuted => {
+                task.payout_resolution = Some(PayoutResolution::Failed);
+                task.stuck = true;
+                task.error =
+                    Some("payout reconciled as unexecuted; retry or redirect the task".into());
+            }
+        }
+        task.next_poll_at = now_ms();
+    })
+    .is_some();
+    if matches!(resolution, Resolution::NotExecuted) || !task_exists {
+        journal::handled(id);
+    }
+}
+
 pub fn resolve_operation(
     id: u64,
     revision: u64,
@@ -1175,28 +1210,7 @@ pub fn resolve_operation(
     let entry = journal::resolve(id, revision, resolution.clone(), evidence, controller)?;
     match entry.purpose {
         journal::Purpose::Payout(task_id) => {
-            pending::update(task_id, |task| {
-                match &resolution {
-                    Resolution::Completed(tx) => {
-                        task.to_tx = Some(tx.clone());
-                        task.payout_resolution = Some(PayoutResolution::Completed);
-                        task.stuck = false;
-                        task.error = None;
-                        task.error_chain = None;
-                    }
-                    Resolution::NotExecuted => {
-                        task.payout_resolution = Some(PayoutResolution::Failed);
-                        task.stuck = true;
-                        task.error = Some(
-                            "payout reconciled as unexecuted; retry or redirect the task".into(),
-                        );
-                    }
-                }
-                task.next_poll_at = now_ms();
-            });
-            if matches!(resolution, Resolution::NotExecuted) {
-                journal::handled(id);
-            }
+            apply_payout_resolution(id, task_id, &resolution);
         }
         journal::Purpose::Deposit(_) => {
             if matches!(resolution, Resolution::NotExecuted) {
@@ -1299,7 +1313,12 @@ pub async fn resume_operation(id: u64, owner: Principal) -> Result<BridgeTx, Str
             journal::handled(id);
             Ok(tx)
         }
-        _ => Err("payouts are resumed through their pending tasks".into()),
+        journal::Purpose::Payout(_) => {
+            Err("payouts are resumed through their pending tasks".into())
+        }
+        journal::Purpose::FeeRecognition { .. } | journal::Purpose::LegacyConflict { .. } => {
+            Err("this operation requires controller reconciliation".into())
+        }
     }
 }
 

@@ -62,6 +62,66 @@ fn a_bad_legacy_resolution_does_not_allocate_or_modify_an_operation() {
 }
 
 #[test]
+fn a_task_cannot_be_closed_while_its_payout_operation_is_unresolved() {
+    pending::reset();
+    STATE.with_borrow_mut(|s| {
+        s.finalize_bridging_round.1 = false;
+        s.finalize_bridging_started_at = 0;
+    });
+    let user = principal(&[31, 32, 33]);
+    let mut task = log(
+        user,
+        BridgeTarget::Icp,
+        evm("ETH"),
+        BridgeTx::Icp(true, 90_001),
+    );
+    task.task_id = pending::next_id();
+    let payout = journal::create(user, journal::Purpose::Payout(task.task_id), now_ms());
+    task.payout_attempt = Some(payout.id);
+    task.stuck = true;
+    pending::insert(&task);
+
+    assert!(state::can_close_task(&task, true).is_err());
+    journal::failed(payout.id, "known not to have executed".into(), false, false);
+    journal::handled(payout.id);
+    assert!(state::can_close_task(&task, true).is_ok());
+}
+
+#[test]
+fn completing_an_orphaned_payout_operation_closes_its_journal_entry() {
+    STATE.with_borrow_mut(|s| {
+        s.finalize_bridging_round.1 = false;
+        s.finalize_bridging_started_at = 0;
+    });
+    let user = principal(&[34, 35, 36]);
+    let mut task = log(
+        user,
+        BridgeTarget::Icp,
+        evm("ETH"),
+        BridgeTx::Icp(true, 90_002),
+    );
+    task.task_id = pending::next_id();
+    task.to_tx = Some(BridgeTx::Evm(false, [77; 32].into()));
+    let entry = journal::create(user, journal::Purpose::Payout(task.task_id), now_ms());
+    journal::prepare(entry.id, journal::Request::LegacyPayout(Box::new(task)), 0).unwrap();
+    let revision = journal::get(entry.id).unwrap().revision;
+    let resolution = Resolution::Completed(BridgeTx::Evm(true, [77; 32].into()));
+    let resolved = journal::resolve(
+        entry.id,
+        revision,
+        resolution.clone(),
+        "verified finalized payout after the task was externally closed".into(),
+        user,
+    )
+    .unwrap();
+    let journal::Purpose::Payout(task_id) = resolved.purpose else {
+        unreachable!()
+    };
+    state::apply_payout_resolution(entry.id, task_id, &resolution);
+    assert!(journal::get(entry.id).unwrap().handled);
+}
+
+#[test]
 fn legacy_pending_fee_defaults_to_zero() {
     #[derive(Serialize)]
     struct BeforeFee {

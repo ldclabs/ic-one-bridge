@@ -250,6 +250,9 @@ async fn recover_operation(id: u64) -> Result<BridgeTx, String> {
         journal::Purpose::FeeRecognition { .. } => {
             Err("fee reconciliation is not a transfer".into())
         }
+        journal::Purpose::LegacyConflict { .. } => {
+            Err("legacy conflicts require controller reconciliation".into())
+        }
     }
 }
 

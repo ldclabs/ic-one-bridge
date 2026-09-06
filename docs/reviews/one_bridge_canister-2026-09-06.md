@@ -1,6 +1,6 @@
 one_bridge_canister 完整代码审查与执行清单
 
-修复状态：已按本次用户确认完成。当前实现、验证结果和升级注意事项见 [修复说明](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/docs/reviews/remediation-2026-09-06.md)。下文保留前次审查基准的触发条件与行号；F03 按明确的成本约束调整。
+修复状态：已按本次用户确认完成。当前实现、验证结果和升级注意事项见 [修复说明](./remediation-2026-09-06.md)。下文保留前次审查基准的触发条件与行号；F03 按明确的成本约束调整。
 
 审查日期：2026-09-06。基准：`a2498a838869ef513dbc6bad3e6f90f53428a951`，crate 版本 0.5.2。
 
@@ -16,7 +16,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F01 · P1：为公开签名和 RPC 入口增加实际的资源预算。**
 
-  位置：[api.rs:102](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/api.rs:102)、[store.rs:725](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:725)、[store.rs:3089](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:3089)。
+  位置：[api.rs:102](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/api.rs#L102)、[store.rs:725](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L725)、[store.rs:3089](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L3089)。
 
   触发：普通用户在派生地址放入足够的 token/native balance，循环调用 `erc20_transfer_tx`、`evm_transfer_tx`、`spl_transfer_tx` 或 `sol_transfer_tx`，拿到签名后不广播。余额一直不变，每次仍由 canister 支付 outcall 和门限签名费用。`ActiveBridgeUserGuard` 仅限制同时调用，返回后即可再调用。空钱包也可反复消耗余额检查之前的 RPC 开销。只有受授权的 `evm_sign` 入口主动接收签名成本所需 cycles。
 
@@ -26,7 +26,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F02 · P1：为 ICP 入金和管理提现补齐持久化转账意图及恢复流程。**
 
-  位置：[store.rs:1757](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:1757)、[store.rs:2616](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2616)、[api_admin.rs:266](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/api_admin.rs:266)、[helper.rs:106](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/helper.rs:106)。
+  位置：[store.rs:1757](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L1757)、[store.rs:2616](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2616)、[api_admin.rs:266](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/api_admin.rs#L266)、[helper.rs:106](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/helper.rs#L106)。
 
   触发：`from_icp` 先扣款，返回后才创建 pending；其 `created_at_time`、`memo` 均为 None。若 ledger 已扣款，而回调解码失败或入队前 trap，canister 没有可恢复的入金记录，用户再次请求还会再次扣款。管理提现虽先预占 `total_withdrawn_fees`，但没有持久化提现记录及去重参数，所有 Err 都退回预占；结果不明确时可能重复提现，回调 trap 则可能留下无法定位的预占。
 
@@ -42,7 +42,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F04 · P1：Solana 过期判定不能使用单方提供的未验证 deadline。**
 
-  位置：[svm/rpc.rs:48](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/svm/rpc.rs:48)、[svm/rpc.rs:89](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/svm/rpc.rs:89)、[store.rs:2804](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2804)、[store.rs:2602](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2602)。
+  位置：[svm/rpc.rs:48](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/svm/rpc.rs#L48)、[svm/rpc.rs:89](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/svm/rpc.rs#L89)、[store.rs:2804](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2804)、[store.rs:2602](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2602)。
 
   触发：`getLatestBlockhash` 只相信第一家，将其 `lastValidBlockHeight` 原样保存；`expired` 随后让两家比较这个未经验证的数字。第一家可返回有效 blockhash 和过低 deadline，并暂扣已签名出金。只要检查时 blockhash 仍有效，两家真实状态均为 unknown 也会触发“已过期”，导致自动构建第二笔交易；若先后释放两笔不同 blockhash 的有效交易，可能重复付款。过高 deadline 则能使无效交易长期无法退出。
 
@@ -52,7 +52,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F05 · P1：为 EVM gas/tip 增加多源验证和绝对成本上限。**
 
-  位置：[evm.rs:122](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/evm.rs:122)、[store.rs:3072](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:3072)、[store.rs:2757](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2757)。
+  位置：[evm.rs:122](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/evm.rs#L122)、[store.rs:3072](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L3072)、[store.rs:2757](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2757)。
 
   触发：gas price 与 priority fee 都只取首个 RPC 答案，tip 还会上调 20%；没有单链或单笔经济上限。桥出金使用 `Funding::Trusted`。错误或恶意的高 tip 只要在钱包余额可承担范围内，会形成可上链的昂贵交易，直接消耗桥的 native gas 储备，并非只能造成交易失败。
 
@@ -62,7 +62,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F06 · P1：限定 Solana token 语义，按实际净入金记账。**
 
-  位置：[api_admin.rs:124](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/api_admin.rs:124)、[svm/types.rs:99](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/svm/types.rs:99)、[store.rs:2373](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2373)。
+  位置：[api_admin.rs:124](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/api_admin.rs#L124)、[svm/types.rs:99](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/svm/types.rs#L99)、[store.rs:2373](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2373)。
 
   触发：注册 mint 仅检查 parsed type 和 decimals，未限制 token program/扩展；Solana 入金仅凭签名 finalized 就按完整 `icp_amount` 放款。带 TransferFeeConfig 的 Token-2022 mint 可被注册，`TransferChecked` 成功后桥收到的可支配余额却小于名义转账金额；出金也可能少到账。普通无转账费 SPL mint 不受这个特定条件影响。
 
@@ -72,7 +72,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F07 · P1：EVM 出金也要验证转账金额，不能仅看 status=1。**
 
-  位置：[store.rs:2528](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2528)、[store.rs:2397](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2397)、[evm.rs:56](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/evm.rs:56)。
+  位置：[store.rs:2528](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2528)、[store.rs:2397](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2397)、[evm.rs:56](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/evm.rs#L56)。
 
   触发：入金检查了 Transfer 事件，出金却在 `TxStatus::Confirmed(_)` 中丢弃 receipt，直接完成、归档并计入总额。若目标 token 的 transfer 返回 false 而不 revert，或者收取转账费，用户可能未收到约定金额，任务仍显示成功。标准 PANDA/OpenZeppelin 正常 transfer 不触发此路径，但本子库没有限制只能注册这种语义的 token。
 
@@ -82,7 +82,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F08 · P1：统一终局证据，修复 EVM 重组与 Solana 过早失败判定。**
 
-  位置：[evm.rs:35](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/evm.rs:35)、[evm.rs:242](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/evm.rs:242)、[store.rs:2875](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2875)、[svm/types.rs:75](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/svm/types.rs:75)。
+  位置：[evm.rs:35](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/evm.rs#L35)、[evm.rs:242](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/evm.rs#L242)、[store.rs:2875](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2875)、[svm/types.rs:75](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/svm/types.rs#L75)。
 
   触发一：EvmReceipt 没有保存 blockHash，因此不同分叉的相同高度 receipt 可以比较为相等；先读 receipt、再 await 读 finalized height，也没有验证该 receipt 的区块仍在 canonical chain。触发二：`replaced` 用 latest nonce 就认定旧交易永远不能执行；该 nonce 对应的替代交易还可能被重组撤销。触发三：Solana 只要 `err` 非空便是 Failed，即使 confirmationStatus 还是 processed/confirmed；入金随后会被直接放弃和归档，重组后同笔交易仍有可能成功。
 
@@ -94,43 +94,43 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F09 · P2：消除三个在途 EVM 出金占满所有调度名额的饥饿问题。**
 
-  位置：[store.rs:1047](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:1047)。第一轮扫描先收集 EVM in-flight 任务，达到 ROUND_TASK_LIMIT=3 立即返回。如果 ETH、BNB、BASE 各一笔长期未确认，健康的 SOL/ICP 任务永远不会进入第二轮扫描；队列旋转也不能消除这个优先级饥饿。
+  位置：[store.rs:1047](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L1047)。第一轮扫描先收集 EVM in-flight 任务，达到 ROUND_TASK_LIMIT=3 立即返回。如果 ETH、BNB、BASE 各一笔长期未确认，健康的 SOL/ICP 任务永远不会进入第二轮扫描；队列旋转也不能消除这个优先级饥饿。
 
   动作：按链公平调度、记录每任务下次可轮询时间，并独立保留每链 nonce 占用；给其他就绪任务保证服务名额。验收：三笔持续 pending 的 EVM 出金存在时，健康 SOL/ICP 任务在有限轮次内被执行。复现已经连续运行 100 轮，健康任务始终未被选中。
 
 - [x] **F10 · P2：在轮次开始时主动设置超时恢复定时器。**
 
-  位置：[store.rs:1584](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:1584)、[store.rs:1919](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:1919)、[store.rs:2262](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2262)。定时器启动时取走 FINALIZE_TIMER，下一次调度发生在整个 join_all 返回之后。一个无界 ledger 调用长期不返回、又没有新入金/管理员动作时，10 分钟 stale-lock 检查没有任何执行者；RoundGuard 只在 trap 清理时生效。
+  位置：[store.rs:1584](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L1584)、[store.rs:1919](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L1919)、[store.rs:2262](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2262)。定时器启动时取走 FINALIZE_TIMER，下一次调度发生在整个 join_all 返回之后。一个无界 ledger 调用长期不返回、又没有新入金/管理员动作时，10 分钟 stale-lock 检查没有任何执行者；RoundGuard 只在 trap 清理时生效。
 
   动作：开始轮次、首次 await 前安排恢复定时器；每个完成任务尽快提交其结果，避免被同批慢任务拖住。保留 generation 和出金占位的防重复机制。验收：让 ledger 回调悬挂超过超时，并禁止新 ingress，定时器仍能恢复其他链处理；旧回调迟到不能覆盖新状态。证据：调度与 await 路径静态确认，待 PocketIC 验收。
 
 - [x] **F11 · P2：JSON-RPC 的服务商错误应参与故障切换。**
 
-  位置：[outcall.rs:224](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/outcall.rs:224)。HTTP 200 中的任何 error 都立即返回，rate limit、节点落后、服务端内部错误也不会尝试健康的后续 provider；“配置三家，一家故障仍工作”的目标因此不能保证。JSON-RPC error 分支和 `same` 的 Debug 错误文本也没有统一长度限制。
+  位置：[outcall.rs:224](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/outcall.rs#L224)。HTTP 200 中的任何 error 都立即返回，rate limit、节点落后、服务端内部错误也不会尝试健康的后续 provider；“配置三家，一家故障仍工作”的目标因此不能保证。JSON-RPC error 分支和 `same` 的 Debug 错误文本也没有统一长度限制。
 
   动作：区分链执行拒绝和 provider 的限流/临时/能力错误；临时错误继续访问其他来源，所有错误文本统一截断并清理敏感内容。验收：首家返回 -32005 限流、后两家正常仍成功；限制错误存储大小。限流提前截断路径已单元复现。
 
 - [x] **F12 · P2：首次扣款前验证目标金额可编码，重定向重试也检查精度。**
 
-  位置：[store.rs:1633](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:1633)、[store.rs:2125](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:2125)、[store.rs:3213](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:3213)。precision 检查只验证下采样余数；高 decimals 的乘法溢出和 Solana u64 上限直到出金构建才发现。ICP 入金已经扣除，随后形成永久无法构建的任务。`plan_retry_redirect` 也没有复用净额精度检查，改到低 decimals 链可能发生取整。
+  位置：[store.rs:1633](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L1633)、[store.rs:2125](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L2125)、[store.rs:3213](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L3213)。precision 检查只验证下采样余数；高 decimals 的乘法溢出和 Solana u64 上限直到出金构建才发现。ICP 入金已经扣除，随后形成永久无法构建的任务。`plan_retry_redirect` 也没有复用净额精度检查，改到低 decimals 链可能发生取整。
 
   动作：在 BridgePlan 中构造经过验证的源/目标链单位金额，检查非零、checked conversion、u64/u128 上限，重试改目标时复用同一验证。验收：20 个 token 从 8 decimals 转为 Solana 18 decimals 时，在扣款前拒绝超出 u64 的 2×10^19；不精确重定向不得产生截断付款。金额检查不足已单元复现。
 
 - [x] **F13 · P2：管理配置在 await 后重新验证，并为未决任务固定资产身份。**
 
-  位置：[api_admin.rs:55](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/api_admin.rs:55)、[api_admin.rs:124](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/api_admin.rs:124)、[api_init.rs:98](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/api_init.rs:98)。EVM/SVM 注册在外部请求前验证唯一性，回来后直接写入。两次正常管理调用可同时通过检查，覆盖配置或注册出两个相同 chain_id 的别名；按 chain_name 加的出金锁此时不能保护实际同一条链。升级还能修改 token_ledger，而未决任务没有记录原 ledger 身份。
+  位置：[api_admin.rs:55](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/api_admin.rs#L55)、[api_admin.rs:124](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/api_admin.rs#L124)、[api_init.rs:98](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/api_init.rs#L98)。EVM/SVM 注册在外部请求前验证唯一性，回来后直接写入。两次正常管理调用可同时通过检查，覆盖配置或注册出两个相同 chain_id 的别名；按 chain_name 加的出金锁此时不能保护实际同一条链。升级还能修改 token_ledger，而未决任务没有记录原 ledger 身份。
 
   动作：提交配置时原子复检唯一性和配置版本，或使用注册占位；任务持久化 chain_id、token/ledger、config version。存在未决资金意图时禁止直接更换 ledger，除非执行明确迁移。验收：并发注册相同链 ID 仅一次成功；延迟回调不能覆盖新配置；升级不能使旧意图在另一个 ledger 上重试。证据：跨 await 与升级路径静态审阅。
 
 - [x] **F14 · P2：公开 info 输出移除完整 RPC URL 中的凭据。**
 
-  位置：[store.rs:253](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:253)、[api.rs:15](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/api.rs:15)、[api_http.rs:73](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/api_http.rs:73)。StateInfo 原样公开所有 provider URL；付费 RPC 将 API key 放在路径/query 时，任何调用者都能直接读取。错误日志隐藏 host 之外部分不能解决此公开接口泄露。
+  位置：[store.rs:253](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L253)、[api.rs:15](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/api.rs#L15)、[api_http.rs:73](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/api_http.rs#L73)。StateInfo 原样公开所有 provider URL；付费 RPC 将 API key 放在路径/query 时，任何调用者都能直接读取。错误日志隐藏 host 之外部分不能解决此公开接口泄露。
 
   动作：公开 DTO 只输出 provider ID、host、健康状态；限制凭据暴露面，并避免给使用者承诺 canister 内明文 secret 对 replica 保密。验收：使用含 path/query token 的测试 URL，query、HTTP JSON/CBOR 和错误均不出现 token。[ICP HTTPS outcall 安全建议](https://docs.internetcomputer.org/guides/security/https-outcalls/)说明了节点可读取 canister 明文秘密。条件：确实使用带凭据 URL；未读取或验证生产凭据。
 
 - [x] **F15 · P2：给 pending 与升级迁移设容量和每次执行预算。**
 
-  位置：[store.rs:166](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:166)、[store.rs:1356](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:1356)、[store.rs:1373](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:1373)、[api_init.rs:81](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/api_init.rs:81)。pending 无容量限制并保存在 heap，每轮多次扫描且整队列重新分配；pre_upgrade 整体 CBOR 序列化状态，post_upgrade 的索引迁移/手续费恢复还可扫描全部历史。规模上升后会碰到内存或单次指令预算，阻止升级。
+  位置：[store.rs:166](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L166)、[store.rs:1356](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L1356)、[store.rs:1373](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L1373)、[api_init.rs:81](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/api_init.rs#L81)。pending 无容量限制并保存在 heap，每轮多次扫描且整队列重新分配；pre_upgrade 整体 CBOR 序列化状态，post_upgrade 的索引迁移/手续费恢复还可扫描全部历史。规模上升后会碰到内存或单次指令预算，阻止升级。
 
   动作：配置留在小型 StableCell；pending 按稳定 task ID 存 StableBTreeMap，并建立用户、来源交易和待调度索引；迁移使用持久化游标分批推进。MemoryId 只增不复用。给 `my_pending_logs` 增加分页，并限制公开 raw/error 负载。
 
@@ -138,7 +138,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F16 · P2：补齐历史 pending 格式和回滚再升级的兼容性。**
 
-  位置：[store.rs:390](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:390)、[store.rs:651](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:651)。2025-10-17 的 f390b32 之前 pending 没有 fee；BridgeLogLocal.fee 有默认值，但 State.pending 使用的 BridgeLog.fee 没有，直接升级携带旧 pending 的状态会在 load 解码失败。另外，新索引只要非空就跳过旧索引迁移；回滚旧代码期间新增的日志，再升级后不会补到新用户索引。
+  位置：[store.rs:390](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L390)、[store.rs:651](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L651)。2025-10-17 的 f390b32 之前 pending 没有 fee；BridgeLogLocal.fee 有默认值，但 State.pending 使用的 BridgeLog.fee 没有，直接升级携带旧 pending 的状态会在 load 解码失败。另外，新索引只要非空就跳过旧索引迁移；回滚旧代码期间新增的日志，再升级后不会补到新用户索引。
 
   动作：明确支持的升级起点，对旧 pending 的 fee 设置历史语义正确的默认/版本迁移；用版本与高水位维护索引，回滚兼容选择双写或再升级补齐，不能把非空当作永久迁移完成。
 
@@ -146,13 +146,13 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **F17 · P2：ATA 存在性检查不要比较整个可变 token account。**
 
-  位置：[svm/rpc.rs:196](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/svm/rpc.rs:196)、[store.rs:3252](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:3252)。只需要判断是否要支付创建 ATA 的租金，却让两家完整 UiAccount.data 相等。两次请求之间收款 ATA 余额变化，双方都确认账户存在也会被判 provider disagreement，正常签名被拒绝。
+  位置：[svm/rpc.rs:196](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/svm/rpc.rs#L196)、[store.rs:3252](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L3252)。只需要判断是否要支付创建 ATA 的租金，却让两家完整 UiAccount.data 相等。两次请求之间收款 ATA 余额变化，双方都确认账户存在也会被判 provider disagreement，正常签名被拒绝。
 
   动作：增加专用存在性/必要属性读取，在解释返回值后再做保守的布尔/owner 校验；mint 注册验证与 ATA funding 验证使用不同 DTO。验收：同一 ATA 余额从 10 变 11 时不再误拒绝；任意一方报告不存在时预留创建成本。已单元复现。
 
 - [x] **F18 · P2：用结构化错误标记故障链，去掉字符串前缀判断。**
 
-  位置：[store.rs:1646](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:1646)。`err.starts_with(from.name())` 会让 `ETHW: ...` 的故障阻挡 ETH，链名校验允许这两个名字。链状态还依赖错误文本是否恰好带前缀。
+  位置：[store.rs:1646](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L1646)。`err.starts_with(from.name())` 会让 `ETHW: ...` 的故障阻挡 ETH，链名校验允许这两个名字。链状态还依赖错误文本是否恰好带前缀。
 
   动作：使用 `TaskError { chain, phase, kind, message }`；gate 比较 chain 身份，message 只负责展示。临时最小修复也应比较完整分隔后的链名。验收：ETHW 的 provider 错误不阻挡 ETH；修改错误文案不改变调度/准入行为。证据：可达配置和字符串条件静态确认。
 
@@ -160,7 +160,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 
 - [x] **O01：合并相同 RPC，先测 outcall 次数、cycles 和延迟。** 同一轮 Solana `getSignatureStatuses` 可以一次查询多个签名；三项状态的正常双 provider 查询可由 6 次 HTTPS 请求减少到 2 次。共享 finalized block height，保留已有 EVM FinalizeContext 缓存。两家独立 provider 的读取可限并发并行，减少串行等待；不能用降低 F03 的完整性要求换取性能。`two_provider_verdict` 的 AND 判定在已有 false 时也可安全提前返回 false。
 
-- [x] **O02：为 Solana 交易消息加入业务意图 ID，避免相同消息被去重后等待过期重试。** 位置：[store.rs:3340](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/src/one_bridge_canister/src/store.rs:3340)。不同任务相同收款人、金额、payer 和 blockhash 可构造同一 message；Agave 按 message hash 检测 AlreadyProcessed。ICP Ed25519 签名本身是非确定性的，不能推断两次签名必然相等，也不能据此断言重复入账。将稳定 operation ID 编入 Memo 指令，可使不同任务消息不同，同一意图重试仍复用已有签名。验收：同轮两笔等额同收款人出金都能独立成功。参考 [IC Schnorr 规范](https://docs.internetcomputer.org/references/ic-interface-spec/management-canister/#ic-method-sign_with_schnorr)与 [Agave bank 实现](https://github.com/anza-xyz/agave/blob/master/runtime/src/bank.rs)。消息相同已单元复现，未运行真实 Agave 双交易测试。
+- [x] **O02：为 Solana 交易消息加入业务意图 ID，避免相同消息被去重后等待过期重试。** 位置：[store.rs:3340](https://github.com/ldclabs/ic-one-bridge/blob/a2498a838869ef513dbc6bad3e6f90f53428a951/src/one_bridge_canister/src/store.rs#L3340)。不同任务相同收款人、金额、payer 和 blockhash 可构造同一 message；Agave 按 message hash 检测 AlreadyProcessed。ICP Ed25519 签名本身是非确定性的，不能推断两次签名必然相等，也不能据此断言重复入账。将稳定 operation ID 编入 Memo 指令，可使不同任务消息不同，同一意图重试仍复用已有签名。验收：同轮两笔等额同收款人出金都能独立成功。参考 [IC Schnorr 规范](https://docs.internetcomputer.org/references/ic-interface-spec/management-canister/#ic-method-sign_with_schnorr)与 [Agave bank 实现](https://github.com/anza-xyz/agave/blob/master/runtime/src/bank.rs)。消息相同已单元复现，未运行真实 Agave 双交易测试。
 
 - [x] **O03：将巨大的 store.rs 按职责拆开，并收紧内部状态表示。** 建议拆成资金意图/状态模型、稳定存储与迁移、调度器、ICRC/EVM/SVM 结算适配器。将 `from_tx`/`to_tx` 的 finalized bool、stuck、error、payout_started_at 等自由组合收束为显式状态；统一 `advance → evidence → commit`，用类型区分暂时失败、终局失败和未知结果。保留 generation/claim 和外部 Candid/稳定编码兼容性。BridgeLogLocal 仅用于稳定存储时可去掉不必要的 CandidType 派生；不能为减少转换行数而直接改变存储短字段或公开接口。
 
@@ -187,7 +187,7 @@ P1 表示应优先处理的资金安全、资源消耗或资金恢复问题；P2
 | ecdsa.rs、schnorr.rs、types.rs | 派生路径、门限签名、地址转换、既有地址兼容测试 |
 | api_http.rs | URI、内容协商、响应负载、明确跳过认证的信任限制 |
 
-复现材料：[13 项观察性测试](/Users/zensh/git/github.com/ldclabs/ic-one-bridge/docs/reviews/one_bridge_canister-a2498a8-observations.rs)。测试代码仅追加到临时副本的 store.rs 末尾，生产源文件未改动。复现方式：将基准提交导出到临时目录，将该文件追加到副本 store.rs，运行 `cargo test --locked audit_observations -- --nocapture`。每个测试注释说明它断言的是当前行为；修复后应将断言改为安全行为并纳入对应模块的正式回归测试。
+复现材料：[13 项观察性测试](./one_bridge_canister-a2498a8-observations.rs)。测试代码仅追加到临时副本的 store.rs 末尾，生产源文件未改动。复现方式：将基准提交导出到临时目录，将该文件追加到副本 store.rs，运行 `cargo test --locked audit_observations -- --nocapture`。每个测试注释说明它断言的是当前行为；修复后应将断言改为安全行为并纳入对应模块的正式回归测试。
 
 依赖公告扫描的限制：本机 cargo-audit 0.18.3 无法解析最新 RustSec 数据库中的 CVSS 4.0 记录，扫描未完成。错误是 `unsupported CVSS version: 4.0`，发生在加载数据库阶段，不能据此判定本项目依赖是否存在该公告对应的问题。后续应使用支持当前公告格式的工具重新扫描 Cargo.lock。
 

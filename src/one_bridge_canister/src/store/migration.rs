@@ -36,13 +36,15 @@ pub fn step(limit: usize) -> bool {
             break;
         };
         if let Some(existing) = pending::by_tx(&task.from_tx) {
-            if !existing.same_with(&task) {
-                pending::update(existing.task_id, |t| {
-                    t.stuck = true;
-                    t.error =
-                        Some("conflicting legacy deposit records require reconciliation".into());
-                });
-            }
+            let conflict = journal::record_legacy_conflict(existing.task_id, task);
+            pending::update(existing.task_id, |t| {
+                t.stuck = true;
+                t.error = Some(format!(
+                    "duplicate legacy deposit record is preserved as operation {}; reconcile it before continuing this task",
+                    conflict.id
+                ));
+                t.error_chain = None;
+            });
         } else {
             if task.task_id == 0 {
                 task.task_id = pending::next_id();
@@ -170,5 +172,35 @@ mod tests {
         assert_eq!(state::user_logs(user, 100, None).len(), 6);
         assert!(step(2));
         assert_eq!(STATE.with_borrow(|s| s.icp_collected_fees), 6);
+    }
+
+    #[test]
+    fn conflicting_legacy_pending_records_are_preserved_for_reconciliation() {
+        pending::reset();
+        let user = Principal::from_slice(&[81, 82, 83]);
+        let mut first = super::super::tests::log(
+            user,
+            BridgeTarget::Sol,
+            BridgeTarget::Evm("ETH".into()),
+            BridgeTx::Sol(false, [44; 64].into()),
+        );
+        first.to_addr = Some("0x0000000000000000000000000000000000000001".into());
+        let mut second = first.clone();
+        second.to_addr = Some("0x0000000000000000000000000000000000000002".into());
+        STATE.with_borrow_mut(|s| s.legacy_pending = VecDeque::from([first, second.clone()]));
+
+        let _ = step(2);
+
+        let live = pending::by_tx(&second.from_tx).expect("first legacy record");
+        assert!(live.stuck);
+        let conflict = journal::page(user, 100, None)
+            .into_iter()
+            .find(|entry| entry.kind == "legacy pending conflict")
+            .expect("preserved conflicting record");
+        assert_eq!(
+            conflict.related_task.and_then(|task| task.to_addr),
+            second.to_addr
+        );
+        assert!(journal::unresolved());
     }
 }

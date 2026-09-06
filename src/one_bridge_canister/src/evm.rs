@@ -3,8 +3,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::outcall::{
-    Agreement, HttpOutcall, LARGE_RESPONSE, RpcCall, SMALL_RESPONSE, as_is, json_rpc_call, lower,
-    same, two_provider_verdict,
+    Agreement, HttpOutcall, LARGE_RESPONSE, RpcCall, SMALL_RESPONSE, as_is, higher, json_rpc_call,
+    lower, same, two_provider_verdict,
 };
 
 pub use alloy_primitives::{Address, TxHash};
@@ -129,7 +129,7 @@ impl<H: HttpOutcall> EvmClient<H> {
             &[],
             SMALL_RESPONSE,
             hex_to_u128,
-            Agreement::Two(lower),
+            Agreement::Two(higher),
         )
         .await
     }
@@ -140,7 +140,7 @@ impl<H: HttpOutcall> EvmClient<H> {
             &[],
             SMALL_RESPONSE,
             hex_to_u128,
-            Agreement::Two(lower),
+            Agreement::Two(higher),
         )
         .await
     }
@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn gas_requires_two_providers_and_broadcasts_require_one() {
+    fn gas_requires_two_providers_uses_the_higher_quote_and_broadcasts_require_one() {
         let mock = MockHttpOutcall::new(vec![
             Err("down".into()),
             result("0x3b9aca00".into()),
@@ -533,7 +533,7 @@ mod tests {
         ]);
         assert_eq!(
             futures::executor::block_on(client(&mock, 3).gas_price()),
-            Ok(1_000_000_000)
+            Ok(2_000_000_000)
         );
         assert_eq!(mock.urls().len(), 3);
 

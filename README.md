@@ -68,9 +68,10 @@ readiness, resource limits and operating-fee accounting without requiring older 
 return those fields.
 
 Public signing/RPC work is subsidized within configurable quotas: 12 requests per user and 120
-requests globally per IC clock hour by default, with a 2T-cycle reserve. Governance can change these
-through `admin_set_resource_limits`. EVM fees also have per-chain transaction/hour caps through
-`admin_set_evm_fee_limits`.
+requests globally per IC clock hour by default, with a 2T-cycle reserve plus 100B cycles of headroom
+for each active subsidized request. Governance can change the quotas and base reserve through
+`admin_set_resource_limits`. EVM fees also have per-chain transaction/hour caps through
+`admin_set_evm_fee_limits`; two provider quotes are reconciled upward before those caps are applied.
 
 
 ## Repository layout

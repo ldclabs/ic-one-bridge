@@ -598,14 +598,6 @@ impl BridgeLog {
     pub fn has_transient_error(&self) -> bool {
         self.error.is_some() && !self.stuck
     }
-
-    pub fn same_with(&self, other: &BridgeLog) -> bool {
-        self.user == other.user
-            && self.from == other.from
-            && self.to == other.to
-            && self.icp_amount == other.icp_amount
-            && self.from_tx == other.from_tx
-    }
 }
 
 impl Storable for BridgeLogLocal {

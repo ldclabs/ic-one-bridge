@@ -31,6 +31,13 @@ pub enum Purpose {
         amount: u128,
         ledger: Principal,
     },
+    /// A second legacy task claimed an incoming transaction already assigned
+    /// to another task. The complete record is retained for controller review
+    /// instead of being discarded during migration.
+    LegacyConflict {
+        existing_task: u64,
+        record: Box<BridgeLog>,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -92,6 +99,11 @@ pub struct Entry {
     pub handled: bool,
     pub reserved_fee: u128,
     pub accounting_settled: bool,
+    /// The result whose accounting effects were applied. Older journal rows
+    /// only carried `accounting_settled`; their phase supplies this value when
+    /// they are first read by the new code.
+    #[serde(default)]
+    pub accounting_success: Option<bool>,
     pub error: Option<String>,
     #[serde(default)]
     pub revision: u64,
@@ -134,6 +146,7 @@ pub enum RequestInfo {
 pub fn info(entry: Entry) -> OperationInfo {
     let related_task = match &entry.purpose {
         Purpose::Payout(id) => pending::get(*id).map(BridgeLog::public_view),
+        Purpose::LegacyConflict { record, .. } => Some(record.clone().public_view()),
         _ => None,
     };
     let request = entry.request.map(|request| match request {
@@ -165,6 +178,7 @@ pub fn info(entry: Entry) -> OperationInfo {
         Purpose::Withdrawal { .. } => ("fee withdrawal", None),
         Purpose::FeeFunding { .. } => ("fee funding", None),
         Purpose::FeeRecognition { .. } => ("fee reconciliation", None),
+        Purpose::LegacyConflict { .. } => ("legacy pending conflict", None),
     };
     OperationInfo {
         id: entry.id,
@@ -287,14 +301,40 @@ pub fn open_funding(owner: Principal) -> Option<Entry> {
         .find(|entry| matches!(entry.purpose, Purpose::FeeFunding { .. }))
 }
 
-pub fn find_request(owner: Principal, id: &[u8]) -> Result<Option<Entry>, String> {
+fn explicit_request_key(owner: Principal, id: &[u8]) -> Result<Vec<u8>, String> {
     if id.is_empty() || id.len() > 64 {
         return Err("request_id must be 1 to 64 bytes".into());
     }
     let mut key = vec![owner.as_slice().len() as u8];
     key.extend_from_slice(owner.as_slice());
     key.extend_from_slice(id);
+    Ok(key)
+}
+
+fn bind_request_key(key: &[u8], operation_id: u64) -> Result<(), String> {
+    REQUEST_IDS.with_borrow_mut(|ids| {
+        if let Some(existing) = ids.get(&key.to_vec()) {
+            if existing != operation_id {
+                return Err("request_id already belongs to another operation".into());
+            }
+            return Ok(());
+        }
+        ids.insert(key.to_vec(), operation_id);
+        Ok(())
+    })
+}
+
+pub fn find_request(owner: Principal, id: &[u8]) -> Result<Option<Entry>, String> {
+    let key = explicit_request_key(owner, id)?;
     Ok(REQUEST_IDS.with_borrow(|ids| ids.get(&key)).and_then(get))
+}
+
+pub fn bind_request(owner: Principal, id: &[u8], operation_id: u64) -> Result<(), String> {
+    let entry = get(operation_id).ok_or_else(|| "operation not found".to_string())?;
+    if entry.owner != owner || !matches!(entry.purpose, Purpose::Deposit(_)) {
+        return Err("request_id can only be bound to the owner's deposit operation".into());
+    }
+    bind_request_key(&explicit_request_key(owner, id)?, operation_id)
 }
 
 pub fn draft(owner: Principal, purpose: Purpose, created_at: u64) -> Entry {
@@ -310,6 +350,7 @@ pub fn draft(owner: Principal, purpose: Purpose, created_at: u64) -> Entry {
         handled: false,
         reserved_fee: 0,
         accounting_settled: false,
+        accounting_success: None,
         error: None,
         revision: 0,
         call_generation: 0,
@@ -333,15 +374,7 @@ pub fn for_deposit(
     now: u64,
 ) -> Result<Entry, String> {
     let key = request_id
-        .map(|id| {
-            if id.is_empty() || id.len() > 64 {
-                return Err("request_id must be 1 to 64 bytes".to_string());
-            }
-            let mut key = vec![plan.user.as_slice().len() as u8];
-            key.extend_from_slice(plan.user.as_slice());
-            key.extend_from_slice(id);
-            Ok(key)
-        })
+        .map(|id| explicit_request_key(plan.user, id))
         .transpose()?;
     if let Some(key) = &key
         && let Some(id) = REQUEST_IDS.with_borrow(|ids| ids.get(key))
@@ -358,6 +391,9 @@ pub fn for_deposit(
         && let Purpose::Deposit(old) = &existing.purpose
     {
         if old == &plan {
+            if let Some(key) = &key {
+                bind_request_key(key, existing.id)?;
+            }
             return Ok(existing);
         }
         return Err(format!(
@@ -367,9 +403,7 @@ pub fn for_deposit(
     }
     let entry = create(plan.user, Purpose::Deposit(plan), now);
     if let Some(key) = key {
-        REQUEST_IDS.with_borrow_mut(|ids| {
-            ids.insert(key, entry.id);
-        });
+        bind_request_key(&key, entry.id)?;
     }
     Ok(entry)
 }
@@ -452,28 +486,67 @@ pub fn available_withdrawal(s: &State) -> u128 {
         .min(available_operating_funds(s))
 }
 
+fn settled_as(entry: &Entry) -> Option<bool> {
+    if let Some(success) = entry.accounting_success {
+        Some(success)
+    } else if !entry.accounting_settled {
+        None
+    } else {
+        match entry.phase {
+            Phase::Completed(_) => Some(true),
+            Phase::Rejected(_) => Some(false),
+            _ => None,
+        }
+    }
+}
+
 fn settle_accounting(entry: &mut Entry, success: bool) {
-    if entry.accounting_settled {
+    let previous = settled_as(entry);
+    if previous == Some(success) {
         return;
     }
     STATE.with_borrow_mut(|s| {
-        if entry.reserved_fee > 0 {
+        if previous.is_none() && entry.reserved_fee > 0 {
             s.reserved_icp_fees = s.reserved_icp_fees.saturating_sub(entry.reserved_fee);
-            if success {
-                s.icp_transfer_fees = s.icp_transfer_fees.saturating_add(entry.reserved_fee);
+        }
+        if entry.reserved_fee > 0 {
+            match (previous, success) {
+                (None | Some(false), true) => {
+                    s.icp_transfer_fees = s.icp_transfer_fees.saturating_add(entry.reserved_fee);
+                }
+                (Some(true), false) => {
+                    s.icp_transfer_fees = s.icp_transfer_fees.saturating_sub(entry.reserved_fee);
+                }
+                _ => {}
             }
         }
-        if !success
-            && matches!(entry.request, Some(Request::Transfer { .. }))
+        if matches!(entry.request, Some(Request::Transfer { .. }))
             && let Purpose::Withdrawal { amount, .. } = &entry.purpose
         {
-            s.total_withdrawn_fees = s.total_withdrawn_fees.saturating_sub(*amount);
+            match (previous, success) {
+                (None, false) | (Some(true), false) => {
+                    s.total_withdrawn_fees = s.total_withdrawn_fees.saturating_sub(*amount);
+                }
+                (Some(false), true) => {
+                    s.total_withdrawn_fees = s.total_withdrawn_fees.saturating_add(*amount);
+                }
+                _ => {}
+            }
         }
-        if success && let Purpose::FeeFunding { amount, .. } = &entry.purpose {
-            s.ledger_fee_credit = s.ledger_fee_credit.saturating_add(*amount);
+        if let Purpose::FeeFunding { amount, .. } = &entry.purpose {
+            match (previous, success) {
+                (None | Some(false), true) => {
+                    s.ledger_fee_credit = s.ledger_fee_credit.saturating_add(*amount);
+                }
+                (Some(true), false) => {
+                    s.ledger_fee_credit = s.ledger_fee_credit.saturating_sub(*amount);
+                }
+                _ => {}
+            }
         }
     });
     entry.accounting_settled = true;
+    entry.accounting_success = Some(success);
 }
 
 pub fn completed(id: u64, tx: BridgeTx) -> Result<BridgeTx, String> {
@@ -740,7 +813,28 @@ pub fn record_fee_recognition(controller: Principal, total: u128, evidence: Stri
     entry.phase = Phase::Recorded;
     entry.handled = true;
     entry.accounting_settled = true;
+    entry.accounting_success = Some(true);
     put(&entry);
+}
+
+pub fn record_legacy_conflict(existing_task: u64, mut record: BridgeLog) -> Entry {
+    let error = format!(
+        "legacy incoming transaction conflicts with task {existing_task}; review both records"
+    );
+    record.stuck = true;
+    record.error = Some(error.clone());
+    let mut entry = create(
+        record.user,
+        Purpose::LegacyConflict {
+            existing_task,
+            record: Box::new(record),
+        },
+        now_ms(),
+    );
+    entry.phase = Phase::NeedsReview(error.clone());
+    entry.error = Some(error);
+    put(&entry);
+    get(entry.id).expect("legacy conflict entry")
 }
 
 pub fn check_resolution(
@@ -1017,6 +1111,85 @@ mod tests {
         );
         assert_eq!(ledger.debits.get(), 1);
     }
+
+    #[test]
+    fn a_corrected_success_reverses_a_prior_not_executed_settlement() {
+        STATE.with_borrow_mut(|s| {
+            s.icp_collected_fees_migrated = true;
+            s.spendable_icp_fees = 200;
+            s.total_withdrawn_fees = 0;
+            s.withdrawals_baseline = 0;
+            s.reserved_icp_fees = 0;
+            s.icp_transfer_fees = 0;
+            s.ledger_fee_credit = 0;
+        });
+        let owner = Principal::from_slice(&[71]);
+        let ledger = Principal::from_slice(&[72]);
+        let entry = create(
+            owner,
+            Purpose::Withdrawal {
+                to: owner,
+                amount: 50,
+                ledger,
+            },
+            now_ms(),
+        );
+        prepare(
+            entry.id,
+            Request::Transfer {
+                ledger,
+                args: TransferArg {
+                    from_subaccount: None,
+                    to: Account {
+                        owner,
+                        subaccount: None,
+                    },
+                    amount: 50u64.into(),
+                    fee: Some(10u64.into()),
+                    memo: Some(memo(entry.id)),
+                    created_at_time: Some(entry.created_at * 1_000_000),
+                },
+            },
+            10,
+        )
+        .unwrap();
+
+        let revision = get(entry.id).unwrap().revision;
+        resolve(
+            entry.id,
+            revision,
+            Resolution::NotExecuted,
+            "ledger evidence initially showed no execution".into(),
+            owner,
+        )
+        .unwrap();
+        assert_eq!(
+            STATE.with_borrow(|s| (
+                s.total_withdrawn_fees,
+                s.reserved_icp_fees,
+                s.icp_transfer_fees,
+                available_withdrawal(s)
+            )),
+            (0, 0, 0, 200)
+        );
+
+        // Rows written by the first journal schema only carry the boolean.
+        let mut legacy = get(entry.id).unwrap();
+        legacy.accounting_success = None;
+        put(&legacy);
+
+        completed(entry.id, BridgeTx::Icp(true, 9_999)).unwrap();
+        assert_eq!(
+            STATE.with_borrow(|s| (
+                s.total_withdrawn_fees,
+                s.reserved_icp_fees,
+                s.icp_transfer_fees,
+                available_withdrawal(s)
+            )),
+            (50, 0, 10, 140)
+        );
+        assert_eq!(get(entry.id).unwrap().accounting_success, Some(true));
+    }
     #[test]
     fn signature_intent_cannot_be_replanned_after_submission() {
         let entry = create(Principal::from_slice(&[1]), Purpose::Payout(99), now_ms());
@@ -1050,5 +1223,26 @@ mod tests {
         let mut different = plan;
         different.amount += 1;
         assert!(for_deposit(different, Some(b"request"), now_ms()).is_err());
+    }
+
+    #[test]
+    fn an_id_can_adopt_and_recover_a_matching_unkeyed_deposit() {
+        let owner = Principal::from_slice(&[91, 92, 93]);
+        let plan = DepositPlan {
+            user: owner,
+            from: BridgeTarget::Icp,
+            to: BridgeTarget::Evm("ETH".into()),
+            to_addr: Some("0x0000000000000000000000000000000000000001".into()),
+            ledger: Principal::from_slice(&[94]),
+            amount: 100,
+            fee: 1,
+        };
+        let original = for_deposit(plan.clone(), None, now_ms()).unwrap();
+        let adopted = for_deposit(plan, Some(b"adopted-request"), now_ms()).unwrap();
+        assert_eq!(adopted.id, original.id);
+        assert_eq!(
+            find_request(owner, b"adopted-request").unwrap().unwrap().id,
+            original.id
+        );
     }
 }
