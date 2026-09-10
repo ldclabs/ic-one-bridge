@@ -207,6 +207,48 @@ thread_local! {
 pub fn get(id: u64) -> Option<Entry> {
     ENTRIES.with_borrow(|entries| entries.get(&id).map(|e| e.0))
 }
+
+pub fn last_id() -> u64 {
+    ENTRIES.with_borrow(|entries| entries.keys().next_back().unwrap_or(0))
+}
+
+fn sync_conflict_hold(entry: &Entry) {
+    if let Purpose::LegacyConflict { existing_task, .. } = &entry.purpose {
+        pending::set_conflict_hold(
+            *existing_task,
+            entry.id,
+            !entry.handled && !matches!(entry.phase, Phase::Rejected(_)),
+        );
+    }
+}
+
+/// Backfills holds for journal rows written before the hold index existed.
+/// The upper bound is captured at upgrade; new writes update the index in put.
+pub fn migrate_conflict_holds(after: u64, through: u64, limit: usize) -> (u64, usize) {
+    if after >= through || limit == 0 {
+        return (after, 0);
+    }
+    let entries = ENTRIES.with_borrow(|entries| {
+        entries
+            .range((
+                std::ops::Bound::Excluded(after),
+                std::ops::Bound::Included(through),
+            ))
+            .take(limit)
+            .map(|entry| entry.value().0)
+            .collect::<Vec<_>>()
+    });
+    for entry in &entries {
+        sync_conflict_hold(entry);
+    }
+    let cursor = if entries.len() < limit {
+        through
+    } else {
+        entries.last().expect("nonempty migration batch").id
+    };
+    (cursor, entries.len())
+}
+
 pub fn put(entry: &Entry) {
     let mut entry = entry.clone();
     entry.revision = get(entry.id).map_or(1, |old| old.revision.saturating_add(1));
@@ -249,6 +291,7 @@ pub fn put(entry: &Entry) {
             ids.remove(&key);
         }
     });
+    sync_conflict_hold(&entry);
 }
 pub fn unresolved() -> bool {
     OPEN.with_borrow(|open| !open.is_empty())

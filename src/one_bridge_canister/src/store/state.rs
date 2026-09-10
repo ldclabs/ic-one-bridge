@@ -7,6 +7,7 @@ mod tests {
     fn bridge_plan_rejects_unencodable_destination_amount_before_any_payment() {
         let mut state = State::new();
         state.ledger_verified = true;
+        state.icp_collected_fees_migrated = true;
         state.token_bridge_fee = 0;
         state.min_threshold_to_bridge = 1;
         state.ecdsa_public_key.public_key =
@@ -520,8 +521,8 @@ fn plan_bridge(
     if matches!(from, BridgeTarget::Evm(_)) && pending::unconfirmed_deposit(user, &from) {
         return Err("this user already has an unconfirmed deposit on the source chain".into());
     }
-    if !s.legacy_pending.is_empty() {
-        return Err("pending migration is in progress".into());
+    if !s.icp_collected_fees_migrated {
+        return Err("financial history migration is in progress".into());
     }
     if pending::len().saturating_add(journal::open_count())
         >= u64::from(s.resource_limits.max_pending)
@@ -1016,6 +1017,7 @@ pub fn plan_retry_redirect(
 /// transaction whose blockhash expired without landing. Retrying a payout
 /// that did go through pays the recipient twice.
 pub fn can_retry_task(task: &BridgeLog) -> Result<(), String> {
+    ensure_task_reconciled(task)?;
     if task.is_finalized() || task.to_tx.as_ref().is_some_and(BridgeTx::is_finalized) {
         return Err("payout is already finalized".into());
     }
@@ -1086,6 +1088,7 @@ pub fn recheck_task(from_tx: &BridgeTx, owner: Principal, controller: bool) -> R
     if !controller && task.user != owner {
         return Err("task belongs to another user".into());
     }
+    ensure_task_reconciled(&task)?;
     pending::update(task.task_id, |task| {
         task.stuck = false;
         task.error = None;
@@ -1104,14 +1107,20 @@ pub fn recheck_task(from_tx: &BridgeTx, owner: Principal, controller: bool) -> R
 }
 
 pub fn can_close_task(task: &BridgeLog, force: bool) -> Result<(), String> {
-    if task.is_finalized() {
+    let held = pending::reconciliation_error(task).is_some();
+    if task.is_finalized() && !held {
         return Err("task is already finalized".into());
     }
     if !force && (!task.stuck || !task.from_tx.is_finalized() || task.payout_may_execute()) {
         return Err("closing would discard an unresolved deposit or payout; reconcile it first, or explicitly force an externally settled closure".into());
     }
     if let Some(id) = task.payout_attempt
-        && !journal::get(id).is_some_and(|entry| entry.handled)
+        && !journal::get(id).is_some_and(|entry| {
+            entry.handled
+                || (held
+                    && matches!(entry.phase, journal::Phase::Completed(ref tx)
+                        if tx.is_finalized() && task.to_tx.as_ref() == Some(tx)))
+        })
     {
         return Err(format!(
             "resolve payout operation {id} before closing its task"
@@ -1129,6 +1138,11 @@ pub fn close_pending_task(from_tx: &BridgeTx, now: u64, force: bool) -> Result<B
         task.error = Some("closed by administrator after external settlement".into());
     }
     let id = archive_bridge_log(&task)?;
+    if let Some(operation) = task.payout_attempt {
+        // can_close_task requires a handled attempt or the exact finalized
+        // payout of a quarantined duplicate. Closing never sends another one.
+        journal::handled(operation);
+    }
     pending::remove(task.task_id);
     task.id = Some(id);
     if stale {
@@ -1380,6 +1394,7 @@ fn payout_operation(task: &mut BridgeLog, run_generation: u64) -> Result<Option<
     let Some(live) = pending::get(task.task_id) else {
         return Ok(None);
     };
+    ensure_task_reconciled(&live).map_err(TaskFault::Stuck)?;
     if let Some(id) = live.payout_attempt {
         task.payout_attempt = Some(id);
         return Ok(Some(id));
@@ -1396,6 +1411,9 @@ fn payout_operation(task: &mut BridgeLog, run_generation: u64) -> Result<Option<
 }
 
 fn payout_fault(task: &BridgeLog, error: String) -> TaskFault {
+    if let Some(error) = pending::reconciliation_error(task) {
+        return TaskFault::Stuck(error);
+    }
     let id = task
         .payout_attempt
         .or_else(|| pending::get(task.task_id).and_then(|t| t.payout_attempt));
@@ -1416,6 +1434,13 @@ fn payout_fault(task: &BridgeLog, error: String) -> TaskFault {
     } else {
         TaskFault::Transient(error)
     }
+}
+
+pub(super) fn ensure_task_reconciled(task: &BridgeLog) -> Result<(), String> {
+    if !STATE.with_borrow(|s| s.icp_collected_fees_migrated) {
+        return Err("financial history migration is in progress".into());
+    }
+    pending::reconciliation_error(task).map_or(Ok(()), Err)
 }
 
 pub fn validate_legacy_fee_recognition(total: u128, evidence: &str) -> Result<u128, String> {

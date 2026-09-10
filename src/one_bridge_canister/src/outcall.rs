@@ -35,6 +35,11 @@ pub const SMALL_RESPONSE: u64 = 8 * 1024;
 /// a parsed Solana account. See [`SMALL_RESPONSE`] for why the budget exists.
 pub const LARGE_RESPONSE: u64 = 32 * 1024;
 
+/// Compatibility budget for full block responses when a provider does not
+/// implement the compact header RPC. Includes HTTP headers and stays within
+/// the management canister's response limit.
+pub const BLOCK_RESPONSE: u64 = 2_000_000;
+
 /// How much of a provider's answer an error message quotes. Answers are up to
 /// [`LARGE_RESPONSE`] long and the message ends up in the pending queue, the
 /// archive and users' error strings.
@@ -168,6 +173,19 @@ pub async fn json_rpc_call<H: HttpOutcall, R: DeserializeOwned, T>(
     interpret: impl Fn(R) -> Result<T, String>,
     agreement: Agreement<T>,
 ) -> Result<T, String> {
+    json_rpc_call_with_fallback(outcall, providers, call, None, interpret, agreement).await
+}
+
+/// A method-unsupported response may use a semantically equivalent RPC on the
+/// same provider. The fallback is still only one vote from that identity.
+pub async fn json_rpc_call_with_fallback<H: HttpOutcall, R: DeserializeOwned, T>(
+    outcall: &H,
+    providers: &[String],
+    call: RpcCall<'_>,
+    fallback: Option<RpcCall<'_>>,
+    interpret: impl Fn(R) -> Result<T, String>,
+    agreement: Agreement<T>,
+) -> Result<T, String> {
     let needed = match agreement {
         Agreement::First => 1,
         Agreement::Two(_) => 2,
@@ -190,31 +208,8 @@ pub async fn json_rpc_call<H: HttpOutcall, R: DeserializeOwned, T>(
         return Err(format!("{needed} independent HTTPS providers are required"));
     }
 
-    let body = serde_json::to_vec(&RPCRequest {
-        jsonrpc: "2.0",
-        method: call.method,
-        params: call.params,
-        id: 1,
-    })
-    .map_err(|err| err.to_string())?;
-    let args = HttpRequestArgs {
-        url: String::new(),
-        max_response_bytes: Some(call.max_response_bytes),
-        method: HttpMethod::POST,
-        headers: vec![
-            HttpHeader {
-                name: "content-type".to_string(),
-                value: "application/json".to_string(),
-            },
-            HttpHeader {
-                name: "user-agent".to_string(),
-                value: APP_AGENT.to_string(),
-            },
-        ],
-        body: Some(body),
-        transform: None,
-        is_replicated: Some(false),
-    };
+    let args = request_args(&call)?;
+    let fallback_args = fallback.as_ref().map(request_args).transpose()?;
 
     let mut answers: Vec<T> = Vec::with_capacity(needed);
     let mut cursor = 0;
@@ -229,7 +224,21 @@ pub async fn json_rpc_call<H: HttpOutcall, R: DeserializeOwned, T>(
                 let mut args = args.clone();
                 args.url = url.clone();
                 let interpret = &interpret;
-                async move { provider_reply(outcall, args, interpret).await }
+                let fallback_args = fallback_args.as_ref();
+                async move {
+                    match provider_reply(outcall, args, interpret).await {
+                        Err(error) if error.method_unsupported => {
+                            if let Some(fallback) = fallback_args {
+                                let mut fallback = fallback.clone();
+                                fallback.url = url.clone();
+                                provider_reply(outcall, fallback, interpret).await
+                            } else {
+                                Err(error)
+                            }
+                        }
+                        result => result,
+                    }
+                }
             }))
             .await;
         cursor += count;
@@ -268,9 +277,38 @@ pub async fn json_rpc_call<H: HttpOutcall, R: DeserializeOwned, T>(
     }
 }
 
+fn request_args(call: &RpcCall<'_>) -> Result<HttpRequestArgs, String> {
+    let body = serde_json::to_vec(&RPCRequest {
+        jsonrpc: "2.0",
+        method: call.method,
+        params: call.params,
+        id: 1,
+    })
+    .map_err(|err| err.to_string())?;
+    Ok(HttpRequestArgs {
+        url: String::new(),
+        max_response_bytes: Some(call.max_response_bytes),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            },
+            HttpHeader {
+                name: "user-agent".to_string(),
+                value: APP_AGENT.to_string(),
+            },
+        ],
+        body: Some(body),
+        transform: None,
+        is_replicated: Some(false),
+    })
+}
+
 struct ProviderError {
     message: String,
     rpc: bool,
+    method_unsupported: bool,
 }
 async fn provider_reply<H: HttpOutcall, R: DeserializeOwned, T>(
     outcall: &H,
@@ -284,6 +322,7 @@ async fn provider_reply<H: HttpOutcall, R: DeserializeOwned, T>(
         .map_err(|error| ProviderError {
             message: format!("provider {host} is unreachable: {error}"),
             rpc: false,
+            method_unsupported: false,
         })?;
     if response.status < 200u64 || response.status >= 300u64 {
         return Err(ProviderError {
@@ -293,6 +332,7 @@ async fn provider_reply<H: HttpOutcall, R: DeserializeOwned, T>(
                 excerpt(&response.body)
             ),
             rpc: false,
+            method_unsupported: false,
         });
     }
     let answer = match serde_json::from_slice::<RPCResponse<R>>(&response.body) {
@@ -309,6 +349,10 @@ async fn provider_reply<H: HttpOutcall, R: DeserializeOwned, T>(
                         .unwrap_or("invalid error response")
                 ),
                 rpc: true,
+                method_unsupported: matches!(
+                    error.get("code").and_then(Value::as_i64),
+                    Some(-32601 | -32004)
+                ),
             });
         }
         Ok(RPCResponse {
@@ -326,6 +370,7 @@ async fn provider_reply<H: HttpOutcall, R: DeserializeOwned, T>(
     answer.map_err(|error| ProviderError {
         message: format!("provider {host} answered with {error}"),
         rpc: false,
+        method_unsupported: false,
     })
 }
 

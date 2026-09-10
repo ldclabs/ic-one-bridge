@@ -13,7 +13,10 @@ fn production_payout_claim_reuses_the_first_transaction_and_fences_old_runs() {
     );
     task.task_id = pending::next_id();
     pending::insert(&task);
-    STATE.with_borrow_mut(|s| s.finalize_bridging_round.1 = true);
+    STATE.with_borrow_mut(|s| {
+        s.finalize_bridging_round.1 = true;
+        s.icp_collected_fees_migrated = true;
+    });
     let generation = next_finalize_run_generation();
     let first = (evm_tx(1), meta(1));
     let second = (evm_tx(2), meta(2));

@@ -94,7 +94,9 @@ fn append_old() {
         .unwrap();
 }
 #[ic_cdk::init]
-fn init(ledger: Principal) {
+fn init(ledger: Principal, scenario: Option<u8>) {
+    let scenario = scenario.unwrap_or(0);
+    let archive_count = if scenario == 2 { 150 } else { 1 };
     let state = OldState {
         key_name: "test_key_1".into(),
         icp_address: ic_cdk::api::canister_self(),
@@ -113,12 +115,18 @@ fn init(ledger: Principal) {
             chain_code: vec![].into(),
         },
         governance_canister: None,
-        pending: VecDeque::from([log(7)]),
+        pending: VecDeque::from([log(if scenario == 0 {
+            7
+        } else {
+            100 + archive_count - 1
+        })]),
         finalize_bridging_round: (0, false),
     };
     let mut cell = StableCell::init(mem(0), Vec::new());
     cell.set(ic_auth_types::cbor_into_vec(&state).unwrap());
-    append_old();
+    for _ in 0..archive_count {
+        append_old();
+    }
 }
 #[ic_cdk::post_upgrade]
 fn upgraded() {

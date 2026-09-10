@@ -42,6 +42,11 @@ those outcalls; two provider URLs do not authenticate a response against a malic
 A Solana blockhash candidate is checked by two providers, and expiry uses that actual hash and its
 finalized context, never just a provider's advertised last-valid height. EVM receipts carry their
 block hash, are checked against the canonical chain, and must prove the expected token transfer.
+Canonical and finalized block reads prefer `eth_getHeaderByNumber`, keeping response size
+independent of the transaction list. A provider that explicitly reports this method unsupported
+can fall back to `eth_getBlockByNumber` with a 2,000,000-byte response budget. Use independent
+providers supporting the compact header method for chains whose full blocks can exceed that limit;
+an oversized or disagreeing response never bypasses confirmation checks.
 
 **Recovering payments.** Every ledger transfer and bridge signature has a durable operation record
 before the external call. An unknown ledger result retains its original request and reservation;
@@ -50,6 +55,12 @@ across lost replies, `my_operations` to inspect the operation, and `resume_opera
 The original `bridge` API can also resume a matching unresolved deposit. Never reset a payout merely
 because an RPC cannot currently find it: ordinary retry refuses unresolved attempts, while explicit
 governance reconciliation records the evidence and exact operation revision.
+Legacy duplicate sources remain under a durable reconciliation hold: neither user/admin rechecks
+nor an ordinary retry can clear it. Resolve every associated legacy-conflict operation through
+governance before resuming a source not yet archived. A source already in the archive must be
+externally reconciled and its duplicate task closed, without another payout. Upgrade backfills these
+indexes in bounded batches and waits for financial-history migration before admitting or paying
+new bridge tasks; existing memory IDs and public Candid types are preserved.
 
 **Guards.** `bridge` rejects amounts below `min_threshold_to_bridge` or with more precision than
 the source chain carries, refuses the bridge's own addresses, the token contracts and the anonymous

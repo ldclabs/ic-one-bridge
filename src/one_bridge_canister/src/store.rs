@@ -483,6 +483,8 @@ enum PayoutClaim {
     /// The task was finalized or removed while this round was building its
     /// candidate transaction.
     TaskGone,
+    /// A financial hold cannot be lifted by retrying or replaying signed bytes.
+    ReconciliationRequired(String),
 }
 
 fn claim_pending_payout(
@@ -497,6 +499,9 @@ fn claim_pending_payout(
     let Some(mut task) = pending::by_tx(from_tx) else {
         return PayoutClaim::TaskGone;
     };
+    if let Err(error) = state::ensure_task_reconciled(&task) {
+        return PayoutClaim::ReconciliationRequired(error);
+    }
     if let Some(tx) = task.to_tx {
         return PayoutClaim::Existing((tx, task.to_meta));
     }

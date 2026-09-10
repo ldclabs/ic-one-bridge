@@ -49,6 +49,7 @@ struct RuntimeInfo {
     ledger_verified: bool,
     pending_count: u64,
     icp_transfer_fees: u128,
+    migration_remaining: u64,
 }
 impl std::ops::Deref for Info {
     type Target = RuntimeInfo;
@@ -155,6 +156,10 @@ struct Rpc {
     reorg: bool,
     calls: usize,
     sol_messages: BTreeMap<String, Vec<u8>>,
+    compact_headers: bool,
+    block_transactions: usize,
+    header_calls: usize,
+    full_block_calls: usize,
 }
 impl Default for Rpc {
     fn default() -> Self {
@@ -166,6 +171,10 @@ impl Default for Rpc {
             reorg: false,
             calls: 0,
             sol_messages: BTreeMap::new(),
+            compact_headers: true,
+            block_transactions: 0,
+            header_calls: 0,
+            full_block_calls: 0,
         }
     }
 }
@@ -219,14 +228,35 @@ impl Rpc {
             "eth_gasPrice" => json!("0x3b9aca00"),
             "eth_maxPriorityFeePerGas" => json!("0x5f5e100"),
             "eth_blockNumber" => json!("0x6e"),
-            "eth_getBlockByNumber" => {
+            "eth_getHeaderByNumber" | "eth_getBlockByNumber" => {
+                let compact = request["method"] == "eth_getHeaderByNumber";
+                if compact {
+                    self.header_calls += 1;
+                    assert_eq!(p.as_array().unwrap().len(), 1);
+                    if !self.compact_headers {
+                        return json!({"jsonrpc":"2.0","id":1,"error":{
+                            "code":-32601,"message":"method not found"
+                        }});
+                    }
+                } else {
+                    self.full_block_calls += 1;
+                    assert_eq!(p[1], false);
+                }
                 let number = if p[0] == "finalized" {
                     110
                 } else {
                     u64::from_str_radix(p[0].as_str().unwrap().trim_start_matches("0x"), 16)
                         .unwrap()
                 };
-                json!({"number":format!("0x{number:x}"),"hash":if self.reorg {B256::from([43;32])} else {block}})
+                let mut value = json!({"number":format!("0x{number:x}"),"hash":if self.reorg {B256::from([43;32])} else {block}});
+                if !compact {
+                    value["transactions"] = json!(
+                        (0..self.block_transactions)
+                            .map(|i| format!("0x{i:064x}"))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                value
             }
             "eth_getTransactionCount" => {
                 let address = p[0].as_str().unwrap().parse::<Address>().unwrap();
@@ -299,6 +329,20 @@ impl Rpc {
         for request in pic.get_canister_http() {
             assert!(request.max_response_bytes.is_some());
             let body = serde_json::to_vec(&self.answer(&request.url, &request.body)).unwrap();
+            if body.len() as u64 > request.max_response_bytes.unwrap() {
+                pic.mock_canister_http_response(MockCanisterHttpResponse {
+                    subnet_id: request.subnet_id,
+                    request_id: request.request_id,
+                    response: CanisterHttpResponse::CanisterHttpReject(
+                        pocket_ic::common::rest::CanisterHttpReject {
+                            reject_code: 2,
+                            message: "HTTP response exceeded max_response_bytes".into(),
+                        },
+                    ),
+                    additional_responses: vec![],
+                });
+                continue;
+            }
             pic.mock_canister_http_response(MockCanisterHttpResponse {
                 subnet_id: request.subnet_id,
                 request_id: request.request_id,
@@ -344,7 +388,11 @@ fn pump(pic: &PocketIc, rpc: &mut Rpc, rounds: usize) {
 }
 fn ready(pic: &PocketIc, rpc: &mut Rpc, bridge: Principal) {
     for _ in 0..100 {
-        if info(pic, bridge).keys_ready == (true, true) && info(pic, bridge).ledger_verified {
+        let state = info(pic, bridge);
+        if state.keys_ready == (true, true)
+            && state.ledger_verified
+            && state.migration_remaining == 0
+        {
             return;
         }
         pump(pic, rpc, 1);
@@ -356,6 +404,295 @@ fn deploy(pic: &PocketIc, module: Vec<u8>, args: Vec<u8>) -> Principal {
     pic.add_cycles(id, 100_000_000_000_000);
     pic.install_canister(id, module, args, None);
     id
+}
+
+fn test_network() -> PocketIc {
+    PocketIcBuilder::new()
+        .with_application_subnet()
+        .with_test_threshold_keys_subnet()
+        .with_nns_subnet()
+        .with_initial_time(pocket_ic::Time::from_nanos_since_unix_epoch(
+            1_800_000_000_000_000_000,
+        ))
+        .build()
+}
+
+fn register_evm_chain(
+    pic: &PocketIc,
+    rpc: &mut Rpc,
+    bridge: Principal,
+    admin: Principal,
+    chain: &str,
+    chain_id: u64,
+) {
+    let providers = vec![
+        format!("https://{}-a.example", chain.to_lowercase()),
+        format!("https://{}-b.example", chain.to_lowercase()),
+    ];
+    for (method, args) in [
+        (
+            "admin_set_evm_providers",
+            encode_args((chain, 3u64, providers)).unwrap(),
+        ),
+        (
+            "admin_add_evm_contract",
+            encode_args((chain, chain_id, Address::from([17; 20]).to_string())).unwrap(),
+        ),
+    ] {
+        decode_one::<Result<(), String>>(&update(pic, rpc, bridge, admin, method, args).unwrap())
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[test]
+#[ignore = "build fixture and test Wasm with make integration-test"]
+fn busy_evm_blocks_settle_deposits_and_payouts_without_duplicate_payments() {
+    // The compact path must also work when a full block exceeds the IC limit;
+    // the compatibility path covers providers lacking the compact method.
+    for (compact_headers, block_transactions) in [(true, 40_000), (false, 807)] {
+        let pic = test_network();
+        let user = Principal::self_authenticating([7; 32]);
+        let admin = Principal::self_authenticating([9; 32]);
+        let ledger = deploy(&pic, wasm("ledger.wasm"), encode_args(()).unwrap());
+        let bridge = deploy(
+            &pic,
+            wasm("bridge.wasm"),
+            encode_one(Some(Args::Init(Init {
+                key_name: "test_key_1".into(),
+                token_name: "Fixture".into(),
+                token_symbol: "TEST".into(),
+                token_decimals: 8,
+                token_logo: "".into(),
+                token_ledger: ledger,
+                token_bridge_fee: 1,
+                min_threshold_to_bridge: 2,
+                governance_canister: Some(admin),
+                erc20_gas_limit: None,
+            })))
+            .unwrap(),
+        );
+        let mut rpc = Rpc {
+            compact_headers,
+            block_transactions,
+            reorg: true,
+            ..Default::default()
+        };
+        ready(&pic, &mut rpc, bridge);
+        rpc.bridge = info(&pic, bridge).evm_address.parse().unwrap();
+        rpc.user = query::<Result<String, String>>(
+            &pic,
+            bridge,
+            user,
+            "evm_address",
+            encode_one(None::<Principal>).unwrap(),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+        register_evm_chain(&pic, &mut rpc, bridge, admin, "BNB", 56);
+        let deposit_args = encode_args((
+            "ICP",
+            "BNB",
+            100u128,
+            Some(Address::from([119; 20]).to_string()),
+            ByteBuf::from(b"busy-block".to_vec()),
+        ))
+        .unwrap();
+        let source = bridge_result(
+            update(
+                &pic,
+                &mut rpc,
+                bridge,
+                user,
+                "bridge_with_id",
+                deposit_args.clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        pump(&pic, &mut rpc, 80);
+        assert_eq!(info(&pic, bridge).pending_count, 1);
+        assert_eq!(info(&pic, bridge).total_bridge_count, 0);
+        // A normal unconfirmed task may still be rechecked by its owner. Drain
+        // the current round at fixed time, then restore a canonical header.
+        for _ in 0..30 {
+            pic.tick();
+            rpc.respond(&pic);
+        }
+        rpc.reorg = false;
+        decode_one::<Result<(), String>>(
+            &update(
+                &pic,
+                &mut rpc,
+                bridge,
+                user,
+                "recheck_task",
+                encode_one(source.clone()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        pump(&pic, &mut rpc, 80);
+        assert_eq!(info(&pic, bridge).pending_count, 0);
+        assert_eq!(info(&pic, bridge).total_bridge_count, 1);
+        assert_eq!(rpc.txs.len(), 1);
+        assert_eq!(
+            bridge_result(
+                update(&pic, &mut rpc, bridge, user, "bridge_with_id", deposit_args).unwrap()
+            )
+            .unwrap(),
+            source
+        );
+        assert_eq!(stats(&pic, ledger).incoming, 1);
+        bridge_result(
+            update(
+                &pic,
+                &mut rpc,
+                bridge,
+                user,
+                "fund_ledger_fees",
+                encode_one(1000u128).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        bridge_result(
+            update(
+                &pic,
+                &mut rpc,
+                bridge,
+                user,
+                "bridge",
+                encode_args(("BNB", "ICP", 100u128, None::<String>)).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        pump(&pic, &mut rpc, 80);
+        assert_eq!(stats(&pic, ledger).outgoing, 1);
+        assert_eq!(stats(&pic, ledger).last_amount, 99);
+        assert_eq!(info(&pic, bridge).pending_count, 0);
+        assert_eq!(info(&pic, bridge).total_bridge_count, 2);
+        assert_eq!(rpc.txs.len(), 2);
+        assert!(rpc.header_calls > 0);
+        assert_eq!(rpc.full_block_calls > 0, !compact_headers);
+    }
+}
+
+#[test]
+#[ignore = "build fixture and test Wasm with make integration-test"]
+fn migrated_duplicates_cannot_be_rechecked_or_retried_even_after_another_upgrade() {
+    for (scenario, archive_count) in [(1u8, 1u64), (2, 150)] {
+        let pic = test_network();
+        let user = Principal::self_authenticating([7; 32]);
+        let ledger = deploy(&pic, wasm("ledger.wasm"), encode_args(()).unwrap());
+        let bridge = deploy(
+            &pic,
+            wasm("legacy.wasm"),
+            encode_args((ledger, Some(scenario))).unwrap(),
+        );
+        let mut rpc = Rpc::default();
+        for upgrade in 0..2 {
+            pic.upgrade_canister(
+                bridge,
+                wasm("bridge.wasm"),
+                encode_one(None::<u8>).unwrap(),
+                None,
+            )
+            .unwrap();
+            ready(&pic, &mut rpc, bridge);
+            rpc.bridge = info(&pic, bridge).evm_address.parse().unwrap();
+            rpc.user = query::<Result<String, String>>(
+                &pic,
+                bridge,
+                user,
+                "evm_address",
+                encode_one(None::<Principal>).unwrap(),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+            if upgrade == 0 {
+                register_evm_chain(&pic, &mut rpc, bridge, Principal::anonymous(), "ETH", 1);
+            }
+            let logs: Result<Vec<Log>, String> = query(
+                &pic,
+                bridge,
+                user,
+                "my_pending_logs",
+                encode_args(()).unwrap(),
+            );
+            let logs = logs.unwrap();
+            assert_eq!(logs.len(), 1);
+            assert!(logs[0].stuck);
+            let source = logs[0].from_tx.clone();
+            for (caller, method) in [
+                (user, "recheck_task"),
+                (Principal::anonymous(), "admin_recheck_task"),
+            ] {
+                let result: Result<(), String> = decode_one(
+                    &update(
+                        &pic,
+                        &mut rpc,
+                        bridge,
+                        caller,
+                        method,
+                        encode_one(source.clone()).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert!(result.unwrap_err().contains("archive"));
+            }
+            #[derive(CandidType)]
+            enum Target {
+                Icp,
+            }
+            let result: Result<Log, String> = decode_one(
+                &update(
+                    &pic,
+                    &mut rpc,
+                    bridge,
+                    Principal::anonymous(),
+                    "admin_retry_bridging_task",
+                    encode_args((source, Some(Target::Icp), None::<String>)).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(result.unwrap_err().contains("archive"));
+            pump(&pic, &mut rpc, 50);
+            assert!(rpc.txs.is_empty());
+            assert_eq!(stats(&pic, ledger).outgoing, 0);
+            assert_eq!(info(&pic, bridge).total_bridge_count, archive_count);
+        }
+        // Explicit external settlement still has a safe administrative closure.
+        let logs: Result<Vec<Log>, String> = query(
+            &pic,
+            bridge,
+            user,
+            "my_pending_logs",
+            encode_args(()).unwrap(),
+        );
+        let source = logs.unwrap().remove(0).from_tx;
+        decode_one::<Result<Log, String>>(
+            &update(
+                &pic,
+                &mut rpc,
+                bridge,
+                Principal::anonymous(),
+                "admin_close_bridging_task",
+                encode_args((source, Some(true))).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(info(&pic, bridge).pending_count, 0);
+        assert!(rpc.txs.is_empty());
+    }
 }
 
 #[test]

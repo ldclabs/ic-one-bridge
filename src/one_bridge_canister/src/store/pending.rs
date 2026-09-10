@@ -1,5 +1,7 @@
 //! Pending tasks live in stable memory. A single secondary map namespaces the
 //! user, incoming transaction, due-time, EVM reservation and chain-error indexes.
+//! Namespaces 5 and 6 hold immutable archive identities and reconciliation
+//! holds; rewriting a task's retry flags cannot erase either financial control.
 use super::*;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
@@ -43,6 +45,53 @@ fn transaction_key(tx: &BridgeTx) -> Vec<u8> {
         }
     }
     key
+}
+
+fn archive_key(tx: &BridgeTx) -> Vec<u8> {
+    let mut key = transaction_key(tx);
+    key[0] = 5;
+    key
+}
+
+pub fn archived_source(tx: &BridgeTx) -> Option<u64> {
+    INDEX.with_borrow(|index| index.get(&archive_key(tx)))
+}
+
+pub fn record_archived_source(tx: &BridgeTx, archive_id: u64) {
+    INDEX.with_borrow_mut(|index| {
+        let key = archive_key(tx);
+        if !index.contains_key(&key) {
+            index.insert(key, archive_id);
+        }
+    });
+    if let Some(task) = by_tx(tx) {
+        update(task.task_id, |_| ());
+    }
+}
+
+pub fn set_conflict_hold(task_id: u64, operation_id: u64, unresolved: bool) {
+    INDEX.with_borrow_mut(|index| {
+        let key = suffix(suffix(vec![6], task_id), operation_id);
+        if unresolved {
+            index.insert(key, operation_id);
+        } else {
+            index.remove(&key);
+        }
+    });
+    if unresolved {
+        update(task_id, |_| ());
+    }
+}
+
+pub fn reconciliation_error(task: &BridgeLog) -> Option<String> {
+    if let Some(id) = archived_source(&task.from_tx) {
+        return Some(format!(
+            "incoming transaction already appears in archive {id}; reconcile and close the duplicate task without another payout"
+        ));
+    }
+    prefix_ids(suffix(vec![6], task.task_id), 1, None)
+        .first()
+        .map(|id| format!("resolve legacy conflict operation {id} before resuming this task"))
 }
 
 fn chain_prefix(kind: u8, chain: &str) -> Vec<u8> {
@@ -127,6 +176,12 @@ pub fn remember_transaction(tx: &BridgeTx, id: u64) -> Result<(), String> {
 }
 
 pub fn insert(task: &BridgeLog) {
+    let mut task = task.clone();
+    if let Some(error) = reconciliation_error(&task) {
+        task.stuck = true;
+        task.error = Some(error);
+        task.error_chain = None;
+    }
     assert_ne!(task.task_id, 0, "pending tasks require a stable ID");
     remember_transaction(&task.from_tx, task.task_id).expect("duplicate incoming transaction");
     if let Some(old) = get(task.task_id) {
@@ -140,7 +195,7 @@ pub fn insert(task: &BridgeLog) {
         tasks.insert(task.task_id, task.clone().into());
     });
     INDEX.with_borrow_mut(|index| {
-        for key in keys(task) {
+        for key in keys(&task) {
             index.insert(key, task.task_id);
         }
     });

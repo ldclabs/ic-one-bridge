@@ -48,6 +48,10 @@ fn signing_run_current(funding: Funding) -> Result<(), String> {
     {
         return Err("payout round was superseded".into());
     }
+    if let Funding::Payout { task_id, .. } = funding {
+        let task = pending::get(task_id).ok_or_else(|| "payout task disappeared".to_string())?;
+        ensure_task_reconciled(&task)?;
+    }
     Ok(())
 }
 

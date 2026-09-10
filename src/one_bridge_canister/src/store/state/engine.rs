@@ -15,7 +15,7 @@ pub(super) async fn finalize_bridging() {
     if STATE.with_borrow(|s| !s.ledger_verified) {
         return;
     }
-    if STATE.with_borrow(|s| !s.legacy_pending.is_empty()) {
+    if STATE.with_borrow(|s| !s.icp_collected_fees_migrated) {
         schedule_finalize(Duration::from_secs(3));
         return;
     }
@@ -263,6 +263,8 @@ async fn process_task(
     run_generation: u64,
 ) -> TaskOutcome {
     let rt = async {
+        ensure_task_reconciled(&task)
+            .map_err(|error| (task.from.clone(), TaskFault::Stuck(error)))?;
         let from = task.from.clone();
         if !settle_deposit(&mut task, &context, now_ms)
             .await
@@ -823,6 +825,7 @@ where
         PayoutClaim::Claimed => {}
         PayoutClaim::Existing(existing) => return Ok(Some(existing)),
         PayoutClaim::RunSuperseded | PayoutClaim::TaskGone => return Ok(None),
+        PayoutClaim::ReconciliationRequired(error) => return Err((None, error)),
     }
 
     let (tx, meta) = payout;

@@ -3,8 +3,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::outcall::{
-    Agreement, HttpOutcall, LARGE_RESPONSE, RpcCall, SMALL_RESPONSE, as_is, higher, json_rpc_call,
-    lower, same, two_provider_verdict,
+    Agreement, BLOCK_RESPONSE, HttpOutcall, LARGE_RESPONSE, RpcCall, SMALL_RESPONSE, as_is, higher,
+    json_rpc_call, json_rpc_call_with_fallback, lower, same, two_provider_verdict,
 };
 
 pub use alloy_primitives::{Address, TxHash};
@@ -160,10 +160,8 @@ impl<H: HttpOutcall> EvmClient<H> {
     /// The height of the latest block the chain itself reports as finalized,
     /// the lower of two providers' views. Not every chain supports the tag.
     pub async fn finalized_block_number(&self) -> Result<u64, String> {
-        self.call(
-            "eth_getBlockByNumber",
-            &["finalized".into(), false.into()],
-            LARGE_RESPONSE,
+        self.block_header(
+            "finalized".into(),
             |header: Option<BlockHeader>| {
                 header
                     .map(|header| header.number.to::<u64>())
@@ -222,10 +220,8 @@ impl<H: HttpOutcall> EvmClient<H> {
             return Err("receipt is missing its block identity".into());
         };
         let header = self
-            .call(
-                "eth_getBlockByNumber",
-                &[format!("0x{number:x}").into(), false.into()],
-                LARGE_RESPONSE,
+            .block_header(
+                format!("0x{number:x}"),
                 |header: Option<BlockHeader>| {
                     header.ok_or_else(|| "receipt block is unavailable".to_string())
                 },
@@ -233,6 +229,35 @@ impl<H: HttpOutcall> EvmClient<H> {
             )
             .await?;
         Ok(header.number.to::<u64>() == number && header.hash == Some(hash))
+    }
+
+    /// `eth_getBlockByNumber(..., false)` still returns every transaction hash.
+    /// Prefer headers so even very busy blocks fit in a small response. Older
+    /// providers can fall back to a bounded full block, without weakening either
+    /// the identity quorum or the number/hash checks performed by the caller.
+    async fn block_header<T>(
+        &self,
+        tag: String,
+        interpret: impl Fn(Option<BlockHeader>) -> Result<T, String>,
+        agreement: Agreement<T>,
+    ) -> Result<T, String> {
+        json_rpc_call_with_fallback(
+            &self.outcall,
+            &self.providers,
+            RpcCall {
+                method: "eth_getHeaderByNumber",
+                params: &[tag.clone().into()],
+                max_response_bytes: LARGE_RESPONSE,
+            },
+            Some(RpcCall {
+                method: "eth_getBlockByNumber",
+                params: &[tag.into(), false.into()],
+                max_response_bytes: BLOCK_RESPONSE,
+            }),
+            interpret,
+            agreement,
+        )
+        .await
     }
 
     /// Broadcasts a signed transaction.
@@ -440,6 +465,184 @@ fn decode_abi_uint(bytes: &[u8]) -> Result<U256, String> {
         return Err("abi uint result must be 32 bytes".to_string());
     }
     Ok(U256::from_be_slice(bytes))
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+    use ic_cdk_management_canister::{HttpRequestArgs, HttpRequestResult};
+    use std::{cell::RefCell, rc::Rc};
+
+    struct HeaderRpc {
+        block: Value,
+        compact_error: Option<i64>,
+        fail_second: bool,
+        requests: Rc<RefCell<Vec<HttpRequestArgs>>>,
+    }
+
+    impl HeaderRpc {
+        fn new() -> Self {
+            Self {
+                block: serde_json::from_slice(include_bytes!(
+                    "../tests/fixtures/data/bnb-block-34500000.json"
+                ))
+                .unwrap(),
+                compact_error: None,
+                fail_second: false,
+                requests: Rc::default(),
+            }
+        }
+        fn receipt(&self) -> EvmReceipt {
+            serde_json::from_value(serde_json::json!({
+                "transactionHash": B256::from([1; 32]),
+                "blockNumber": self.block["result"]["number"],
+                "blockHash": self.block["result"]["hash"],
+                "status": "0x1", "logs": []
+            }))
+            .unwrap()
+        }
+        fn make_huge(&mut self) {
+            self.block["result"]["transactions"] = serde_json::json!(
+                (0..40_000u64)
+                    .map(|i| format!("0x{i:064x}"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(serde_json::to_vec(&self.block).unwrap().len() > BLOCK_RESPONSE as usize);
+        }
+    }
+
+    impl HttpOutcall for HeaderRpc {
+        async fn request(&self, args: &HttpRequestArgs) -> Result<HttpRequestResult, String> {
+            self.requests.borrow_mut().push(args.clone());
+            if self.fail_second && args.url == "https://b.example" {
+                return Err("second provider unavailable".into());
+            }
+            let request: Value = serde_json::from_slice(args.body.as_ref().unwrap()).unwrap();
+            let mut response = self.block.clone();
+            match request["method"].as_str().unwrap() {
+                "eth_getHeaderByNumber" => {
+                    assert_eq!(request["params"].as_array().unwrap().len(), 1);
+                    if let Some(code) = self.compact_error {
+                        response = serde_json::json!({"jsonrpc":"2.0", "id":1,
+                            "error":{"code":code,"message":"provider RPC error"}});
+                    } else {
+                        response["result"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("transactions");
+                    }
+                }
+                "eth_getBlockByNumber" => assert_eq!(request["params"][1], false),
+                method => panic!("unexpected method {method}"),
+            }
+            let body = serde_json::to_vec(&response).unwrap();
+            if body.len() as u64 > args.max_response_bytes.unwrap() {
+                return Err("response exceeds max_response_bytes".into());
+            }
+            Ok(HttpRequestResult {
+                status: 200u64.into(),
+                headers: vec![],
+                body,
+            })
+        }
+    }
+
+    fn client(rpc: HeaderRpc) -> EvmClient<HeaderRpc> {
+        EvmClient::new(
+            vec!["https://a.example".into(), "https://b.example".into()],
+            3,
+            rpc,
+        )
+    }
+
+    #[test]
+    fn real_and_larger_blocks_use_only_compact_headers() {
+        for huge in [false, true] {
+            let mut rpc = HeaderRpc::new();
+            assert!(serde_json::to_vec(&rpc.block).unwrap().len() > LARGE_RESPONSE as usize);
+            if huge {
+                rpc.make_huge();
+            }
+            let receipt = rpc.receipt();
+            let requests = rpc.requests.clone();
+            let client = client(rpc);
+            assert_eq!(
+                futures::executor::block_on(client.receipt_is_canonical(&receipt)),
+                Ok(true)
+            );
+            assert_eq!(
+                futures::executor::block_on(client.finalized_block_number()),
+                Ok(34_500_000)
+            );
+            assert_eq!(requests.borrow().len(), 4);
+            for request in requests.borrow().iter() {
+                let body: Value = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                assert_eq!(body["method"], "eth_getHeaderByNumber");
+                assert_eq!(request.max_response_bytes, Some(LARGE_RESPONSE));
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_compact_methods_use_bounded_full_blocks_and_still_need_two_providers() {
+        for code in [-32601, -32004] {
+            for fail_second in [false, true] {
+                let mut rpc = HeaderRpc::new();
+                rpc.compact_error = Some(code);
+                rpc.fail_second = fail_second;
+                let receipt = rpc.receipt();
+                let requests = rpc.requests.clone();
+                let result =
+                    futures::executor::block_on(client(rpc).receipt_is_canonical(&receipt));
+                assert_eq!(result.is_ok(), !fail_second);
+                for request in requests.borrow().iter() {
+                    let body: Value =
+                        serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                    if body["method"] == "eth_getBlockByNumber" {
+                        assert_eq!(request.max_response_bytes, Some(BLOCK_RESPONSE));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_oversized_fallback_and_a_wrong_block_hash_cannot_confirm() {
+        let mut rpc = HeaderRpc::new();
+        rpc.make_huge();
+        rpc.compact_error = Some(-32601);
+        let receipt = rpc.receipt();
+        assert!(futures::executor::block_on(client(rpc).receipt_is_canonical(&receipt)).is_err());
+
+        let rpc = HeaderRpc::new();
+        let mut receipt = rpc.receipt();
+        receipt.block_hash = Some(B256::ZERO);
+        assert_eq!(
+            futures::executor::block_on(client(rpc).receipt_is_canonical(&receipt)),
+            Ok(false)
+        );
+
+        let rpc = HeaderRpc::new();
+        let mut receipt = rpc.receipt();
+        receipt.block_number = Some(U64::from(34_500_001));
+        assert_eq!(
+            futures::executor::block_on(client(rpc).receipt_is_canonical(&receipt)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn rate_limits_do_not_trigger_expensive_fallbacks() {
+        let mut rpc = HeaderRpc::new();
+        rpc.compact_error = Some(-32005);
+        let receipt = rpc.receipt();
+        let requests = rpc.requests.clone();
+        assert!(futures::executor::block_on(client(rpc).receipt_is_canonical(&receipt)).is_err());
+        assert_eq!(requests.borrow().len(), 2);
+        for request in requests.borrow().iter() {
+            assert_eq!(request.max_response_bytes, Some(LARGE_RESPONSE));
+        }
+    }
 }
 
 #[cfg(test)]
