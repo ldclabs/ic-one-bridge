@@ -41,6 +41,7 @@ struct Info {
     evm_address: String,
     total_bridge_count: u64,
     total_bridged_tokens: u128,
+    icp_collected_fees: u128,
     finalize_bridging_round: (u64, bool),
 }
 #[derive(Debug, CandidType, Deserialize)]
@@ -48,7 +49,6 @@ struct RuntimeInfo {
     keys_ready: (bool, bool),
     ledger_verified: bool,
     pending_count: u64,
-    icp_transfer_fees: u128,
     migration_remaining: u64,
 }
 impl std::ops::Deref for Info {
@@ -86,7 +86,6 @@ struct Stats {
 }
 #[derive(Debug, CandidType, Deserialize)]
 enum Phase {
-    Recorded,
     Planning,
     Prepared,
     Submitted,
@@ -447,6 +446,101 @@ fn register_evm_chain(
 
 #[test]
 #[ignore = "build fixture and test Wasm with make integration-test"]
+fn icp_payouts_need_no_fee_funding_before_or_after_upgrade() {
+    for legacy in [false, true] {
+        let pic = test_network();
+        let user = Principal::self_authenticating([7; 32]);
+        let admin = Principal::self_authenticating([9; 32]);
+        let ledger = deploy(&pic, wasm("ledger.wasm"), encode_args(()).unwrap());
+        let bridge = if legacy {
+            let id = deploy(
+                &pic,
+                wasm("legacy.wasm"),
+                encode_args((ledger, Some(3u8))).unwrap(),
+            );
+            pic.upgrade_canister(
+                id,
+                wasm("bridge.wasm"),
+                encode_one(None::<u8>).unwrap(),
+                None,
+            )
+            .unwrap();
+            id
+        } else {
+            deploy(
+                &pic,
+                wasm("bridge.wasm"),
+                encode_one(Some(Args::Init(Init {
+                    key_name: "test_key_1".into(),
+                    token_name: "Fixture".into(),
+                    token_symbol: "TEST".into(),
+                    token_decimals: 8,
+                    token_logo: "".into(),
+                    token_ledger: ledger,
+                    token_bridge_fee: 1,
+                    min_threshold_to_bridge: 2,
+                    governance_canister: Some(admin),
+                    erc20_gas_limit: None,
+                })))
+                .unwrap(),
+            )
+        };
+        let mut rpc = Rpc::default();
+        ready(&pic, &mut rpc, bridge);
+        if !legacy {
+            rpc.bridge = info(&pic, bridge).evm_address.parse().unwrap();
+            rpc.user = query::<Result<String, String>>(
+                &pic,
+                bridge,
+                user,
+                "evm_address",
+                encode_one(None::<Principal>).unwrap(),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+            register_evm_chain(&pic, &mut rpc, bridge, admin, "BNB", 56);
+            bridge_result(
+                update(
+                    &pic,
+                    &mut rpc,
+                    bridge,
+                    user,
+                    "bridge",
+                    encode_args(("BNB", "ICP", 100u128, None::<String>)).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        pump(&pic, &mut rpc, 60);
+        // The ledger pays its fee directly. No ICP deposit or sponsorship was
+        // needed, even when the bridge fee is smaller than the ledger fee.
+        assert_eq!(stats(&pic, ledger).incoming, 0);
+        assert_eq!(stats(&pic, ledger).outgoing, 1);
+        assert_eq!(
+            stats(&pic, ledger).last_amount,
+            if legacy { 100 } else { 99 }
+        );
+        assert_eq!(stats(&pic, ledger).last_to, Some(user));
+        assert_eq!(info(&pic, bridge).icp_collected_fees, 0);
+        assert_eq!(info(&pic, bridge).pending_count, 0);
+        pic.upgrade_canister(
+            bridge,
+            wasm("bridge.wasm"),
+            encode_one(None::<u8>).unwrap(),
+            None,
+        )
+        .unwrap();
+        ready(&pic, &mut rpc, bridge);
+        pump(&pic, &mut rpc, 30);
+        assert_eq!(stats(&pic, ledger).outgoing, 1);
+        assert_eq!(info(&pic, bridge).pending_count, 0);
+    }
+}
+
+#[test]
+#[ignore = "build fixture and test Wasm with make integration-test"]
 fn busy_evm_blocks_settle_deposits_and_payouts_without_duplicate_payments() {
     // The compact path must also work when a full block exceeds the IC limit;
     // the compatibility path covers providers lacking the compact method.
@@ -546,18 +640,6 @@ fn busy_evm_blocks_settle_deposits_and_payouts_without_duplicate_payments() {
             source
         );
         assert_eq!(stats(&pic, ledger).incoming, 1);
-        bridge_result(
-            update(
-                &pic,
-                &mut rpc,
-                bridge,
-                user,
-                "fund_ledger_fees",
-                encode_one(1000u128).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
         bridge_result(
             update(
                 &pic,
@@ -905,18 +987,6 @@ fn payment_recovery_traps_watchdog_upgrade_and_certification() {
 
     // A stalled old ledger callback survives the watchdog. The newer retry gets
     // Duplicate; a healthy task also progresses, and the late old reply is inert.
-    bridge_result(
-        update(
-            &pic,
-            &mut rpc,
-            bridge,
-            admin,
-            "fund_ledger_fees",
-            encode_one(100u128).unwrap(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
     // Trap in a timer callback as well as in the original ingress callback.
     update(
         &pic,
@@ -1029,7 +1099,6 @@ fn payment_recovery_traps_watchdog_upgrade_and_certification() {
     pump(&pic, &mut rpc, 20);
     assert_eq!(info(&pic, bridge).total_bridge_count, 5);
     assert_eq!(info(&pic, bridge).total_bridged_tokens, 500);
-    assert_eq!(info(&pic, bridge).icp_transfer_fees, 20);
 
     // Distinct equal-sized Solana payouts sharing one recent blockhash must
     // remain distinct messages. Verify the real management-canister signature.

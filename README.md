@@ -75,7 +75,7 @@ provider errors, new tasks are paused and the rounds slow to an hourly cooldown;
 Track a task with `my_bridge_log(from_tx)`, `my_pending_logs()` and `my_finalized_logs(take, prev)`.
 Pending results are bounded; use `my_pending_logs_page(take, after_task_id)` or
 `pending_logs_page(take, after_task_id)` for later pages. New optional `runtime` fields carry task IDs,
-readiness, resource limits and operating-fee accounting without requiring older bridge instances to
+readiness, resource limits and fee-withdrawal availability without requiring older bridge instances to
 return those fields.
 
 Public signing/RPC work is subsidized within configurable quotas: 12 requests per user and 120
@@ -184,7 +184,7 @@ dfx canister call one_bridge_canister admin_set_svm_providers '(vec { "https://a
 dfx canister call one_bridge_canister admin_add_svm_contract '("<SPL mint address>")' --ic
 ```
 
-#### Operating fees and browser RPCs
+#### Ledger transfers and browser RPCs
 
 `info().evm_providers` and `info().svm_providers` expose only public browser endpoints. Anonymous
 origin URLs continue to work automatically. If internal URLs contain paths or credentials, publish
@@ -196,12 +196,12 @@ Transfer-fee/hook and other extension semantics must not enter nominal-amount br
 Previously configured mints are revalidated during upgrade. Users can still withdraw a legacy
 extension mint to an already-created recipient ATA where the existing transfer instruction supports it.
 
-The ICP ledger fee is paid from an explicitly tracked operating budget. A sponsor can approve the
-canister on the token ledger and call `fund_ledger_fees(amount)` to fund it. Earned, verified ICP-side
-bridge fees can also pay those costs. New accounting excludes unknown historical expenses: after
-upgrading from older code, governance must reconcile backing before using
-`admin_recognize_legacy_fees(total_verified_legacy_fees, evidence)`. The argument is a cumulative
-verified total, so repeating the same proposal cannot credit it twice.
+The token ledger charges transfer fees directly to the bridge's existing ledger account when it
+pays a recipient or withdraws bridge fees. Payouts need no separate operating credit, sponsorship
+or historical-fee recognition, including the first payout after an upgrade. The account must hold
+enough tokens for the payout and its ledger fee. Governance withdrawals retain the existing
+`icp_collected_fees - total_withdrawn_fees` ceiling; unresolved withdrawals stay counted until their
+outcome is known. This ceiling does not gate user payouts.
 
 `/config` (JSON) and `/config.cbor` provide cached, certified configuration and funds addresses.
 The legacy HTTP `/` endpoint remains an uncertified operational view. Check initialization flags
@@ -258,14 +258,15 @@ The generated Candid file is the authoritative interface:
   `pending_logs_page`, `my_finalized_logs`, `finalized_logs`.
 - Withdraw from a user's derived wallet: `erc20_transfer`, `erc20_transfer_tx`,
   `evm_transfer_tx`, `spl_transfer_tx`, `sol_transfer_tx`.
-- Fund ledger operating costs: `fund_ledger_fees`.
 - Governance configuration and recovery: the existing admin methods plus
   `admin_set_resource_limits`, `admin_set_evm_fee_limits`, `admin_set_public_providers`,
   `admin_recheck_task`, `admin_resolve_operation`, `admin_resolve_legacy_payout`,
-  `admin_recognize_legacy_fees`, and their `validate_*` counterparts.
+  and their `validate_*` counterparts.
 
-See [the migration and recovery guide](./docs/reviews/remediation-2026-09-06.md) for defaults,
-manual reconciliation preconditions and downgrade restrictions.
+After upgrading, wait for `info().runtime.migration_remaining` to reach zero and for ledger/key
+verification to complete. Preserve the canister ID, ledger and keys. Do not downgrade to a version
+that cannot read the stable pending/journal tables while payment intents remain outstanding.
+Unknown payouts require ledger/chain reconciliation before governance can reset them.
 
 Full Candid API definition: [one_bridge_canister.did](./src/one_bridge_canister/one_bridge_canister.did)
 

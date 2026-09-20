@@ -27,7 +27,8 @@ TODO
 
 Supported assets must have fixed-unit transfer semantics. Solana mint extensions such as transfer
 fees and hooks are rejected for bridging; the ledger decimals and minting account are checked at
-initialization. The project must fund the tracked ICP ledger-fee budget and native gas reserves,
-configure independent official core RPC providers, and publish separate anonymous browser RPC
+initialization. The bridge's ledger account must cover payouts and transfer fees, and its external
+addresses need native gas reserves. The project must configure independent official core RPC
+providers and publish separate anonymous browser RPC
 endpoints when the internal providers require credentials. Governance must register any newly used
 admin methods and their matching validation functions before invoking them through SNS proposals.

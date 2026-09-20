@@ -89,7 +89,6 @@ export type PayoutResolution = { 'Failed' : null } |
   { 'Expired' : null } |
   { 'Incomplete' : null };
 export type Phase = { 'Prepared' : null } |
-  { 'Recorded' : null } |
   { 'Rejected' : string } |
   { 'NeedsReview' : string } |
   { 'Submitted' : null } |
@@ -178,20 +177,15 @@ export interface StateInfo {
   'sub_bridges' : Array<Principal>,
 }
 export interface StateRuntimeInfo {
-  'icp_transfer_fees' : bigint,
   'resource_limits' : ResourceLimits,
   'pending_count' : bigint,
   'ledger_verified' : boolean,
   'keys_ready' : [boolean, boolean],
-  'legacy_fees_recognized' : bigint,
-  'ledger_fee_credit' : bigint,
   'migration_remaining' : bigint,
   'evm_provider_hosts' : Array<[string, Array<string>]>,
   'svm_provider_hosts' : Array<string>,
   'available_icp_fees' : bigint,
-  'reserved_icp_fees' : bigint,
   'evm_fee_limits' : Array<[string, EvmFeeLimits]>,
-  'spendable_icp_fees' : bigint,
   'unresolved_operations' : bigint,
   'svm_mint_verified' : boolean,
 }
@@ -245,7 +239,6 @@ export interface _SERVICE {
     Array<OperationInfo>
   >,
   'admin_recheck_task' : ActorMethod<[BridgeTx], Result>,
-  'admin_recognize_legacy_fees' : ActorMethod<[bigint, string], Result>,
   'admin_remove_bridges' : ActorMethod<[Array<Principal>], Result>,
   'admin_resolve_legacy_payout' : ActorMethod<
     [BridgeTx, bigint, Resolution, string],
@@ -280,7 +273,6 @@ export interface _SERVICE {
   'evm_sign' : ActorMethod<[Uint8Array | number[]], Result_6>,
   'evm_transfer_tx' : ActorMethod<[string, string, bigint], Result_5>,
   'finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_7>,
-  'fund_ledger_fees' : ActorMethod<[bigint], Result_2>,
   'info' : ActorMethod<[], Result_8>,
   'my_bridge_log' : ActorMethod<[BridgeTx], Result_1>,
   'my_finalized_logs' : ActorMethod<[number, [] | [bigint]], Result_7>,
@@ -308,10 +300,6 @@ export interface _SERVICE {
   'validate_admin_collect_fees' : ActorMethod<[Principal, bigint], Result_5>,
   'validate_admin_init_public_keys' : ActorMethod<[], Result_5>,
   'validate_admin_recheck_task' : ActorMethod<[BridgeTx], Result_5>,
-  'validate_admin_recognize_legacy_fees' : ActorMethod<
-    [bigint, string],
-    Result_5
-  >,
   'validate_admin_remove_bridges' : ActorMethod<[Array<Principal>], Result_5>,
   'validate_admin_resolve_legacy_payout' : ActorMethod<
     [BridgeTx, bigint, Resolution, string],

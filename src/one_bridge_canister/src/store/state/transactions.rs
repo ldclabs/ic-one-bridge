@@ -164,7 +164,6 @@ async fn sign_evm_tx(
                 deadline: TxDeadline::Nonce(tx.nonce),
                 validity: None,
             },
-            0,
         )?;
         journal::start_signature(id)?;
     }
@@ -462,7 +461,6 @@ async fn sign_svm_tx(
                 deadline: TxDeadline::BlockHeight(blockhash.last_valid_block_height),
                 validity: Some(blockhash.clone().into()),
             },
-            0,
         )?;
         journal::start_signature(id)?;
     }

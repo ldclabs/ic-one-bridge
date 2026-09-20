@@ -61,10 +61,9 @@ pub struct State {
     pub total_bridged_tokens: u128,
     #[serde(default)]
     pub total_collected_fees: u128,
-    /// The part of `total_collected_fees` that sits on the ICP ledger: the
-    /// fees of tasks whose deposit came in on ICP. A task deposited on
-    /// another chain leaves its fee there, so only this part can be withdrawn
-    /// through the ledger without eating into what backs the other chains.
+    /// Fees from ICP-origin deposits, retained as the existing conservative
+    /// governance withdrawal ceiling. This statistic does not gate payouts
+    /// or represent a separate balance for paying ledger transfer fees.
     #[serde(default)]
     pub icp_collected_fees: u128,
     /// Whether `icp_collected_fees` was recovered from the archive already.
@@ -81,20 +80,6 @@ pub struct State {
     pub resource_limits: ResourceLimits,
     #[serde(default)]
     pub evm_fee_limits: HashMap<String, EvmFeeLimits>,
-    #[serde(default)]
-    pub ledger_fee_credit: u128,
-    #[serde(default)]
-    pub icp_transfer_fees: u128,
-    #[serde(default)]
-    pub reserved_icp_fees: u128,
-    #[serde(default)]
-    pub fee_accounting_version: u8,
-    #[serde(default)]
-    pub spendable_icp_fees: u128,
-    #[serde(default)]
-    pub withdrawals_baseline: u128,
-    #[serde(default)]
-    pub legacy_fees_recognized: u128,
 }
 
 #[derive(CandidType, Serialize, Deserialize)]
@@ -136,12 +121,7 @@ pub struct StateRuntimeInfo {
     pub ledger_verified: bool,
     pub resource_limits: ResourceLimits,
     pub evm_fee_limits: HashMap<String, EvmFeeLimits>,
-    pub ledger_fee_credit: u128,
-    pub icp_transfer_fees: u128,
-    pub reserved_icp_fees: u128,
-    pub spendable_icp_fees: u128,
     pub available_icp_fees: u128,
-    pub legacy_fees_recognized: u128,
     pub pending_count: u64,
     pub unresolved_operations: u64,
     pub migration_remaining: u64,
@@ -183,12 +163,7 @@ impl StateInfo {
                         )
                     })
                     .collect(),
-                ledger_fee_credit: s.ledger_fee_credit,
-                icp_transfer_fees: s.icp_transfer_fees,
-                reserved_icp_fees: s.reserved_icp_fees,
-                spendable_icp_fees: s.spendable_icp_fees,
                 available_icp_fees: journal::available_withdrawal(s),
-                legacy_fees_recognized: s.legacy_fees_recognized,
                 pending_count: pending::len(),
                 unresolved_operations: journal::open_count(),
                 migration_remaining: migration::remaining(),
@@ -300,13 +275,6 @@ impl State {
             error_rounds: 0,
             resource_limits: ResourceLimits::default(),
             evm_fee_limits: HashMap::new(),
-            ledger_fee_credit: 0,
-            icp_transfer_fees: 0,
-            reserved_icp_fees: 0,
-            fee_accounting_version: 1,
-            spendable_icp_fees: 0,
-            withdrawals_baseline: 0,
-            legacy_fees_recognized: 0,
         }
     }
 }

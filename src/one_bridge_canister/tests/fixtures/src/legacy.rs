@@ -97,6 +97,21 @@ fn append_old() {
 fn init(ledger: Principal, scenario: Option<u8>) {
     let scenario = scenario.unwrap_or(0);
     let archive_count = if scenario == 2 { 150 } else { 1 };
+    let pending = if scenario == 3 {
+        // A confirmed external deposit awaiting its first ICP payout, with no
+        // historical ICP fee income or any of the unreleased budget fields.
+        let mut item = log(7);
+        item.from = Target::Evm("BNB".into());
+        item.to = Target::Icp;
+        item.from_tx = Tx::Evm(true, [7; 32].into());
+        item
+    } else {
+        log(if scenario == 0 {
+            7
+        } else {
+            100 + archive_count - 1
+        })
+    };
     let state = OldState {
         key_name: "test_key_1".into(),
         icp_address: ic_cdk::api::canister_self(),
@@ -115,11 +130,7 @@ fn init(ledger: Principal, scenario: Option<u8>) {
             chain_code: vec![].into(),
         },
         governance_canister: None,
-        pending: VecDeque::from([log(if scenario == 0 {
-            7
-        } else {
-            100 + archive_count - 1
-        })]),
+        pending: VecDeque::from([pending]),
         finalize_bridging_round: (0, false),
     };
     let mut cell = StableCell::init(mem(0), Vec::new());

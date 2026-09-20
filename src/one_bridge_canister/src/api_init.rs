@@ -91,7 +91,6 @@ fn post_upgrade(args: Option<CanisterArgs>) {
         s.ledger_verified = false;
         s.svm_mint_verified = false;
     });
-    store::state::initialize_fee_accounting();
     store::state::start_migrations();
 
     match args {

@@ -294,9 +294,8 @@ fn check_providers(providers: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Withdraws collected fees. Only the fees that sit on the ICP ledger — those
-/// of tasks deposited on ICP — can be taken from it; a task deposited on
-/// another chain left its fee there.
+/// Withdraws collected fees under the existing ICP-origin income ceiling.
+/// Ledger transfer fees are paid directly by the bridge account.
 #[ic_cdk::update(guard = "is_controller")]
 async fn admin_collect_fees(to: Principal, icp_amount: u128) -> Result<store::BridgeTx, String> {
     store::state::collect_fees(ic_cdk::api::msg_caller(), to, icp_amount).await
@@ -567,30 +566,6 @@ fn validate_admin_resolve_legacy_payout(
     let operation =
         store::state::validate_legacy_resolution(&from_tx, task_id, &resolution, &evidence)?;
     pretty_format(&(operation, resolution, evidence))
-}
-
-/// Cumulative historical fee recognition after external backing reconciliation.
-/// The amount is a verified total, not an increment; duplicate proposals are idempotent.
-#[ic_cdk::update(guard = "is_controller")]
-async fn admin_recognize_legacy_fees(
-    total_verified_legacy_fees: u128,
-    evidence: String,
-) -> Result<(), String> {
-    store::state::recognize_legacy_fees(
-        total_verified_legacy_fees,
-        evidence,
-        ic_cdk::api::msg_caller(),
-    )
-    .await
-}
-#[ic_cdk::update(guard = "is_controller")]
-fn validate_admin_recognize_legacy_fees(
-    total_verified_legacy_fees: u128,
-    evidence: String,
-) -> Result<String, String> {
-    let increment =
-        store::state::validate_legacy_fee_recognition(total_verified_legacy_fees, &evidence)?;
-    pretty_format(&(total_verified_legacy_fees, increment, evidence))
 }
 
 #[ic_cdk::update(guard = "is_controller")]

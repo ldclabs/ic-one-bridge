@@ -320,7 +320,6 @@ mod tests {
         journal::prepare(
             entry.id,
             journal::Request::LegacyPayout(Box::new(live.clone())),
-            0,
         )
         .unwrap();
         live.payout_attempt = Some(entry.id);

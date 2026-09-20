@@ -18,6 +18,7 @@ pub fn next_id() -> u64 {
         id
     })
 }
+#[cfg(test)]
 pub fn id_high_water() -> u64 {
     NEXT_ID.with_borrow(|cell| *cell.get())
 }

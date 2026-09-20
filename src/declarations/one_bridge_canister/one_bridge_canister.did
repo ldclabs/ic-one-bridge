@@ -88,7 +88,6 @@ type OperationInfo = record {
 type PayoutResolution = variant { Failed; Completed; Expired; Incomplete };
 type Phase = variant {
   Prepared;
-  Recorded;
   Rejected : text;
   NeedsReview : text;
   Submitted;
@@ -168,20 +167,15 @@ type StateInfo = record {
   sub_bridges : vec principal;
 };
 type StateRuntimeInfo = record {
-  icp_transfer_fees : nat;
   resource_limits : ResourceLimits;
   pending_count : nat64;
   ledger_verified : bool;
   keys_ready : record { bool; bool };
-  legacy_fees_recognized : nat;
-  ledger_fee_credit : nat;
   migration_remaining : nat64;
   evm_provider_hosts : vec record { text; vec text };
   svm_provider_hosts : vec text;
   available_icp_fees : nat;
-  reserved_icp_fees : nat;
   evm_fee_limits : vec record { text; EvmFeeLimits };
-  spendable_icp_fees : nat;
   unresolved_operations : nat64;
   svm_mint_verified : bool;
 };
@@ -245,9 +239,8 @@ service : (opt CanisterArgs) -> {
   // `admin_retry_bridging_task` with a refund target. A task whose payout is
   // broadcast but not confirmed is refused unless `force` is set.
   admin_close_bridging_task : (BridgeTx, opt bool) -> (Result_1);
-  // Withdraws collected fees. Only the fees that sit on the ICP ledger — those
-  // of tasks deposited on ICP — can be taken from it; a task deposited on
-  // another chain left its fee there.
+  // Withdraws collected fees under the existing ICP-origin income ceiling.
+  // Ledger transfer fees are paid directly by the bridge account.
   admin_collect_fees : (principal, nat) -> (Result_2);
   // Fetches whichever of the subnet master keys the canister is still
   // missing, and returns the bridge's EVM and Solana addresses. Bridging that
@@ -255,9 +248,6 @@ service : (opt CanisterArgs) -> {
   admin_init_public_keys : () -> (Result_3);
   admin_operations : (principal, nat32, opt nat64) -> (vec OperationInfo) query;
   admin_recheck_task : (BridgeTx) -> (Result);
-  // Cumulative historical fee recognition after external backing reconciliation.
-  // The amount is a verified total, not an increment; duplicate proposals are idempotent.
-  admin_recognize_legacy_fees : (nat, text) -> (Result);
   admin_remove_bridges : (vec principal) -> (Result);
   admin_resolve_legacy_payout : (BridgeTx, nat64, Resolution, text) -> (Result);
   // Explicit governance attestation after external accounting. This is not an
@@ -304,7 +294,6 @@ service : (opt CanisterArgs) -> {
   evm_sign : (blob) -> (Result_6);
   evm_transfer_tx : (text, text, nat) -> (Result_5);
   finalized_logs : (nat32, opt nat64) -> (Result_7) query;
-  fund_ledger_fees : (nat) -> (Result_2);
   info : () -> (Result_8) query;
   my_bridge_log : (BridgeTx) -> (Result_1) query;
   my_finalized_logs : (nat32, opt nat64) -> (Result_7) query;
@@ -327,7 +316,6 @@ service : (opt CanisterArgs) -> {
   validate_admin_collect_fees : (principal, nat) -> (Result_5);
   validate_admin_init_public_keys : () -> (Result_5);
   validate_admin_recheck_task : (BridgeTx) -> (Result_5);
-  validate_admin_recognize_legacy_fees : (nat, text) -> (Result_5);
   validate_admin_remove_bridges : (vec principal) -> (Result_5);
   validate_admin_resolve_legacy_payout : (
       BridgeTx,

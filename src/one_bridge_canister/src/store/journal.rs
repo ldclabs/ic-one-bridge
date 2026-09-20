@@ -16,18 +16,10 @@ pub struct DepositPlan {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Purpose {
-    FeeRecognition {
-        total: u128,
-        evidence: String,
-    },
     Deposit(DepositPlan),
     Payout(u64),
     Withdrawal {
         to: Principal,
-        amount: u128,
-        ledger: Principal,
-    },
-    FeeFunding {
         amount: u128,
         ledger: Principal,
     },
@@ -76,7 +68,6 @@ pub struct Reconciliation {
 
 #[derive(Clone, CandidType, Serialize, Deserialize, Debug)]
 pub enum Phase {
-    Recorded,
     Planning,
     Prepared,
     Submitted,
@@ -97,13 +88,9 @@ pub struct Entry {
     pub signed: Option<(BridgeTx, TxMeta)>,
     pub signature: Option<ByteBuf>,
     pub handled: bool,
-    pub reserved_fee: u128,
-    pub accounting_settled: bool,
-    /// The result whose accounting effects were applied. Older journal rows
-    /// only carried `accounting_settled`; their phase supplies this value when
-    /// they are first read by the new code.
-    #[serde(default)]
-    pub accounting_success: Option<bool>,
+    /// A withdrawal counts against total_withdrawn_fees before submission and
+    /// stays counted while its outcome is unknown or successful.
+    pub withdrawal_counted: bool,
     pub error: Option<String>,
     #[serde(default)]
     pub revision: u64,
@@ -176,8 +163,6 @@ pub fn info(entry: Entry) -> OperationInfo {
         Purpose::Deposit(plan) => ("deposit", Some(plan)),
         Purpose::Payout(_) => ("payout", None),
         Purpose::Withdrawal { .. } => ("fee withdrawal", None),
-        Purpose::FeeFunding { .. } => ("fee funding", None),
-        Purpose::FeeRecognition { .. } => ("fee reconciliation", None),
         Purpose::LegacyConflict { .. } => ("legacy pending conflict", None),
     };
     OperationInfo {
@@ -283,7 +268,7 @@ pub fn put(entry: &Entry) {
             && !matches!(entry.phase, Phase::Rejected(_))
             && matches!(
                 entry.purpose,
-                Purpose::Deposit(_) | Purpose::Withdrawal { .. } | Purpose::FeeFunding { .. }
+                Purpose::Deposit(_) | Purpose::Withdrawal { .. }
             )
         {
             ids.insert(key, entry.id);
@@ -330,18 +315,6 @@ pub fn open_withdrawal(owner: Principal) -> Option<Entry> {
     ids.into_iter()
         .filter_map(get)
         .find(|e| matches!(e.purpose, Purpose::Withdrawal { .. }))
-}
-
-pub fn open_funding(owner: Principal) -> Option<Entry> {
-    let mut start = vec![255];
-    start.extend_from_slice(&UserLogKey::new(&owner, 0).0);
-    let mut end = vec![255];
-    end.extend_from_slice(&UserLogKey::new(&owner, u64::MAX).0);
-    REQUEST_IDS
-        .with_borrow(|ids| ids.range(start..end).map(|e| e.value()).collect::<Vec<_>>())
-        .into_iter()
-        .filter_map(get)
-        .find(|entry| matches!(entry.purpose, Purpose::FeeFunding { .. }))
 }
 
 fn explicit_request_key(owner: Principal, id: &[u8]) -> Result<Vec<u8>, String> {
@@ -391,9 +364,7 @@ pub fn draft(owner: Principal, purpose: Purpose, created_at: u64) -> Entry {
         signed: None,
         signature: None,
         handled: false,
-        reserved_fee: 0,
-        accounting_settled: false,
-        accounting_success: None,
+        withdrawal_counted: false,
         error: None,
         revision: 0,
         call_generation: 0,
@@ -463,7 +434,10 @@ pub fn page(owner: Principal, take: usize, before: Option<u64>) -> Vec<Operation
         .collect()
 }
 
-pub fn prepare(id: u64, request: Request, fee: u128) -> Result<(), String> {
+/// Persist the exact request before calling the ledger. Transfer fees are paid
+/// directly from the bridge account; only governance withdrawals reserve their
+/// principal against the existing earned-fee ceiling.
+pub fn prepare(id: u64, request: Request) -> Result<(), String> {
     let mut entry = get(id).ok_or_else(|| "operation not found".to_string())?;
     if entry.request.is_some() {
         return Ok(());
@@ -471,35 +445,20 @@ pub fn prepare(id: u64, request: Request, fee: u128) -> Result<(), String> {
     if !matches!(entry.phase, Phase::Planning) {
         return Err("operation cannot be prepared again".into());
     }
-    if matches!(request, Request::Transfer { .. }) {
+    if matches!(request, Request::Transfer { .. })
+        && let Purpose::Withdrawal { amount, .. } = &entry.purpose
+    {
         STATE.with_borrow_mut(|s| {
-            let amount = match &entry.purpose {
-                Purpose::Withdrawal { amount, .. } => *amount,
-                _ => 0,
-            };
-            let needed = fee
-                .checked_add(amount)
-                .ok_or_else(|| "fee reservation overflow".to_string())?;
-            if available_operating_funds(s) < needed {
-                return Err(
-                    "ICP: fund the ledger fee budget before transferring or withdrawing"
-                        .to_string(),
-                );
-            }
-            if amount > available_withdrawal(s) {
+            if *amount > available_withdrawal(s) {
                 return Err("withdrawal exceeds earned ICP fees".to_string());
             }
-            s.reserved_icp_fees = s
-                .reserved_icp_fees
-                .checked_add(fee)
-                .ok_or_else(|| "fee reservation overflow".to_string())?;
             s.total_withdrawn_fees = s
                 .total_withdrawn_fees
-                .checked_add(amount)
+                .checked_add(*amount)
                 .ok_or_else(|| "withdrawal overflow".to_string())?;
             Ok::<_, String>(())
         })?;
-        entry.reserved_fee = fee;
+        entry.withdrawal_counted = true;
     }
     entry.request = Some(request);
     entry.phase = Phase::Prepared;
@@ -507,89 +466,32 @@ pub fn prepare(id: u64, request: Request, fee: u128) -> Result<(), String> {
     Ok(())
 }
 
-pub fn available_operating_funds(s: &State) -> u128 {
+/// Preserve the pre-upgrade governance withdrawal cap. Outstanding withdrawals
+/// remain included in total_withdrawn_fees until proven not to have executed.
+/// Neither this cap nor historical fee migration is a ledger-fee budget.
+pub fn available_withdrawal(s: &State) -> u128 {
     if !s.icp_collected_fees_migrated {
         return 0;
     }
-    s.spendable_icp_fees
-        .saturating_add(s.ledger_fee_credit)
-        .saturating_sub(
-            s.total_withdrawn_fees
-                .saturating_sub(s.withdrawals_baseline),
-        )
-        .saturating_sub(s.icp_transfer_fees)
-        .saturating_sub(s.reserved_icp_fees)
-}
-pub fn available_withdrawal(s: &State) -> u128 {
-    s.spendable_icp_fees
-        .saturating_sub(
-            s.total_withdrawn_fees
-                .saturating_sub(s.withdrawals_baseline),
-        )
-        .min(available_operating_funds(s))
+    s.icp_collected_fees.saturating_sub(s.total_withdrawn_fees)
 }
 
-fn settled_as(entry: &Entry) -> Option<bool> {
-    if let Some(success) = entry.accounting_success {
-        Some(success)
-    } else if !entry.accounting_settled {
-        None
-    } else {
-        match entry.phase {
-            Phase::Completed(_) => Some(true),
-            Phase::Rejected(_) => Some(false),
-            _ => None,
-        }
-    }
-}
-
-fn settle_accounting(entry: &mut Entry, success: bool) {
-    let previous = settled_as(entry);
-    if previous == Some(success) {
+fn settle_withdrawal(entry: &mut Entry, counted: bool) {
+    if entry.withdrawal_counted == counted
+        || !matches!(entry.request, Some(Request::Transfer { .. }))
+    {
         return;
     }
-    STATE.with_borrow_mut(|s| {
-        if previous.is_none() && entry.reserved_fee > 0 {
-            s.reserved_icp_fees = s.reserved_icp_fees.saturating_sub(entry.reserved_fee);
-        }
-        if entry.reserved_fee > 0 {
-            match (previous, success) {
-                (None | Some(false), true) => {
-                    s.icp_transfer_fees = s.icp_transfer_fees.saturating_add(entry.reserved_fee);
-                }
-                (Some(true), false) => {
-                    s.icp_transfer_fees = s.icp_transfer_fees.saturating_sub(entry.reserved_fee);
-                }
-                _ => {}
-            }
-        }
-        if matches!(entry.request, Some(Request::Transfer { .. }))
-            && let Purpose::Withdrawal { amount, .. } = &entry.purpose
-        {
-            match (previous, success) {
-                (None, false) | (Some(true), false) => {
-                    s.total_withdrawn_fees = s.total_withdrawn_fees.saturating_sub(*amount);
-                }
-                (Some(false), true) => {
-                    s.total_withdrawn_fees = s.total_withdrawn_fees.saturating_add(*amount);
-                }
-                _ => {}
-            }
-        }
-        if let Purpose::FeeFunding { amount, .. } = &entry.purpose {
-            match (previous, success) {
-                (None | Some(false), true) => {
-                    s.ledger_fee_credit = s.ledger_fee_credit.saturating_add(*amount);
-                }
-                (Some(true), false) => {
-                    s.ledger_fee_credit = s.ledger_fee_credit.saturating_sub(*amount);
-                }
-                _ => {}
-            }
-        }
-    });
-    entry.accounting_settled = true;
-    entry.accounting_success = Some(success);
+    if let Purpose::Withdrawal { amount, .. } = &entry.purpose {
+        STATE.with_borrow_mut(|s| {
+            s.total_withdrawn_fees = if counted {
+                s.total_withdrawn_fees.saturating_add(*amount)
+            } else {
+                s.total_withdrawn_fees.saturating_sub(*amount)
+            };
+        });
+        entry.withdrawal_counted = counted;
+    }
 }
 
 pub fn completed(id: u64, tx: BridgeTx) -> Result<BridgeTx, String> {
@@ -597,13 +499,10 @@ pub fn completed(id: u64, tx: BridgeTx) -> Result<BridgeTx, String> {
     if let Phase::Completed(existing) = entry.phase {
         return Ok(existing);
     }
-    if matches!(
-        entry.purpose,
-        Purpose::Deposit(_) | Purpose::FeeFunding { .. }
-    ) {
+    if matches!(entry.purpose, Purpose::Deposit(_)) {
         pending::remember_transaction(&tx, id)?;
     }
-    settle_accounting(&mut entry, true);
+    settle_withdrawal(&mut entry, true);
     entry.phase = Phase::Completed(tx.clone());
     entry.error = None;
     put(&entry);
@@ -638,7 +537,7 @@ pub fn failed(id: u64, error: String, uncertain: bool, retryable: bool) -> Strin
         } else if retryable {
             Phase::Prepared
         } else {
-            settle_accounting(&mut entry, false);
+            settle_withdrawal(&mut entry, false);
             Phase::Rejected(error.clone())
         };
         put(&entry);
@@ -847,19 +746,6 @@ pub fn safe_to_reset(id: u64) -> bool {
     })
 }
 
-pub fn record_fee_recognition(controller: Principal, total: u128, evidence: String) {
-    let mut entry = create(
-        controller,
-        Purpose::FeeRecognition { total, evidence },
-        now_ms(),
-    );
-    entry.phase = Phase::Recorded;
-    entry.handled = true;
-    entry.accounting_settled = true;
-    entry.accounting_success = Some(true);
-    put(&entry);
-}
-
 pub fn record_legacy_conflict(existing_task: u64, mut record: BridgeLog) -> Entry {
     let error = format!(
         "legacy incoming transaction conflicts with task {existing_task}; review both records"
@@ -896,10 +782,8 @@ pub fn check_resolution(
         return Err("completed operations cannot be reset".into());
     }
     if let Resolution::Completed(tx) = resolution {
-        if matches!(
-            entry.purpose,
-            Purpose::Deposit(_) | Purpose::FeeFunding { .. }
-        ) && pending::known_transaction(tx).is_some_and(|id| id != entry.id)
+        if matches!(entry.purpose, Purpose::Deposit(_))
+            && pending::known_transaction(tx).is_some_and(|id| id != entry.id)
         {
             return Err("transaction already belongs to another operation".into());
         }
@@ -1018,7 +902,6 @@ mod tests {
                     created_at_time: Some(entry.created_at * 1_000_000),
                 },
             },
-            0,
         )
         .unwrap();
         get(entry.id).unwrap()
@@ -1094,145 +977,106 @@ mod tests {
         assert!(futures::executor::block_on(execute_with(entry.id, &ledger)).is_ok());
         assert_eq!((ledger.calls.get(), ledger.debits.get()), (2, 1));
     }
-    #[test]
-    fn unknown_withdrawal_keeps_reservation_and_accounts_fee_exactly_once() {
-        STATE.with_borrow_mut(|s| {
-            s.icp_collected_fees_migrated = true;
-            s.icp_collected_fees = 200;
-            s.spendable_icp_fees = 200;
-        });
-        let owner = Principal::from_slice(&[1]);
-        let target = Principal::from_slice(&[2]);
-        let entry = create(
+    fn withdrawal(owner: Principal, amount: u128) -> Entry {
+        create(
             owner,
             Purpose::Withdrawal {
                 to: owner,
-                amount: 50,
-                ledger: target,
+                amount,
+                ledger: Principal::from_slice(&[2]),
             },
             now_ms(),
-        );
-        prepare(
-            entry.id,
-            Request::Transfer {
-                ledger: target,
-                args: TransferArg {
-                    from_subaccount: None,
-                    to: Account {
-                        owner,
-                        subaccount: None,
-                    },
-                    amount: 50u64.into(),
-                    fee: Some(10u64.into()),
-                    memo: Some(memo(entry.id)),
-                    created_at_time: Some(entry.created_at * 1_000_000),
-                },
-            },
-            10,
         )
-        .unwrap();
+    }
+
+    fn transfer_request(entry: &Entry, amount: u128) -> Request {
+        Request::Transfer {
+            ledger: Principal::from_slice(&[2]),
+            args: TransferArg {
+                from_subaccount: None,
+                to: Account {
+                    owner: entry.owner,
+                    subaccount: None,
+                },
+                amount: amount.into(),
+                fee: Some(10u64.into()),
+                memo: Some(memo(entry.id)),
+                created_at_time: Some(entry.created_at * 1_000_000),
+            },
+        }
+    }
+
+    #[test]
+    fn unknown_withdrawal_keeps_its_cap_reservation_and_debits_once() {
+        STATE.with_borrow_mut(|s| {
+            s.icp_collected_fees_migrated = true;
+            s.icp_collected_fees = 200;
+        });
+        let entry = withdrawal(Principal::from_slice(&[1]), 50);
+        prepare(entry.id, transfer_request(&entry, 50)).unwrap();
         let ledger = LostReply::new();
         assert!(futures::executor::block_on(execute_with(entry.id, &ledger)).is_err());
         assert_eq!(
-            STATE.with_borrow(|s| (
-                s.total_withdrawn_fees,
-                s.reserved_icp_fees,
-                available_withdrawal(s)
-            )),
-            (50, 10, 140)
+            STATE.with_borrow(|s| (s.total_withdrawn_fees, available_withdrawal(s))),
+            (50, 150)
         );
+
+        // A second controller cannot spend the unresolved withdrawal's share.
+        let other = withdrawal(Principal::from_slice(&[3]), 151);
+        assert!(prepare(other.id, transfer_request(&other, 151)).is_err());
+        assert!(!get(other.id).unwrap().withdrawal_counted);
         assert!(futures::executor::block_on(execute_with(entry.id, &ledger)).is_ok());
         failed(entry.id, "late error".into(), false, false);
         assert_eq!(
-            STATE.with_borrow(|s| (
-                s.total_withdrawn_fees,
-                s.reserved_icp_fees,
-                s.icp_transfer_fees,
-                available_withdrawal(s)
-            )),
-            (50, 0, 10, 140)
+            STATE.with_borrow(|s| (s.total_withdrawn_fees, available_withdrawal(s))),
+            (50, 150)
         );
         assert_eq!(ledger.debits.get(), 1);
     }
 
     #[test]
-    fn a_corrected_success_reverses_a_prior_not_executed_settlement() {
+    fn a_corrected_success_reinstates_a_released_withdrawal_exactly_once() {
         STATE.with_borrow_mut(|s| {
             s.icp_collected_fees_migrated = true;
-            s.spendable_icp_fees = 200;
-            s.total_withdrawn_fees = 0;
-            s.withdrawals_baseline = 0;
-            s.reserved_icp_fees = 0;
-            s.icp_transfer_fees = 0;
-            s.ledger_fee_credit = 0;
+            s.icp_collected_fees = 200;
         });
         let owner = Principal::from_slice(&[71]);
-        let ledger = Principal::from_slice(&[72]);
-        let entry = create(
-            owner,
-            Purpose::Withdrawal {
-                to: owner,
-                amount: 50,
-                ledger,
-            },
-            now_ms(),
-        );
-        prepare(
-            entry.id,
-            Request::Transfer {
-                ledger,
-                args: TransferArg {
-                    from_subaccount: None,
-                    to: Account {
-                        owner,
-                        subaccount: None,
-                    },
-                    amount: 50u64.into(),
-                    fee: Some(10u64.into()),
-                    memo: Some(memo(entry.id)),
-                    created_at_time: Some(entry.created_at * 1_000_000),
-                },
-            },
-            10,
-        )
-        .unwrap();
-
-        let revision = get(entry.id).unwrap().revision;
+        let entry = withdrawal(owner, 50);
+        prepare(entry.id, transfer_request(&entry, 50)).unwrap();
         resolve(
             entry.id,
-            revision,
+            get(entry.id).unwrap().revision,
             Resolution::NotExecuted,
             "ledger evidence initially showed no execution".into(),
             owner,
         )
         .unwrap();
+        failed(entry.id, "same rejection".into(), false, false);
         assert_eq!(
-            STATE.with_borrow(|s| (
-                s.total_withdrawn_fees,
-                s.reserved_icp_fees,
-                s.icp_transfer_fees,
-                available_withdrawal(s)
-            )),
-            (0, 0, 0, 200)
+            STATE.with_borrow(|s| (s.total_withdrawn_fees, available_withdrawal(s))),
+            (0, 200)
         );
-
-        // Rows written by the first journal schema only carry the boolean.
-        let mut legacy = get(entry.id).unwrap();
-        legacy.accounting_success = None;
-        put(&legacy);
-
+        completed(entry.id, BridgeTx::Icp(true, 9_999)).unwrap();
         completed(entry.id, BridgeTx::Icp(true, 9_999)).unwrap();
         assert_eq!(
-            STATE.with_borrow(|s| (
-                s.total_withdrawn_fees,
-                s.reserved_icp_fees,
-                s.icp_transfer_fees,
-                available_withdrawal(s)
-            )),
-            (50, 0, 10, 140)
+            STATE.with_borrow(|s| (s.total_withdrawn_fees, available_withdrawal(s))),
+            (50, 150)
         );
-        assert_eq!(get(entry.id).unwrap().accounting_success, Some(true));
+        assert!(get(entry.id).unwrap().withdrawal_counted);
     }
+
+    #[test]
+    fn ledger_payout_needs_no_earned_fee_balance_and_still_deduplicates() {
+        assert_eq!(STATE.with_borrow(|s| s.icp_collected_fees), 0);
+        let entry = create(Principal::from_slice(&[8]), Purpose::Payout(99), now_ms());
+        prepare(entry.id, transfer_request(&entry, 100)).unwrap();
+        let ledger = LostReply::new();
+        assert!(futures::executor::block_on(execute_with(entry.id, &ledger)).is_err());
+        assert!(futures::executor::block_on(execute_with(entry.id, &ledger)).is_ok());
+        assert_eq!(ledger.debits.get(), 1);
+        assert_eq!(STATE.with_borrow(|s| s.total_withdrawn_fees), 0);
+    }
+
     #[test]
     fn signature_intent_cannot_be_replanned_after_submission() {
         let entry = create(Principal::from_slice(&[1]), Purpose::Payout(99), now_ms());
@@ -1246,7 +1090,6 @@ mod tests {
                 deadline: TxDeadline::Nonce(7),
                 validity: None,
             },
-            0,
         )
         .unwrap();
         assert!(start_signature(entry.id).is_ok());

@@ -144,7 +144,6 @@ export const idlFactory = ({ IDL }) => {
   });
   const Phase = IDL.Variant({
     'Prepared' : IDL.Null,
-    'Recorded' : IDL.Null,
     'Rejected' : IDL.Text,
     'NeedsReview' : IDL.Text,
     'Submitted' : IDL.Null,
@@ -186,20 +185,15 @@ export const idlFactory = ({ IDL }) => {
   const Result_6 = IDL.Variant({ 'Ok' : IDL.Vec(IDL.Nat8), 'Err' : IDL.Text });
   const Result_7 = IDL.Variant({ 'Ok' : IDL.Vec(BridgeLog), 'Err' : IDL.Text });
   const StateRuntimeInfo = IDL.Record({
-    'icp_transfer_fees' : IDL.Nat,
     'resource_limits' : ResourceLimits,
     'pending_count' : IDL.Nat64,
     'ledger_verified' : IDL.Bool,
     'keys_ready' : IDL.Tuple(IDL.Bool, IDL.Bool),
-    'legacy_fees_recognized' : IDL.Nat,
-    'ledger_fee_credit' : IDL.Nat,
     'migration_remaining' : IDL.Nat64,
     'evm_provider_hosts' : IDL.Vec(IDL.Tuple(IDL.Text, IDL.Vec(IDL.Text))),
     'svm_provider_hosts' : IDL.Vec(IDL.Text),
     'available_icp_fees' : IDL.Nat,
-    'reserved_icp_fees' : IDL.Nat,
     'evm_fee_limits' : IDL.Vec(IDL.Tuple(IDL.Text, EvmFeeLimits)),
-    'spendable_icp_fees' : IDL.Nat,
     'unresolved_operations' : IDL.Nat64,
     'svm_mint_verified' : IDL.Bool,
   });
@@ -264,7 +258,6 @@ export const idlFactory = ({ IDL }) => {
         ['query'],
       ),
     'admin_recheck_task' : IDL.Func([BridgeTx], [Result], []),
-    'admin_recognize_legacy_fees' : IDL.Func([IDL.Nat, IDL.Text], [Result], []),
     'admin_remove_bridges' : IDL.Func([IDL.Vec(IDL.Principal)], [Result], []),
     'admin_resolve_legacy_payout' : IDL.Func(
         [BridgeTx, IDL.Nat64, Resolution, IDL.Text],
@@ -324,7 +317,6 @@ export const idlFactory = ({ IDL }) => {
         [Result_7],
         ['query'],
       ),
-    'fund_ledger_fees' : IDL.Func([IDL.Nat], [Result_2], []),
     'info' : IDL.Func([], [Result_8], ['query']),
     'my_bridge_log' : IDL.Func([BridgeTx], [Result_1], ['query']),
     'my_finalized_logs' : IDL.Func(
@@ -378,11 +370,6 @@ export const idlFactory = ({ IDL }) => {
       ),
     'validate_admin_init_public_keys' : IDL.Func([], [Result_5], []),
     'validate_admin_recheck_task' : IDL.Func([BridgeTx], [Result_5], []),
-    'validate_admin_recognize_legacy_fees' : IDL.Func(
-        [IDL.Nat, IDL.Text],
-        [Result_5],
-        [],
-      ),
     'validate_admin_remove_bridges' : IDL.Func(
         [IDL.Vec(IDL.Principal)],
         [Result_5],

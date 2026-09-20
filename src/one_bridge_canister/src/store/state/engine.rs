@@ -161,12 +161,6 @@ pub(super) async fn finalize_bridging() {
                             if task.from == BridgeTarget::Icp {
                                 s.icp_collected_fees =
                                     s.icp_collected_fees.saturating_add(task.fee);
-                                if journal::get(task.task_id).is_some_and(|entry| {
-                                    matches!(entry.purpose, journal::Purpose::Deposit(_))
-                                }) {
-                                    s.spendable_icp_fees =
-                                        s.spendable_icp_fees.saturating_add(task.fee);
-                                }
                             }
                         });
                         if let Some(id) = task.payout_attempt {
@@ -241,15 +235,12 @@ async fn recover_operation(id: u64) -> Result<BridgeTx, String> {
     let entry = journal::get(id).ok_or_else(|| "operation disappeared".to_string())?;
     match entry.purpose {
         journal::Purpose::Deposit(_) => resume_deposit_entry(entry).await,
-        journal::Purpose::Withdrawal { .. } | journal::Purpose::FeeFunding { .. } => {
+        journal::Purpose::Withdrawal { .. } => {
             let tx = journal::execute(id).await?;
             journal::handled(id);
             Ok(tx)
         }
         journal::Purpose::Payout(_) => Err("payout is recovered through its task".into()),
-        journal::Purpose::FeeRecognition { .. } => {
-            Err("fee reconciliation is not a transfer".into())
-        }
         journal::Purpose::LegacyConflict { .. } => {
             Err("legacy conflicts require controller reconciliation".into())
         }
@@ -528,7 +519,6 @@ async fn settle_payout(
                             amount: amount.into(),
                         },
                     },
-                    fee,
                 )?;
             }
             match journal::execute(id).await {

@@ -244,11 +244,6 @@ async fn resume_deposit(operation_id: u64) -> Result<store::BridgeTx, String> {
 }
 
 #[ic_cdk::update(guard = "admit_request")]
-async fn fund_ledger_fees(amount: u128) -> Result<store::BridgeTx, String> {
-    store::state::fund_ledger_fees(msg_caller()?, amount).await
-}
-
-#[ic_cdk::update(guard = "admit_request")]
 async fn resume_operation(id: u64) -> Result<store::BridgeTx, String> {
     store::state::resume_operation(id, msg_caller()?).await
 }

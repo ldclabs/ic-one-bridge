@@ -235,16 +235,6 @@ pub fn info() -> StateInfo {
     STATE.with_borrow(|s| StateInfo::new(s, total_bridge_count))
 }
 
-pub fn initialize_fee_accounting() {
-    STATE.with_borrow_mut(|s| {
-        if s.fee_accounting_version == 0 {
-            s.withdrawals_baseline = s.total_withdrawn_fees;
-            s.spendable_icp_fees = 0;
-            s.fee_accounting_version = 1;
-        }
-    });
-}
-
 pub fn start_migrations() {
     migration::start();
 }
@@ -748,7 +738,6 @@ async fn resume_deposit_entry_inner(entry: journal::Entry) -> Result<BridgeTx, S
                                 amount: plan.amount.into(),
                             },
                         },
-                        0,
                     )?;
                 }
                 schedule_finalize(Duration::from_secs(5));
@@ -1160,9 +1149,7 @@ pub fn can_change_ledger() -> bool {
     pending::is_empty()
         && !journal::unresolved()
         && BRIDGE_LOGS.with_borrow(|logs| logs.is_empty())
-        && STATE.with_borrow(|s| {
-            s.legacy_pending.is_empty() && s.ledger_fee_credit == 0 && s.total_withdrawn_fees == 0
-        })
+        && STATE.with_borrow(|s| s.legacy_pending.is_empty() && s.total_withdrawn_fees == 0)
 }
 
 pub fn validate_resolution(
@@ -1322,7 +1309,7 @@ pub async fn resume_operation(id: u64, owner: Principal) -> Result<BridgeTx, Str
         .ok_or_else(|| "operation not found".to_string())?;
     match entry.purpose {
         journal::Purpose::Deposit(_) => resume_deposit_entry(entry).await,
-        journal::Purpose::Withdrawal { .. } | journal::Purpose::FeeFunding { .. } => {
+        journal::Purpose::Withdrawal { .. } => {
             let tx = journal::execute(id).await?;
             journal::handled(id);
             Ok(tx)
@@ -1330,7 +1317,7 @@ pub async fn resume_operation(id: u64, owner: Principal) -> Result<BridgeTx, Str
         journal::Purpose::Payout(_) => {
             Err("payouts are resumed through their pending tasks".into())
         }
-        journal::Purpose::FeeRecognition { .. } | journal::Purpose::LegacyConflict { .. } => {
+        journal::Purpose::LegacyConflict { .. } => {
             Err("this operation requires controller reconciliation".into())
         }
     }
@@ -1377,11 +1364,8 @@ pub async fn fee_withdrawal_preview(to: Principal, amount: u128) -> Result<(u128
     let fee = ledger_fee(ledger).await?;
     STATE.with_borrow(|s| {
         let available = journal::available_withdrawal(s);
-        let needed = amount
-            .checked_add(fee)
-            .ok_or_else(|| "withdrawal amount overflow".to_string())?;
-        if amount > available || needed > journal::available_operating_funds(s) {
-            return Err("withdrawal and its ledger fee exceed available funds".into());
+        if amount > available {
+            return Err("withdrawal exceeds earned ICP fees".into());
         }
         Ok((fee, available))
     })
@@ -1443,73 +1427,6 @@ pub(super) fn ensure_task_reconciled(task: &BridgeLog) -> Result<(), String> {
     pending::reconciliation_error(task).map_or(Ok(()), Err)
 }
 
-pub fn validate_legacy_fee_recognition(total: u128, evidence: &str) -> Result<u128, String> {
-    if !pending::is_empty() || journal::unresolved() {
-        return Err("resolve all pending payments before recognizing historical fees".into());
-    }
-    if !(20..=2000).contains(&evidence.trim().len()) {
-        return Err("provide the external balance and backing reconciliation evidence".into());
-    }
-    STATE.with_borrow(|s| {
-        if !s.icp_collected_fees_migrated {
-            return Err("archive migration is incomplete".into());
-        }
-        let historic_ceiling = s
-            .icp_collected_fees
-            .saturating_sub(
-                s.spendable_icp_fees
-                    .saturating_sub(s.legacy_fees_recognized),
-            )
-            .saturating_sub(s.withdrawals_baseline);
-        if total < s.legacy_fees_recognized || total > historic_ceiling {
-            return Err(
-                "verified total exceeds historical earned fees or decreases an earlier recognition"
-                    .into(),
-            );
-        }
-        Ok(total - s.legacy_fees_recognized)
-    })
-}
-
-pub async fn recognize_legacy_fees(
-    total: u128,
-    evidence: String,
-    controller: Principal,
-) -> Result<(), String> {
-    let delta = validate_legacy_fee_recognition(total, &evidence)?;
-    if delta == 0 {
-        return Ok(());
-    }
-    let watermark = pending::id_high_water();
-    let ledger = STATE.with_borrow(|s| s.token_ledger);
-    let balance: Nat = crate::helper::read_call(
-        ledger,
-        "icrc1_balance_of",
-        (Account {
-            owner: crate::helper::canister_id(),
-            subaccount: None,
-        },),
-    )
-    .await?;
-    let balance = u128::try_from(&balance.0)
-        .map_err(|_| "ledger balance exceeds supported range".to_string())?;
-    if pending::id_high_water() != watermark {
-        return Err("financial operations changed during reconciliation; review again".into());
-    }
-    let delta = validate_legacy_fee_recognition(total, &evidence)?;
-    if balance < delta {
-        return Err("ledger balance is below the proposed fee allocation".into());
-    }
-    // This capped, cumulative controller attestation asserts the funds are
-    // free of backing obligations; a balance alone does not establish that.
-    journal::record_fee_recognition(controller, total, evidence);
-    STATE.with_borrow_mut(|s| {
-        s.spendable_icp_fees = s.spendable_icp_fees.saturating_add(delta);
-        s.legacy_fees_recognized = total;
-    });
-    Ok(())
-}
-
 pub async fn collect_fees(
     owner: Principal,
     to: Principal,
@@ -1558,66 +1475,12 @@ pub async fn collect_fees(
                     amount: amount.into(),
                 },
             },
-            fee,
         )?;
     }
     schedule_finalize(Duration::from_secs(5));
     let tx = journal::execute(entry.id)
         .await
         .map_err(|e| format!("withdrawal operation {}: {e}", entry.id))?;
-    journal::handled(entry.id);
-    Ok(tx)
-}
-
-pub async fn fund_ledger_fees(owner: Principal, amount: u128) -> Result<BridgeTx, String> {
-    if !STATE.with_borrow(|s| s.ledger_verified) {
-        return Err("ledger verification is incomplete".into());
-    }
-    if amount == 0 {
-        return Err("amount must be positive".into());
-    }
-    let _active = acquire_active_bridge_user(owner)?;
-    let ledger = STATE.with_borrow(|s| s.token_ledger);
-    let entry = match journal::open_funding(owner) {
-        Some(entry) => {
-            if !matches!(entry.purpose,journal::Purpose::FeeFunding {amount:old,ledger:old_ledger} if old==amount && old_ledger==ledger)
-            {
-                return Err(format!("resolve funding operation {} first", entry.id));
-            }
-            entry
-        }
-        None => journal::create(
-            owner,
-            journal::Purpose::FeeFunding { amount, ledger },
-            now_ms(),
-        ),
-    };
-    journal::prepare(
-        entry.id,
-        journal::Request::TransferFrom {
-            ledger,
-            args: TransferFromArgs {
-                spender_subaccount: None,
-                from: Account {
-                    owner,
-                    subaccount: None,
-                },
-                to: Account {
-                    owner: crate::helper::canister_id(),
-                    subaccount: None,
-                },
-                fee: None,
-                memo: Some(journal::memo(entry.id)),
-                created_at_time: Some(entry.created_at.saturating_mul(1_000_000)),
-                amount: amount.into(),
-            },
-        },
-        0,
-    )?;
-    schedule_finalize(Duration::from_secs(5));
-    let tx = journal::execute(entry.id)
-        .await
-        .map_err(|e| format!("fee funding operation {}: {e}", entry.id))?;
     journal::handled(entry.id);
     Ok(tx)
 }

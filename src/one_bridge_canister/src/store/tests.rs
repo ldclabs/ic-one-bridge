@@ -106,7 +106,7 @@ fn completing_an_orphaned_payout_operation_closes_its_journal_entry() {
     task.task_id = pending::next_id();
     task.to_tx = Some(BridgeTx::Evm(false, [77; 32].into()));
     let entry = journal::create(user, journal::Purpose::Payout(task.task_id), now_ms());
-    journal::prepare(entry.id, journal::Request::LegacyPayout(Box::new(task)), 0).unwrap();
+    journal::prepare(entry.id, journal::Request::LegacyPayout(Box::new(task))).unwrap();
     let revision = journal::get(entry.id).unwrap().revision;
     let resolution = Resolution::Completed(BridgeTx::Evm(true, [77; 32].into()));
     let resolved = journal::resolve(
