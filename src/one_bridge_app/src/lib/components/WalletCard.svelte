@@ -11,11 +11,13 @@
   import { toastRun } from '$lib/stores/toast.svelte'
   import { pruneAddress } from '$lib/utils/helper'
   import { type TokenInfo } from '$lib/utils/token'
-  import { tick, untrack } from 'svelte'
+  import { onDestroy, tick, untrack } from 'svelte'
   import AccountAddresses from './AccountAddresses.svelte'
   import AddressInput from './AddressInput.svelte'
   import AmountInput from './AmountInput.svelte'
   import BridgeHeader from './BridgeHeader.svelte'
+  import BridgeStatus from './BridgeStatus.svelte'
+  import { errMessage } from '$lib/utils/tryrun'
   import NetworkSelector from './ChainSelector.svelte'
   import ConfirmAddress from './ConfirmAddress.svelte'
   import PrimaryButton from './PrimaryButton.svelte'
@@ -31,6 +33,8 @@
   const defaultToken = formDefault('Token', 'PANDA')
   const defaultFrom = formDefault('From', 'ICP')
 
+  let alive = true
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined
   let myAddresses = $state<MyAddresses | null>(null)
   let bridges = $state<BridgeCanisterAPI[]>([])
   // the effect below keeps it in sync, only the initial value is read here
@@ -47,17 +51,33 @@
   let nativeToken = $state<boolean>(false)
   let thirdAddress = $state<string>('')
   let confirmAddress = $state<boolean>(false)
-  let fromAmount = $state<number>()
+  let fromAmount = $state('')
   let error = $state<string | null>(null)
+  let accountError = $state('')
+  let feeWarning = $state<string | undefined>()
+  const readiness = $derived(
+    fromChain?.name === 'ICP'
+      ? null
+      : selectedBridge.readiness([fromChain?.name ?? ''], false, nativeToken)
+  )
   let isLoading = $state<boolean>(false)
   let isTransfering = $state<boolean>(false)
   let transferingProgress = $state<TransferingProgress | null>(null)
   const disabledTransfering = $derived.by(() => {
-    return !!(isTransfering || error || !thirdAddress || !confirmAddress)
+    return !!(
+      isTransfering ||
+      error ||
+      accountError ||
+      readiness ||
+      !thirdAddress ||
+      !confirmAddress
+    )
   })
 
   $effect(() => {
+    const keys = mainBridge.runtime?.keys_ready.join()
     return toastRun(async (_signal) => {
+      void keys
       myAddresses = await mainBridge.myAddresses(
         authStore.identity.getPrincipal().toText()
       )
@@ -106,8 +126,9 @@
     isTransfering = false
     thirdAddress = ''
     confirmAddress = false
-    fromAmount = undefined
+    fromAmount = ''
     error = null
+    transferingProgress?.stop()
     transferingProgress = null
 
     refreshMyTokenInfo()
@@ -151,11 +172,19 @@
   }
 
   function validateAmount(): [bigint, string] {
+    try {
+      return validateExactAmount()
+    } catch (err) {
+      return [0n, errMessage(err)]
+    }
+  }
+
+  function validateExactAmount(): [bigint, string] {
     if (!selectedBridge.token || !fromChain) {
       return [0n, '']
     }
 
-    const value = Math.max(fromAmount || 0, 0)
+    const value = fromAmount || '0'
     if (nativeToken) {
       const spendable = fromBalanceNative - gasFee
       const amount = selectedBridge.parseNativeAmount(fromChain.name, value)
@@ -176,10 +205,15 @@
     const spendable = fromBalance - (fromChain.name === 'ICP' ? gasFee : 0n)
     const amount = selectedBridge.parseAmount(value)
     let err = ''
-    if (amount < selectedBridge.minAmount) {
-      err = `Minimum transfer amount is ${selectedBridge.displayAmount(
-        selectedBridge.minAmount
-      )}`
+    if (amount <= 0n) {
+      err = 'Enter an amount greater than zero'
+    } else if (
+      selectedBridge.toTokenAmount(
+        fromChain.name,
+        selectedBridge.toChainAmount(fromChain.name, amount)
+      ) !== amount
+    ) {
+      err = `The amount has more precision than ${fromChain.name} supports`
     } else if (amount > spendable) {
       err = `Insufficient balance, should be less than ${selectedBridge.displayAmount(
         spendable
@@ -212,9 +246,12 @@
 
       const account = await selectedBridge.myAccountOn(
         fromChain.name,
-        myAddresses
+        myAddresses,
+        nativeToken
       )
       fromAddress = account.address
+      accountError = ''
+      feeWarning = account.feeWarning
       fromBalance = account.tokenBalance
       fromBalanceNative = account.nativeBalance
       // a token transfer on ICP pays the ledger fee in the token itself;
@@ -223,6 +260,8 @@
         fromChain.name === 'ICP' && !nativeToken
           ? selectedBridge.token!.fee
           : account.nativeFee
+    } catch (err) {
+      accountError = errMessage(err)
     } finally {
       isLoading = false
     }
@@ -252,8 +291,15 @@
   async function onTransfer() {
     const [amount, err] = validateTransfer()
     error = err || null
-    if (isTransfering || err || amount <= 0n) return
+    if (disabledTransfering || err || amount <= 0n) return
 
+    const owner = authStore.identity.getPrincipal().toText()
+    const assertOwner = () => {
+      if (!alive || owner !== authStore.identity.getPrincipal().toText())
+        throw new Error(
+          'The signed-in account changed. Please start again with the correct account.'
+        )
+    }
     isTransfering = true
     toastRun(async () => {
       if (!selectedBridge.state || !selectedBridge.token || !fromChain) {
@@ -262,11 +308,14 @@
 
       const chain = fromChain.name
       try {
+        assertOwner()
         if (chain === 'ICP') {
           const icp = await selectedBridge.loadICPTokenAPI()
+          assertOwner()
           const idx = nativeToken
             ? await icp.transferICP(thirdAddress, amount)
             : await icp.transfer(thirdAddress, amount)
+          assertOwner()
           transferingProgress = TransferingProgress.track(selectedBridge, {
             chain,
             native: nativeToken,
@@ -276,10 +325,13 @@
           })
         } else if (chain === 'SOL') {
           const svm = await selectedBridge.loadSvmTokenAPI()
+          assertOwner()
           const signedTx = nativeToken
             ? await selectedBridge.buildSolTransferTx(thirdAddress, amount)
             : await selectedBridge.buildSplTransferTx(thirdAddress, amount)
+          assertOwner()
           const tx = await svm!.sendRawTransaction(signedTx)
+          assertOwner()
           transferingProgress = TransferingProgress.track(selectedBridge, {
             chain,
             native: nativeToken,
@@ -288,6 +340,7 @@
           })
         } else {
           const evm = await selectedBridge.loadEVMTokenAPI(chain)
+          assertOwner()
           const signedTx = nativeToken
             ? await selectedBridge.buildEvmTransferTx(
                 chain,
@@ -299,7 +352,9 @@
                 thirdAddress,
                 amount
               )
+          assertOwner()
           const tx = await evm.sendRawTransaction(signedTx)
+          assertOwner()
           transferingProgress = TransferingProgress.track(selectedBridge, {
             chain,
             native: nativeToken,
@@ -309,8 +364,8 @@
         }
 
         refreshMyTokenInfo()
-        setTimeout(() => {
-          refreshMyTokenInfo()
+        refreshTimer = setTimeout(() => {
+          if (alive) refreshMyTokenInfo()
         }, 5000)
       } catch (err) {
         isTransfering = false
@@ -318,6 +373,11 @@
       }
     })
   }
+  onDestroy(() => {
+    alive = false
+    clearTimeout(refreshTimer)
+    transferingProgress?.stop()
+  })
 </script>
 
 <div
@@ -326,6 +386,16 @@
   {#key bridgeCanister}
     <RefreshButton {isLoading} onclick={() => refreshMyTokenInfo(true)} />
     <AccountAddresses addresses={myAddresses} />
+    <BridgeStatus
+      bridge={selectedBridge}
+      chains={fromChain ? [fromChain.name] : []}
+      wallet
+      native={nativeToken}
+    />
+    {#if accountError}<p role="alert" class="text-sm break-words text-red-300"
+        >{accountError}</p
+      >{/if}
+    {#if feeWarning}<p class="text-xs text-amber-200">{feeWarning}</p>{/if}
 
     <div class="relative">
       <BridgeHeader

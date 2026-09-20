@@ -4,10 +4,25 @@ import {
   type BridgeTarget,
   type BridgeTx,
   type StateInfo,
+  type OperationInfo,
   type _SERVICE
 } from '$declarations/one_bridge_canister/one_bridge_canister.did.js'
 import { getChain, type Chain } from '$lib/chains'
 import { type BridgeLogInfo, type BridgingStatus } from '$lib/types/bridge'
+import { dynAgent } from '$lib/utils/auth'
+import {
+  prepareRequest,
+  submitRequest,
+  withRequestLock,
+  type BridgeRequest
+} from '$lib/utils/bridge-request'
+import {
+  readinessReason,
+  logSettled,
+  txFinalized,
+  canRecheck,
+  reconciliationHeld
+} from '$lib/utils/bridge-state'
 import { unwrapResult } from '$lib/types/result'
 import { EvmRpc } from '$lib/utils/evmrpc'
 import { SvmRpc } from '$lib/utils/svmrpc'
@@ -35,10 +50,6 @@ const SVM_UNSET = '11111111111111111111111111111111'
 
 // the ICP ledger's own transfer fee, in e8s
 const ICP_TX_FEE = 10_000n
-// `MAX_ERROR_ROUNDS` in the canister: the consecutive failing rounds after
-// which it refuses new tasks. It is not published in `info()`, so it is
-// repeated here and has to be kept in step with the canister
-const MAX_ERROR_ROUNDS = 42n
 // the canister needs 5 000 lamports for a Solana transfer and makes the user's
 // derived address the fee payer; the margin keeps a rounded-down "max" from
 // landing exactly on that limit.
@@ -75,6 +86,7 @@ export type ChainAccount = {
   // charges its fee in the token itself, so this is the native ICP fee and
   // only applies to a native ICP transfer
   nativeFee: bigint
+  feeWarning?: string | undefined
 }
 
 export class BridgeCanisterAPI {
@@ -107,9 +119,11 @@ export class BridgeCanisterAPI {
 
   readonly canisterId: Principal
   #actor: _SERVICE
-  #token: TokenInfo | null = null
+  #token = $state<TokenInfo | null>(null)
   #display: TokenDisplay | null = null
   #tokenLedger: TokenLedgerAPI | null = null
+  #tokenLedgerLoading: { id: string; promise: Promise<TokenLedgerAPI> } | null =
+    null
   #svmRpc: SvmRpc | null = null
   #evmRPC: Map<string, EvmRpc> = new Map()
   #state = $state<StateInfo | null>(null)
@@ -139,17 +153,20 @@ export class BridgeCanisterAPI {
     return this.#state?.token_bridge_fee ?? 0n
   }
 
-  /**
-   * Why the bridge is refusing new tasks, or null.
-   *
-   * The pause is the canister's circuit breaker. It is not a dead end: the
-   * rounds keep going on an hourly cooldown and a clean one lifts it, so the
-   * message says to retry rather than to find an administrator.
-   */
-  get pausedReason(): string | null {
-    return (this.#state?.error_rounds ?? 0n) >= MAX_ERROR_ROUNDS
-      ? 'the bridge is paused after repeated errors and retries by itself, please try again later'
-      : null
+  get runtime() {
+    return this.#state?.runtime[0] ?? null
+  }
+
+  readiness(
+    chains: string[],
+    newBridge = true,
+    nativeTransfer = false
+  ): string | null {
+    return readinessReason(this.#state, chains, newBridge, nativeTransfer)
+  }
+
+  get supportsRecovery(): boolean {
+    return !!this.runtime
   }
 
   //#region amounts
@@ -203,31 +220,63 @@ export class BridgeCanisterAPI {
     return tokenAmount / 10n ** BigInt(tokenDecimals - decimals)
   }
 
+  validateBridgePrecision(
+    from: string,
+    to: string,
+    amount: bigint
+  ): string | null {
+    if (amount > (1n << 128n) - 1n)
+      return 'The amount exceeds the bridge’s supported range.'
+    for (const [chain, value] of [
+      [from, amount],
+      [to, amount - this.bridgeFee]
+    ] as const) {
+      if (value <= 0n) return 'The amount must exceed the bridge fee.'
+      if (
+        this.toTokenAmount(chain, this.toChainAmount(chain, value)) !== value
+      ) {
+        return `The amount ${chain === to ? 'after the bridge fee ' : ''}has more precision than ${chain} supports.`
+      }
+    }
+    return null
+  }
+
   //#endregion
 
   //#region state
 
   async loadState(): Promise<StateInfo> {
-    if (this.#state == null) {
-      const state = await this.refreshState()
-      this.#token = {
-        name: state.token_name,
-        symbol: state.token_symbol,
-        decimals: state.token_decimals,
-        fee: 0n,
-        logo: state.token_logo,
-        canisterId: state.token_ledger.toText()
-      }
-      this.#display = new TokenDisplay(state.token_decimals)
-    }
-
-    return this.#state as StateInfo
+    return this.#state ?? (await this.refreshState())
   }
 
   async refreshState(): Promise<StateInfo> {
-    const state = await this.#actor.info()
-    this.#state = unwrapResult(state, 'call info failed')
-    return this.#state as StateInfo
+    const state = unwrapResult(await this.#actor.info(), 'call info failed')
+    const previous = this.#state
+    if (
+      !previous ||
+      configKey([previous.evm_providers, previous.evm_token_contracts]) !==
+        configKey([state.evm_providers, state.evm_token_contracts])
+    )
+      this.#evmRPC.clear()
+    if (
+      !previous ||
+      configKey([previous.svm_providers, previous.svm_token_address]) !==
+        configKey([state.svm_providers, state.svm_token_address])
+    )
+      this.#svmRpc = null
+    const sameLedger = this.#token?.canisterId === state.token_ledger.toText()
+    if (!sameLedger) this.#tokenLedger = null
+    this.#token = {
+      name: state.token_name,
+      symbol: state.token_symbol,
+      decimals: state.token_decimals,
+      fee: sameLedger ? (this.#token?.fee ?? 0n) : 0n,
+      logo: state.token_logo,
+      canisterId: state.token_ledger.toText()
+    }
+    this.#display = new TokenDisplay(state.token_decimals)
+    this.#state = state
+    return state
   }
 
   /**
@@ -297,28 +346,38 @@ export class BridgeCanisterAPI {
   //#region chain clients
 
   async loadICPTokenAPI(): Promise<TokenLedgerAPI> {
-    if (this.#tokenLedger == null) {
-      await this.loadState()
-
-      this.#tokenLedger = new TokenLedgerAPI(this.#token!)
-      try {
-        const info = await this.#tokenLedger.fetchTokenInfo()
-        this.#token!.fee = info.fee
-      } catch (error) {
-        console.error('Failed to load ICP token API:', error)
-      }
+    await this.loadState()
+    const token = this.#token!
+    const id = token.canisterId
+    if (this.#tokenLedger?.canisterId.toText() === id) return this.#tokenLedger
+    if (this.#tokenLedgerLoading?.id === id)
+      return this.#tokenLedgerLoading.promise
+    const promise = (async () => {
+      const ledger = new TokenLedgerAPI(token)
+      const info = await ledger.fetchTokenInfo()
+      if (this.#token?.canisterId !== id)
+        throw new Error('The token ledger changed. Refresh before continuing.')
+      this.#token.fee = info.fee
+      this.#tokenLedger = ledger
+      return ledger
+    })()
+    this.#tokenLedgerLoading = { id, promise }
+    try {
+      return await promise
+    } finally {
+      if (this.#tokenLedgerLoading?.promise === promise)
+        this.#tokenLedgerLoading = null
     }
-
-    return this.#tokenLedger
   }
 
   async loadSvmTokenAPI(): Promise<SvmRpc | null> {
     if (!this.#svmRpc) {
       const state = await this.loadState()
-      if (
-        state.svm_providers.length > 0 &&
-        state.svm_token_address[0] !== SVM_UNSET
-      ) {
+      if (state.svm_token_address[0] !== SVM_UNSET) {
+        if (!state.svm_providers.length)
+          throw new Error(
+            'Public browser RPC endpoints for SOL are not configured; governance must publish anonymous endpoints.'
+          )
         // cache only once a provider answered: an unawaited selection leaves
         // the client on providers[0] and turns a total outage into an
         // unhandled rejection
@@ -351,7 +410,9 @@ export class BridgeCanisterAPI {
     }
     const [_maxConfirmations, providerUrls] = provider[1]
     if (providerUrls.length === 0) {
-      throw new Error(`Public browser RPC endpoints for ${chain} are not configured; the bridge administrator must publish anonymous endpoints`)
+      throw new Error(
+        `Public browser RPC endpoints for ${chain} are not configured; the bridge administrator must publish anonymous endpoints`
+      )
     }
 
     const api = new EvmRpc(providerUrls, contract[1][0])
@@ -389,9 +450,10 @@ export class BridgeCanisterAPI {
    * bridge. See also the note on {@link BridgeCanisterAPI.loadSubBridges}.
    */
   async myAddresses(icp: string): Promise<MyAddresses> {
+    const keys = this.runtime?.keys_ready
     const [svm, evm] = await Promise.all([
-      this.mySvmAddress(),
-      this.myEvmAddress()
+      keys && !keys[1] ? Promise.resolve('') : this.mySvmAddress(),
+      keys && !keys[0] ? Promise.resolve('') : this.myEvmAddress()
     ])
     return { icp, svm, evm }
   }
@@ -404,7 +466,11 @@ export class BridgeCanisterAPI {
    * bridge: the main canister publishes the one set of addresses, and a
    * sub-bridge's token is deposited to those same addresses.
    */
-  async myAccountOn(chain: string, my: MyAddresses): Promise<ChainAccount> {
+  async myAccountOn(
+    chain: string,
+    my: MyAddresses,
+    native = false
+  ): Promise<ChainAccount> {
     switch (chain) {
       case 'ICP': {
         const icp = await this.loadICPTokenAPI()
@@ -424,7 +490,7 @@ export class BridgeCanisterAPI {
         const svm = await this.loadSvmTokenAPI()
         if (!svm) throw new Error('SOL is not supported by this bridge')
         const [splBalance, nativeBalance] = await Promise.all([
-          svm.getSplBalance(my.svm),
+          native ? Promise.resolve(0n) : svm.getSplBalance(my.svm),
           svm.getBalance(my.svm)
         ])
         return {
@@ -439,18 +505,23 @@ export class BridgeCanisterAPI {
         const state = await this.loadState()
         const evm = await this.loadEVMTokenAPI(chain)
         const [erc20Balance, nativeBalance, nativeFee] = await Promise.all([
-          evm.getErc20Balance(my.evm),
+          native ? Promise.resolve(0n) : evm.getErc20Balance(my.evm),
           evm.getBalance(my.evm),
           // the gas limit the canister will sign with, so the form and the
           // canister agree on what the address has to hold
-          evm.gasFeeEstimation(state.erc20_gas_limit)
+          evm.gasFeeEstimation(
+            native ? 21_000n : state.erc20_gas_limit,
+            state.evm_latest_gas.find(([name]) => name === chain)?.[1],
+            this.runtime?.evm_fee_limits.find(([name]) => name === chain)?.[1]
+          )
         ])
         return {
           chain,
           address: my.evm,
           tokenBalance: this.toTokenAmount(chain, erc20Balance),
           nativeBalance,
-          nativeFee
+          nativeFee: nativeFee.amount,
+          feeWarning: nativeFee.warning
         }
       }
     }
@@ -492,7 +563,10 @@ export class BridgeCanisterAPI {
     take: number,
     prev?: bigint
   ): Promise<BridgeLogInfo[]> {
-    const res = await this.#actor.my_finalized_logs(take, prev ? [prev] : [])
+    const res = await this.#actor.my_finalized_logs(
+      take,
+      prev === undefined ? [] : [prev]
+    )
     const logs = unwrapResult(res, 'call my_finalized_logs failed')
     return logs.map((log) => this.toBridgeLogInfo(log))
   }
@@ -501,7 +575,10 @@ export class BridgeCanisterAPI {
     take: number,
     prev?: bigint
   ): Promise<BridgeLogInfo[]> {
-    const res = await this.#actor.finalized_logs(take, prev ? [prev] : [])
+    const res = await this.#actor.finalized_logs(
+      take,
+      prev === undefined ? [] : [prev]
+    )
     const logs = unwrapResult(res, 'call finalized_logs failed')
     return logs.map((log) => this.toBridgeLogInfo(log))
   }
@@ -510,7 +587,14 @@ export class BridgeCanisterAPI {
     const from = getChainName(log.from)
     const to = getChainName(log.to)
     return {
-      id: log.id[0] || 0n,
+      id: log.id[0] ?? 0n,
+      taskId: log.runtime[0]?.task_id,
+      fromTransaction: log.from_tx,
+      canRecheck: canRecheck(log),
+      settled: logSettled(log),
+      stuck: log.stuck,
+      needsReview: !log.id.length && reconciliationHeld(log),
+      nextPollAt: Number(log.runtime[0]?.next_poll_at ?? 0n),
       user: log.user.toText(),
       token: this.#token?.symbol || '',
       from,
@@ -540,21 +624,8 @@ export class BridgeCanisterAPI {
 
   //#region transfers
 
-  /**
-   * Re-reads the source chain balance right before submitting.
-   *
-   * The canister signs and broadcasts the incoming transfer without checking
-   * any balance, so an amount the source address cannot cover turns into a
-   * transaction that reverts on chain: the gas is spent for nothing, and the
-   * failed task sits in the bridge's pending queue. The form validates against
-   * a balance read when the chain was picked, which can be stale by the time
-   * Bridge is pressed, so check again here — in the chain's own units, the same
-   * way the canister converts them.
-   *
-   * This is a usability guard, not a safety one: if the balance cannot be read
-   * the bridge request still goes through, because the canister is what
-   * actually protects funds.
-   */
+  // New deposits only. Recovery must never require the already-debited funds
+  // to still be present in the user's source account.
   async #assertSufficientSourceBalance(
     fromChain: string,
     amount: bigint
@@ -613,22 +684,157 @@ export class BridgeCanisterAPI {
     }
   }
 
-  async bridge(
-    fromChain: string,
-    toChain: string,
+  async prepareBridgeRequest(
+    from: string,
+    to: string,
     amount: bigint,
-    toAddr?: string
-  ): Promise<BridgingProgress> {
-    await this.#assertSufficientSourceBalance(fromChain, amount)
+    recipient = ''
+  ): Promise<BridgeRequest> {
+    const owner = this.#owner()
+    const canister = this.canisterId.toText()
+    const prepare = () =>
+      prepareRequest(localStorage, canister, owner, {
+        from,
+        to,
+        amount: String(amount),
+        recipient: recipient.trim()
+      })
+    // Serialise creation across tabs; retries share the persisted ID.
+    return withRequestLock(canister, owner, prepare)
+  }
 
-    const res = await this.#actor.bridge(
-      fromChain,
-      toChain,
-      amount,
-      toAddr ? [toAddr] : []
+  async submitBridgeRequest(request: BridgeRequest): Promise<BridgingProgress> {
+    if (request.canister !== this.canisterId.toText())
+      throw new Error('This request belongs to another bridge')
+    const assertOwner = () => {
+      if (this.#owner() !== request.owner)
+        throw new Error(
+          'The signed-in account changed. Sign in with the original account to continue this request.'
+        )
+    }
+    try {
+      const tx = await withRequestLock(request.canister, request.owner, () =>
+        submitRequest(localStorage, request, {
+          assertOwner,
+          prepare: async () => {
+            await this.refreshState()
+            assertOwner()
+            const reason = this.readiness([request.from, request.to])
+            if (reason) throw new Error(reason)
+            await this.#assertSufficientSourceBalance(
+              request.from,
+              BigInt(request.amount)
+            )
+            assertOwner()
+            if (request.from === 'ICP') {
+              const ledger = await this.loadICPTokenAPI()
+              assertOwner()
+              await ledger.ensureAllowance(
+                this.canisterId,
+                BigInt(request.amount) + (this.token?.fee ?? 0n),
+                request.owner
+              )
+            }
+          },
+          send: async (saved, id) =>
+            unwrapResult(
+              await this.#actor.bridge_with_id(
+                saved.from,
+                saved.to,
+                BigInt(saved.amount),
+                saved.recipient ? [saved.recipient] : [],
+                id
+              ),
+              'Bridge request could not complete'
+            )
+        })
+      )
+      return BridgingProgress.track(this, tx)
+    } finally {
+      this.#activityChanged()
+    }
+  }
+
+  #owner(): string {
+    const principal = dynAgent.id.getPrincipal()
+    if (principal.isAnonymous()) throw new Error('Sign in to continue')
+    return principal.toText()
+  }
+
+  #activityChanged() {
+    if (typeof window !== 'undefined')
+      window.dispatchEvent(new Event('bridge-activity'))
+  }
+
+  async listOperations(take = 20, before?: bigint): Promise<OperationInfo[]> {
+    return unwrapResult(
+      await this.#actor.my_operations(
+        take,
+        before === undefined ? [] : [before]
+      ),
+      'Could not load operations'
     )
-    const tx = unwrapResult(res, 'call bridge failed')
-    return BridgingProgress.track(this, tx)
+  }
+
+  async listPendingLogs(
+    mine: boolean,
+    take = 20,
+    after?: bigint
+  ): Promise<BridgeLogInfo[]> {
+    const cursor: [] | [bigint] = after === undefined ? [] : [after]
+    const result = !this.supportsRecovery
+      ? mine
+        ? await this.#actor.my_pending_logs()
+        : await this.#actor.pending_logs()
+      : mine
+        ? await this.#actor.my_pending_logs_page(take, cursor)
+        : await this.#actor.pending_logs_page(take, cursor)
+    return unwrapResult(result, 'Could not load pending tasks').map((log) =>
+      this.toBridgeLogInfo(log)
+    )
+  }
+
+  async resumeOperation(
+    operation: OperationInfo
+  ): Promise<BridgingProgress | null> {
+    const owner = this.#owner()
+    if (owner !== operation.owner.toText())
+      throw new Error('This operation belongs to another account')
+    try {
+      const tx = unwrapResult(
+        await this.#actor.resume_operation(operation.id),
+        'Could not resume operation'
+      )
+      if (owner !== this.#owner())
+        throw new Error('The signed-in account changed')
+      return operation.kind === 'deposit'
+        ? BridgingProgress.track(this, tx)
+        : null
+    } finally {
+      this.#activityChanged()
+    }
+  }
+
+  async cancelOperation(operation: OperationInfo): Promise<void> {
+    if (this.#owner() !== operation.owner.toText())
+      throw new Error('This operation belongs to another account')
+    try {
+      unwrapResult(
+        await this.#actor.cancel_operation(operation.id),
+        'Could not cancel operation'
+      )
+    } finally {
+      this.#activityChanged()
+    }
+  }
+
+  async recheckTask(tx: BridgeTx): Promise<void> {
+    this.#owner()
+    try {
+      unwrapResult(await this.#actor.recheck_task(tx), 'Could not recheck task')
+    } finally {
+      this.#activityChanged()
+    }
   }
 
   // the transfer transactions below are signed by the canister; the browser
@@ -669,6 +875,9 @@ export class BridgingProgress {
   #tx: BridgeTx
   #log = $state<BridgeLog | null>(null)
   #isComplete = $derived.by(() => isFinalized(this.#log?.to_tx[0]))
+  #owner = dynAgent.id.getPrincipal().toText()
+  #timer: ReturnType<typeof setTimeout> | undefined
+  #stopped = false
   #status = $derived.by(() => getBridgingStatus(this.#log))
 
   static track(api: BridgeCanisterAPI, tx: BridgeTx): BridgingProgress {
@@ -682,17 +891,32 @@ export class BridgingProgress {
     this.#tx = tx
   }
 
+  stop() {
+    this.#stopped = true
+    clearTimeout(this.#timer)
+  }
+
+  get isSettled(): boolean {
+    return this.#log ? logSettled(this.#log) || this.#log.stuck : false
+  }
+
   #refreshLog = async (): Promise<void> => {
+    if (this.#stopped || dynAgent.id.getPrincipal().toText() !== this.#owner)
+      return
     try {
-      this.#log = await this.#api.getMyBridgeLog(this.#tx)
+      const log = await this.#api.getMyBridgeLog(this.#tx)
+      if (this.#stopped || dynAgent.id.getPrincipal().toText() !== this.#owner)
+        return
+      this.#log = log
       await tick()
-      if (!this.#isComplete) {
-        setTimeout(() => this.#refreshLog(), 2000)
+      if (!this.isSettled) {
+        this.#timer = setTimeout(() => this.#refreshLog(), 5000)
       }
     } catch (error) {
       console.error(`Error refreshing log ${this.#tx}:`, error)
       // keep polling: a transient failure must not strand the UI in "Bridging..."
-      setTimeout(() => this.#refreshLog(), 5000)
+      if (!this.#stopped)
+        this.#timer = setTimeout(() => this.#refreshLog(), 5000)
     }
   }
 
@@ -715,6 +939,11 @@ export class BridgingProgress {
     if (isFinalized(this.#log.to_tx[0])) {
       return ''
     }
+    if (logSettled(this.#log))
+      return (
+        this.#log.error[0] ??
+        'This transfer was closed without a completed payout.'
+      )
     if (this.#log.error.length > 0) {
       return `${this.#log.error[0]}`
     }
@@ -738,6 +967,9 @@ export class TransferingProgress {
   #api: BridgeCanisterAPI
   #tx = $state<TransferTxInfo | null>(null)
   #error = $state<string | null>(null)
+  #owner = dynAgent.id.getPrincipal().toText()
+  #timer: ReturnType<typeof setTimeout> | undefined
+  #stopped = false
 
   static track(
     api: BridgeCanisterAPI,
@@ -753,7 +985,14 @@ export class TransferingProgress {
     this.#tx = tx
   }
 
+  stop() {
+    this.#stopped = true
+    clearTimeout(this.#timer)
+  }
+
   #refreshLog = async (): Promise<void> => {
+    if (this.#stopped || dynAgent.id.getPrincipal().toText() !== this.#owner)
+      return
     if (!this.#tx || this.#tx.isFinalized || this.#error) return
 
     try {
@@ -769,7 +1008,8 @@ export class TransferingProgress {
           }
           return
         }
-        setTimeout(() => this.#refreshLog(), 2000)
+        if (!this.#stopped)
+          this.#timer = setTimeout(() => this.#refreshLog(), 5000)
       } else if ('Sol' in this.#tx) {
         const sol = await this.#api.loadSvmTokenAPI()
         const status = sol ? await sol.getTransactionStatus(this.#tx.Sol) : ''
@@ -783,12 +1023,14 @@ export class TransferingProgress {
           return
         }
 
-        setTimeout(() => this.#refreshLog(), 2000)
+        if (!this.#stopped)
+          this.#timer = setTimeout(() => this.#refreshLog(), 5000)
       }
     } catch (error) {
       console.error(`Error refreshing log ${this.#tx}:`, error)
       // keep polling: a transient failure must not strand the UI in "Transfering..."
-      setTimeout(() => this.#refreshLog(), 5000)
+      if (!this.#stopped)
+        this.#timer = setTimeout(() => this.#refreshLog(), 5000)
     }
   }
 
@@ -879,20 +1121,21 @@ function getBridgingStatus(log?: BridgeLog | null): BridgingStatus {
   if (isFinalized(log.to_tx[0])) {
     return 'Completed'
   }
+  if (logSettled(log)) return 'Closed'
+  if (log.stuck)
+    return reconciliationHeld(log) ? 'Needs review' : 'Needs attention'
   if (log.error.length > 0) {
-    return 'Error'
+    return 'Retrying'
   }
   return 'Pending'
 }
 
 function isFinalized(tx?: BridgeTx): boolean {
-  if (!tx) return false
-  if ('Evm' in tx) {
-    return tx.Evm[0]
-  } else if ('Sol' in tx) {
-    return tx.Sol[0]
-  } else if ('Icp' in tx) {
-    return tx.Icp[0]
-  }
-  return false
+  return txFinalized(tx)
+}
+
+function configKey(value: unknown): string {
+  return JSON.stringify(value, (_, item) =>
+    typeof item === 'bigint' ? String(item) : item
+  )
 }

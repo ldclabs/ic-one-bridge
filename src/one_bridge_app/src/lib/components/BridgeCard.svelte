@@ -13,12 +13,20 @@
   import { toastRun } from '$lib/stores/toast.svelte'
   import { pruneAddress } from '$lib/utils/helper'
   import { type TokenInfo } from '$lib/utils/token'
-  import { tick } from 'svelte'
+  import { onMount, tick } from 'svelte'
   import { innerWidth } from 'svelte/reactivity/window'
   import AccountAddresses from './AccountAddresses.svelte'
   import AddressInput from './AddressInput.svelte'
   import AmountInput from './AmountInput.svelte'
   import BridgeHeader from './BridgeHeader.svelte'
+  import BridgeStatus from './BridgeStatus.svelte'
+  import {
+    readRequest,
+    forgetRequest,
+    withRequestLock,
+    type BridgeRequest
+  } from '$lib/utils/bridge-request'
+  import { errMessage } from '$lib/utils/tryrun'
   import NetworkSelector from './ChainSelector.svelte'
   import ConfirmAddress from './ConfirmAddress.svelte'
   import PrimaryButton from './PrimaryButton.svelte'
@@ -58,9 +66,29 @@
   let toAddress = $state<string>('')
   let thirdAddress = $state<string>('')
   let confirmAddress = $state<boolean>(false)
-  let fromAmount = $state<number>()
+  let fromAmount = $state('')
+  const receivedAmount = $derived.by(() => {
+    if (!selectedBridge || !fromAmount) return null
+    try {
+      const value =
+        selectedBridge.parseAmount(fromAmount) - selectedBridge.bridgeFee
+      return value > 0n ? value : null
+    } catch {
+      return null
+    }
+  })
   let error = $state<string | null>(null)
-  let bridgeError = $state<string | null>(null)
+  const bridgeError = $derived(
+    selectedBridge?.readiness(
+      [fromChain?.name ?? '', toChain?.name ?? ''].filter(Boolean)
+    ) ?? null
+  )
+  let accountError = $state('')
+  let feeWarning = $state<string | undefined>()
+  let savedRequest = $state<BridgeRequest | null>(null)
+  let savedError = $state('')
+  let actionError = $state('')
+  let alive = true
   let isLoading = $state<boolean>(false)
   let isSigningIn = $state<boolean>(false)
   let isBridging = $state<boolean>(false)
@@ -68,6 +96,9 @@
   const disabledBridging = $derived.by(() => {
     return !!(
       isBridging ||
+      savedRequest ||
+      savedError ||
+      accountError ||
       bridgeError ||
       error ||
       (thirdAddress && !confirmAddress)
@@ -76,12 +107,16 @@
 
   $effect(() => {
     const bridge = mainBridge
+    const evmReady = bridge?.runtime?.keys_ready[0]
+    const solReady = bridge?.runtime?.keys_ready[1]
     if (!bridge || !isAuthenticated) {
       myAddresses = null
       return
     }
 
     return toastRun(async (_signal) => {
+      void evmReady
+      void solReady
       myAddresses = await bridge.myAddresses(
         authStore.identity.getPrincipal().toText()
       )
@@ -103,11 +138,10 @@
 
   $effect(() => {
     if (!selectedBridge || !selectedBridge.state) return
+    loadSavedRequest()
 
     return toastRun(async (_signal) => {
       if (!selectedBridge || !selectedBridge.state) return
-
-      bridgeError = selectedBridge.pausedReason
 
       selectedToken = selectedBridge.token!
       supportChains = await selectedBridge.supportChains()
@@ -140,8 +174,9 @@
     isBridging = false
     thirdAddress = ''
     confirmAddress = false
-    fromAmount = undefined
+    fromAmount = ''
     error = null
+    bridgingProgress?.stop()
     bridgingProgress = null
     refreshMyTokenInfo()
   }
@@ -178,14 +213,28 @@
   }
 
   function validateAmount(): [bigint, string] {
+    try {
+      return validateExactAmount()
+    } catch (err) {
+      return [0n, errMessage(err)]
+    }
+  }
+
+  function validateExactAmount(): [bigint, string] {
     if (!selectedBridge?.token || !fromChain || !toChain) {
       return [0n, '']
     }
 
     // ICP charges the ledger fee in the token, so it is not spendable
     const spendable = fromBalance - (fromChain.name === 'ICP' ? gasFee : 0n)
-    const amount = selectedBridge.parseAmount(Math.max(fromAmount || 0, 0))
-    let err = ''
+    const amount = selectedBridge.parseAmount(fromAmount || '0')
+    let err =
+      selectedBridge.validateBridgePrecision(
+        fromChain.name,
+        toChain.name,
+        amount
+      ) ?? ''
+    if (err) return [amount, err]
     if (amount < selectedBridge.minAmount) {
       err = `Minimum bridge amount is ${selectedBridge.displayAmount(
         selectedBridge.minAmount
@@ -194,7 +243,7 @@
       err = `Insufficient balance, should be less than ${selectedBridge.displayAmount(
         spendable
       )}`
-    } else if (amount >= bridgeReserve) {
+    } else if (amount - selectedBridge.bridgeFee > bridgeReserve) {
       err = 'Bridge has insufficient balance'
     } else if (fromChain.name !== 'ICP' && fromBalanceNative < gasFee) {
       err = `Insufficient ${fromChain.name} balance to cover gas fee`
@@ -235,6 +284,8 @@
         myAddresses
       )
       fromAddress = account.address
+      feeWarning = account.feeWarning
+      accountError = ''
       fromBalance = account.tokenBalance
       fromBalanceNative = account.nativeBalance
       // on ICP the ledger takes its fee in the token itself; every other chain
@@ -246,6 +297,8 @@
         toAddress = addressOn(toChain.name, myAddresses)
         bridgeReserve = await selectedBridge.reserveOn(toChain.name)
       }
+    } catch (err) {
+      accountError = errMessage(err)
     } finally {
       isLoading = false
     }
@@ -280,50 +333,118 @@
     await refreshMyTokenInfo()
   }
 
-  async function onBridge() {
-    const [amount, err] = validateBridge()
-    error = err || null
-    if (isBridging || err || amount <= 0n) return
+  function loadSavedRequest() {
+    if (!selectedBridge || !isAuthenticated) return
+    try {
+      savedRequest = readRequest(
+        localStorage,
+        selectedBridge.canisterId.toText(),
+        authStore.identity.getPrincipal().toText()
+      )
+      savedError = ''
+    } catch (err) {
+      savedError = errMessage(err)
+    }
+  }
 
+  async function continueSaved() {
+    const bridge = selectedBridge
+    const request = savedRequest
+    if (!bridge || !request || isBridging) return
     isBridging = true
-    toastRun(async () => {
-      if (
-        !selectedBridge?.state ||
-        !selectedBridge.token ||
-        !fromChain ||
-        !toChain
-      ) {
+    actionError = ''
+    try {
+      bridgingProgress?.stop()
+      const next = await bridge.submitBridgeRequest(request)
+      if (!alive) {
+        next.stop()
         return
       }
-
-      try {
-        if (fromChain.name === 'ICP') {
-          const icp = await selectedBridge.loadICPTokenAPI()
-          await icp.ensureAllowance(
-            selectedBridge.canisterId,
-            amount + selectedBridge.token.fee + selectedBridge.bridgeFee
-          )
-        }
-
-        bridgingProgress = await selectedBridge.bridge(
-          fromChain.name,
-          toChain.name,
-          amount,
-          thirdAddress
-        )
-
-        rememberForm(selectedBridge.token.symbol, fromChain.name, toChain.name)
-
-        refreshMyTokenInfo()
-        setTimeout(() => {
-          refreshMyTokenInfo()
-        }, 5000)
-      } catch (err) {
+      bridgingProgress = next
+      rememberForm(bridge.token?.symbol ?? '', request.from, request.to)
+      refreshMyTokenInfo()
+    } catch (err) {
+      if (alive) actionError = errMessage(err)
+    } finally {
+      if (alive) {
         isBridging = false
-        throw err
+        loadSavedRequest()
       }
-    })
+    }
   }
+
+  async function dismissSaved() {
+    const previous = savedRequest
+    if (!previous || isBridging) return
+    isBridging = true
+    try {
+      await withRequestLock(previous.canister, previous.owner, () => {
+        const current = readRequest(
+          localStorage,
+          previous.canister,
+          previous.owner
+        )
+        if (!alive || !current || current.id !== previous.id) return
+        if (
+          current.stage === 'submitted' &&
+          !confirm(
+            'This request may already have moved funds. Check Operations & recovery first. Clearing it only removes this browser’s shortcut; it does not cancel the payment. Have you verified the outcome and want to clear it?'
+          )
+        )
+          return
+        forgetRequest(localStorage, current)
+        actionError = ''
+        resetBridge()
+      })
+    } catch (err) {
+      savedError = errMessage(err)
+    } finally {
+      if (alive) {
+        isBridging = false
+        loadSavedRequest()
+      }
+    }
+  }
+
+  async function onBridge() {
+    if (!selectedBridge || !fromChain || !toChain || disabledBridging) return
+    const [amount, err] = validateBridge()
+    error = err || null
+    if (err || amount <= 0n) return
+    isBridging = true
+    actionError = ''
+    try {
+      savedRequest = await selectedBridge.prepareBridgeRequest(
+        fromChain.name,
+        toChain.name,
+        amount,
+        thirdAddress
+      )
+      rememberForm(
+        selectedBridge.token?.symbol ?? '',
+        fromChain.name,
+        toChain.name
+      )
+    } catch (err) {
+      actionError = errMessage(err)
+    } finally {
+      isBridging = false
+      loadSavedRequest()
+    }
+    if (savedRequest && !actionError) await continueSaved()
+  }
+
+  onMount(() => {
+    const refresh = () => loadSavedRequest()
+    window.addEventListener('storage', refresh)
+    window.addEventListener('bridge-activity', refresh)
+    return () => {
+      alive = false
+      bridgingProgress?.stop()
+      window.removeEventListener('storage', refresh)
+      window.removeEventListener('bridge-activity', refresh)
+    }
+  })
 </script>
 
 <div
@@ -332,6 +453,61 @@
   {#key bridgeCanister}
     <RefreshButton {isLoading} onclick={() => refreshMyTokenInfo(true)} />
     <AccountAddresses addresses={myAddresses} />
+    <BridgeStatus
+      bridge={selectedBridge}
+      chains={[fromChain?.name ?? '', toChain?.name ?? ''].filter(Boolean)}
+    />
+    {#if savedError}<p role="alert" class="text-sm break-words text-red-300"
+        >{savedError}</p
+      >{/if}
+    {#if savedRequest}
+      <section
+        aria-label="Saved bridge request"
+        class="space-y-3 rounded-lg border border-cyan-300/25 bg-cyan-300/5 p-4"
+      >
+        <p class="font-medium text-cyan-100"
+          >{savedRequest.stage === 'accepted'
+            ? 'Your bridge request was accepted'
+            : 'You have a saved bridge request'}</p
+        >
+        <p class="text-sm text-white/70"
+          >{savedRequest.from} → {savedRequest.to} · {selectedBridge?.displayAmount(
+            BigInt(savedRequest.amount)
+          )}
+          {selectedBridge?.token?.symbol}</p
+        >
+        {#if savedRequest.recipient}<p class="text-xs break-all text-white/50"
+            >To {savedRequest.recipient}</p
+          >{/if}
+        <p class="text-xs leading-relaxed text-white/60"
+          >{savedRequest.stage === 'prepared'
+            ? 'Continue this draft or discard it before starting another transfer.'
+            : 'Continue with the original request to recover its result. This does not start another transfer or ask you to fund the deposit again.'}</p
+        >
+        <div class="flex flex-wrap gap-2">
+          <button
+            class="rounded-md bg-cyan-300/15 px-3 py-2 text-sm text-cyan-100 disabled:opacity-40"
+            disabled={isBridging}
+            onclick={continueSaved}
+            >{isBridging
+              ? 'Checking…'
+              : savedRequest.stage === 'accepted'
+                ? 'Follow original transfer'
+                : 'Continue saved request'}</button
+          >
+          <button
+            class="rounded-md bg-white/5 px-3 py-2 text-sm text-white/60 disabled:opacity-40"
+            disabled={isBridging}
+            onclick={dismissSaved}
+            >{savedRequest.stage === 'accepted'
+              ? 'Start another bridge'
+              : savedRequest.stage === 'prepared'
+                ? 'Discard draft'
+                : 'Clear after reviewing outcome'}</button
+          >
+        </div>
+      </section>
+    {/if}
 
     <div class="relative">
       <BridgeHeader
@@ -339,7 +515,7 @@
         tokens={supportTokens}
         {selectedToken}
         {onSelectToken}
-        disabled={isLoading || isBridging}
+        disabled={isLoading || isBridging || !!savedRequest}
       />
     </div>
 
@@ -353,7 +529,7 @@
           <TokenLink bridge={selectedBridge} chain={fromChain?.name} />
         </p>
         <NetworkSelector
-          disabled={isLoading || isBridging}
+          disabled={isLoading || isBridging || !!savedRequest}
           selectedChain={fromChain}
           disabledChainName={''}
           onSelectChain={onSelectFromChain}
@@ -371,7 +547,7 @@
           <TokenLink bridge={selectedBridge} chain={toChain?.name} />
         </p>
         <NetworkSelector
-          disabled={isLoading || isBridging}
+          disabled={isLoading || isBridging || !!savedRequest}
           selectedChain={toChain}
           disabledChainName={fromChain?.name ?? ''}
           onSelectChain={onSelectToChain}
@@ -385,7 +561,7 @@
         <p class="collapse mb-1 text-center text-sm">-</p>
         <button
           onclick={onSwapChains}
-          disabled={isLoading || isBridging}
+          disabled={isLoading || isBridging || !!savedRequest}
           title="Swap from and to"
           class="hover:bg-gray flex size-8 items-center justify-center rounded-full border border-white/40 bg-black/90 text-white/50 shadow transition-all duration-500 hover:border-white/60 hover:text-white/90"
         >
@@ -403,7 +579,7 @@
       </p>
       <AmountInput
         bind:value={fromAmount}
-        disabled={isLoading || isBridging}
+        disabled={isLoading || isBridging || !!savedRequest}
         oninput={validateSendAmount}
       />
       {#if selectedBridge}
@@ -430,29 +606,38 @@
       </p>
       <AddressInput
         bind:value={thirdAddress}
-        disabled={isLoading || isBridging}
+        disabled={isLoading || isBridging || !!savedRequest}
         placeholder={pruneAddress(toAddress) || '0x...'}
         oninput={validateThirdAddress}
       />
-      {#if selectedBridge && !error && fromAmount! > 0}
-        {@const received =
-          selectedBridge.parseAmount(fromAmount!) - selectedBridge.bridgeFee}
+      {#if selectedBridge && !error && receivedAmount !== null}
         <div class="mt-1 text-sm text-green-500">
-          <span>You receive: {selectedBridge.displayAmount(received)}</span>
+          <span
+            >You receive: {selectedBridge.displayAmount(receivedAmount)}</span
+          >
         </div>
       {/if}
       {#if thirdAddress}
         <ConfirmAddress
           bind:checked={confirmAddress}
-          disabled={isLoading || isBridging}
+          disabled={isLoading || isBridging || !!savedRequest}
         />
       {/if}
     </div>
 
     <div class="relative">
-      {#if bridgeError || error}
-        <p class="mb-1 text-sm text-red-400">{bridgeError || error}</p>
+      {#if accountError || actionError || error}
+        <p role="alert" class="mb-1 text-sm break-words text-red-400"
+          >{actionError || accountError || error}</p
+        >
       {/if}
+      {#if feeWarning}<p class="mb-2 text-xs text-amber-200">{feeWarning}</p
+        >{/if}
+      {#if fromChain && fromChain.name !== 'ICP'}<p
+          class="mb-2 text-xs text-white/40"
+          >Gas is an estimate. The bridge checks current provider quotes and fee
+          limits before signing.</p
+        >{/if}
       {#if bridgingProgress}
         {@const message = bridgingProgress.message}
         {@const info = bridgingProgress.info}
@@ -500,19 +685,12 @@
           ><span class="text-cyan-500">Sign in with Internet Identity</span
           ></PrimaryButton
         >
-      {:else if bridgingProgress}
-        {@const isComplete = bridgingProgress.isComplete}
-        <PrimaryButton
-          onclick={resetBridge}
-          disabled={!isComplete}
-          isLoading={!isComplete}
+      {:else if savedRequest}
+        <p class="text-center text-sm text-white/50"
+          >{bridgingProgress?.isSettled
+            ? 'See Activity for the final status or any required review.'
+            : 'Use the saved request above to continue. Your activity is also available below.'}</p
         >
-          {#if isComplete}
-            <span class="text-green-500">Bridge completed, start again</span>
-          {:else}
-            <span>Bridging...</span>
-          {/if}
-        </PrimaryButton>
       {:else}
         <PrimaryButton
           onclick={onBridge}

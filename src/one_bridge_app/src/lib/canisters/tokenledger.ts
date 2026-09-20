@@ -102,8 +102,14 @@ export class TokenLedgerAPI {
     return unwrapResult(res, 'call icrc2_approve failed')
   }
 
-  async ensureAllowance(spender: Principal, amount: bigint): Promise<void> {
+  async ensureAllowance(
+    spender: Principal,
+    amount: bigint,
+    owner?: string
+  ): Promise<void> {
     const allowance = await this.allowance(spender)
+    if (owner && owner !== dynAgent.id.getPrincipal().toText())
+      throw new Error('The signed-in account changed')
     const expires_at = allowance.expires_at[0] || 0n
     if (
       allowance.allowance < amount ||

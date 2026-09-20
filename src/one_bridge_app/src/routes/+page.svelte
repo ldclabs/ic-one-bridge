@@ -1,7 +1,7 @@
 <script lang="ts">
   import { BridgeCanisterAPI } from '$lib/canisters/bridge.svelte'
   import BridgeCard from '$lib/components/BridgeCard.svelte'
-  import BridgeLogsPanel from '$lib/components/BridgeLogsPanel.svelte'
+  import BridgeActivity from '$lib/components/BridgeActivity.svelte'
   import WalletCard from '$lib/components/WalletCard.svelte'
   import { BRIDGE_CANISTER_ID } from '$lib/constants'
   import ArrowRightUpLine from '$lib/icons/arrow-right-up-line.svelte'
@@ -10,84 +10,48 @@
   import TwitterXLine from '$lib/icons/twitter-x-line.svelte'
   import { authStore } from '$lib/stores/auth.svelte'
   import { toastRun } from '$lib/stores/toast.svelte'
-  import { type BridgeLogInfo } from '$lib/types/bridge'
-  import { onMount, tick } from 'svelte'
-
-  const RECENT_LOGS = 20
+  import { onMount } from 'svelte'
 
   const principal = $derived(authStore.identity.getPrincipal().toText())
   const isAuthenticated = $derived(authStore.identity.isAuthenticated)
 
   let mainBridge = $state<BridgeCanisterAPI | null>(null)
-  let recentLogs: BridgeLogInfo[] = $state([])
-  let myRecentLogs: BridgeLogInfo[] = $state([])
-  let isLoading = $state(false)
-  let isMyLoading = $state(false)
+  let bridges = $state<BridgeCanisterAPI[]>([])
   let activeTab: 'bridge' | 'wallet' = $state('bridge')
 
   function onSignIn() {
     return authStore.signIn()
   }
 
-  // the newest logs across the main bridge and every sub-bridge, since each
-  // canister keeps only its own token's history
-  async function loadLogs(
-    take: (bridge: BridgeCanisterAPI) => Promise<BridgeLogInfo[]>
-  ): Promise<BridgeLogInfo[]> {
-    const bridge = mainBridge!
-    const bridges = [bridge, ...(await bridge.loadSubBridges())]
-    const logs = (await Promise.all(bridges.map(take))).flat()
-    logs.sort((a, b) => b.finalizedAt - a.finalizedAt)
-    return logs.slice(0, RECENT_LOGS)
-  }
-
-  function fetchRecentLogs() {
-    if (!mainBridge || isLoading) return
-
-    isLoading = true
-    toastRun(async (_signal) => {
-      recentLogs = await loadLogs((b) => b.listFinalizedLogs(RECENT_LOGS))
-    }).finally(() => {
-      // the button stays busy briefly so a click always reads as an action
-      setTimeout(() => {
-        isLoading = false
-      }, 1000)
-    })
-  }
-
-  function fetchMyRecentLogs() {
-    if (!mainBridge || isMyLoading) return
-
-    isMyLoading = true
-    toastRun(async (_signal) => {
-      myRecentLogs = await loadLogs((b) => b.listMyFinalizedLogs(RECENT_LOGS))
-    }).finally(() => {
-      setTimeout(() => {
-        isMyLoading = false
-      }, 1000)
-    })
-  }
-
-  $effect(() => {
-    if (mainBridge && isAuthenticated) {
-      tick().then(() => {
-        fetchMyRecentLogs()
-      })
-    } else {
-      myRecentLogs = []
-    }
-  })
-
   onMount(() => {
-    return toastRun(async (_signal) => {
-      if (mainBridge) return
-
+    let alive = true
+    let refreshing = false
+    const initial = toastRun(async () => {
       const bridge = await BridgeCanisterAPI.loadBridge(BRIDGE_CANISTER_ID)
-      // load sub-bridges in background
-      bridge.loadSubBridges()
+      const others = await bridge.loadSubBridges()
+      if (!alive) return
       mainBridge = bridge
-      fetchRecentLogs()
-    }).abort
+      bridges = [bridge, ...others]
+    })
+    const refresh = async () => {
+      if (refreshing || document.hidden) return
+      refreshing = true
+      try {
+        await Promise.all(bridges.map((bridge) => bridge.refreshState()))
+      } catch (error) {
+        console.error('Could not refresh bridge status', error)
+      } finally {
+        refreshing = false
+      }
+    }
+    const timer = setInterval(refresh, 15_000)
+    window.addEventListener('bridge-activity', refresh)
+    return () => {
+      alive = false
+      clearInterval(timer)
+      initial.abort()
+      window.removeEventListener('bridge-activity', refresh)
+    }
   })
 </script>
 
@@ -221,23 +185,12 @@
     </div>
   </section>
 
-  {#if isAuthenticated}
-    <BridgeLogsPanel
-      title="My bridge logs"
-      logs={myRecentLogs}
-      isLoading={isMyLoading}
-      disabled={isLoading || isMyLoading}
-      onRefresh={fetchMyRecentLogs}
-    />
-  {/if}
-
-  <BridgeLogsPanel
-    title="Bridge logs"
-    logs={recentLogs}
-    {isLoading}
-    disabled={isLoading || isMyLoading}
-    onRefresh={fetchRecentLogs}
-  />
+  {#key principal + isAuthenticated}
+    {#each bridges as bridge (bridge.canisterId.toText())}
+      {#if isAuthenticated}<BridgeActivity {bridge} mine />{/if}
+      <BridgeActivity {bridge} />
+    {/each}
+  {/key}
 
   <footer id="page-footer" class="text-surface-400 px-4 pt-12 pb-24">
     <div class="flex h-16 flex-col items-center">

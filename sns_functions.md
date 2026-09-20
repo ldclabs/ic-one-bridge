@@ -10,9 +10,9 @@
 1_309 dpjyw-raaaa-aaaar-qbxlq-cai admin_retry_bridging_task
 1_310 dpjyw-raaaa-aaaar-qbxlq-cai admin_close_bridging_task
 
-Planned registrations in proposals 505–509 and 511–512 (pending governance):
+Planned registrations in proposals 506–512 (pending governance):
 
-1_311 dpjyw-raaaa-aaaar-qbxlq-cai admin_init_public_keys // proposal-505
+1_311 dpjyw-raaaa-aaaar-qbxlq-cai admin_init_public_keys // proposal-512
 1_312 dpjyw-raaaa-aaaar-qbxlq-cai admin_set_resource_limits // proposal-506
 1_313 dpjyw-raaaa-aaaar-qbxlq-cai admin_set_evm_fee_limits // proposal-507
 1_314 dpjyw-raaaa-aaaar-qbxlq-cai admin_resolve_operation // proposal-508

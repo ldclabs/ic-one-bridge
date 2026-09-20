@@ -5,12 +5,13 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "format": "prettier --write \"src/**/*.{json,js,jsx,ts,tsx,css,scss,svelte}\"",
     "ncu": "npx npm-check-updates -u"
   },
   "type": "module",
-  "version": "0.5.2",
+  "version": "0.6.1",
   "dependencies": {
     "@icp-sdk/auth": "^8.0.3",
     "@icp-sdk/core": "^6.1.0",

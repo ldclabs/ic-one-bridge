@@ -4,9 +4,13 @@
   import { formatTimeAgo, pruneAddress } from '$lib/utils/helper'
 
   let {
-    logs
+    logs,
+    onRecheck,
+    busy = false
   }: {
     logs: BridgeLogInfo[]
+    onRecheck?: ((log: BridgeLogInfo) => void) | undefined
+    busy?: boolean
   } = $props()
 </script>
 
@@ -19,7 +23,7 @@
       <th class="px-4 py-3">Token</th>
       <th class="px-4 py-3">Amount</th>
       <th class="px-4 py-3">Status</th>
-      <th class="px-4 py-3">Finalized</th>
+      <th class="px-4 py-3">Updated</th>
     </tr>
   </thead>
   <tbody class="divide-y divide-white/5">
@@ -71,8 +75,26 @@
           >
             {log.status}
           </span>
+          {#if log.error}<p
+              class="mt-2 max-w-xs text-xs break-words text-amber-100/80"
+              >{log.error}</p
+            >{/if}
         </td>
-        <td class="px-4 py-4">{formatTimeAgo(log.finalizedAt)}</td>
+        <td class="px-4 py-4">
+          {formatTimeAgo(log.finalizedAt || log.createdAt)}
+          {#if !log.settled && log.nextPollAt > 0}<p
+              class="mt-1 text-xs text-white/40"
+              >Next check {new Date(log.nextPollAt).toLocaleTimeString()}</p
+            >{/if}
+          {#if onRecheck && log.canRecheck}<button
+              class="mt-2 block rounded-md bg-white/5 px-3 py-2 text-xs text-cyan-200 disabled:opacity-40"
+              disabled={busy}
+              onclick={() => onRecheck?.(log)}>Check confirmation</button
+            >{/if}
+          {#if log.needsReview}<p class="mt-2 text-xs text-amber-200"
+              >Governance review required</p
+            >{/if}
+        </td>
       </tr>
     {/each}
   </tbody>

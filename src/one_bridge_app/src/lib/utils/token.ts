@@ -18,22 +18,35 @@ export interface TokenInfo {
  */
 export class TokenDisplay {
   readonly #decimals: number
-  readonly #one: number
+  readonly #one: bigint
+  readonly #decimal: string
   readonly #formatter: Intl.NumberFormat
 
   constructor(decimals: number) {
     this.#decimals = decimals
-    this.#one = Number(10n ** BigInt(decimals))
+    this.#one = 10n ** BigInt(decimals)
+    this.#decimal =
+      new Intl.NumberFormat(locale)
+        .formatToParts(1.1)
+        .find((part) => part.type === 'decimal')?.value ?? '.'
     this.#formatter = new Intl.NumberFormat(locale, {
-      minimumFractionDigits: 1,
-      maximumFractionDigits: decimals,
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0,
       // never round up: a displayed balance must not exceed the real one
       roundingMode: 'floor'
     } as Intl.NumberFormatOptions)
   }
 
   displayValue(ulps: bigint): string {
-    return this.#formatter.format(Number(ulps) / this.#one)
+    const negative = ulps < 0n
+    const absolute = negative ? -ulps : ulps
+    const integral = this.#formatter.format(absolute / this.#one)
+    const fraction =
+      (absolute % this.#one)
+        .toString()
+        .padStart(this.#decimals, '0')
+        .replace(/0+$/, '') || '0'
+    return `${negative ? '-' : ''}${integral}${this.#decimals ? this.#decimal + fraction : ''}`
   }
 
   /**

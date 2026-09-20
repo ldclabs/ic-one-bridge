@@ -1,3 +1,6 @@
+import type { EvmFeeLimits } from '../../declarations/one_bridge_canister/one_bridge_canister.did.js'
+import { evmFee, providerIdentity } from './bridge-fees.ts'
+
 /**
  * Read-only EVM access over public JSON-RPC endpoints.
  *
@@ -31,26 +34,56 @@ export class EvmRpc {
     return BigInt((await jsonRPC<string>(this.#endpoint, method, params)) ?? 0)
   }
 
-  /**
-   * What the canister will require the sender to hold before it signs.
-   *
-   * It refuses to sign for an address that cannot pay `gas_limit *
-   * max_fee_per_gas`, and it builds that ceiling itself: the priority fee is
-   * bumped by a fifth and the base is doubled for headroom. Estimating with
-   * the plain `gasPrice + priorityFee` would clear a balance the canister then
-   * rejects, so the same arithmetic is repeated here.
-   *
-   * `gas` is the canister's `erc20_gas_limit`, the larger of the two limits it
-   * uses; a native transfer needs less, and over-estimating there is the safe
-   * direction.
-   */
-  async gasFeeEstimation(gas: bigint): Promise<bigint> {
-    const [gasPrice, maxPriorityFeePerGas] = await Promise.all([
-      this.#hex('eth_gasPrice'),
-      this.#hex('eth_maxPriorityFeePerGas')
-    ])
-    const priority = maxPriorityFeePerGas + maxPriorityFeePerGas / 5n
-    return gas * (gasPrice * 2n + priority)
+  // Prefer the canister's recent two-provider quote. Browser endpoints may
+  // differ from the canister's private providers, so this remains an estimate.
+  async gasFeeEstimation(
+    gas: bigint,
+    cached?: [bigint, bigint, bigint],
+    limits?: EvmFeeLimits
+  ): Promise<{ amount: bigint; warning?: string | undefined }> {
+    if (cached && cached[0] + 120_000n >= BigInt(Date.now())) {
+      return evmFee(gas, cached[1], cached[2], limits)
+    }
+    const unique = [
+      ...new Map(
+        this.#providers.map((url) => [providerIdentity(url), url])
+      ).values()
+    ]
+    const quotes = await Promise.allSettled(
+      unique.map(async (url) => {
+        const [price, priority] = await Promise.all([
+          jsonRPC<string>(url, 'eth_gasPrice'),
+          jsonRPC<string>(url, 'eth_maxPriorityFeePerGas')
+        ])
+        if (price === null || priority === null)
+          throw new Error('RPC returned no gas quote')
+        return [BigInt(price), BigInt(priority)] as const
+      })
+    )
+    const valid = quotes.flatMap((result) =>
+      result.status === 'fulfilled' ? [result.value] : []
+    )
+    if (!valid.length)
+      throw new Error(
+        'No public provider could estimate gas. Refresh before submitting.'
+      )
+    const price = valid.reduce(
+      (max, [value]) => (value > max ? value : max),
+      0n
+    )
+    const tip = valid.reduce(
+      (max, [, value]) => (value > max ? value : max),
+      0n
+    )
+    const estimate = evmFee(gas, price, tip, limits)
+    return {
+      ...estimate,
+      warning:
+        estimate.warning ??
+        (valid.length < 2
+          ? 'Gas is estimated from one public provider. The bridge checks two providers before signing, so the final requirement may be higher.'
+          : undefined)
+    }
   }
 
   async getBalance(address: string): Promise<bigint> {
@@ -87,6 +120,7 @@ async function jsonRPC<T>(
 ): Promise<T | null> {
   const resp = await fetch(url, {
     method: 'POST',
+    signal: AbortSignal.timeout(15_000),
     mode: 'cors',
     headers: {
       'Content-Type': 'application/json',

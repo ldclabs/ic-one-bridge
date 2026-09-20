@@ -21,11 +21,13 @@
     <p class="mb-1 text-white/60">Your address</p>
     {#each rows as [label, address] (label)}
       <p class="flex items-center gap-1">
-        <span>{label}: {pruneAddress(address, true)}</span>
-        <TextClipboardButton
-          value={address}
-          class="text-white/60 *:size-5 hover:text-white/80"
-        />
+        <span
+          >{label}: {address ? pruneAddress(address, true) : 'Not ready'}</span
+        >
+        {#if address}<TextClipboardButton
+            value={address}
+            class="text-white/60 *:size-5 hover:text-white/80"
+          />{/if}
       </p>
     {/each}
   </div>

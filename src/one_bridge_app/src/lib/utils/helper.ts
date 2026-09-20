@@ -16,10 +16,10 @@ export function formatTimeAgo(timestamp: number) {
   const minutes = Math.max(Math.round(delta / (60 * 1000)), 1)
   if (minutes > 60 * 24) {
     const days = Math.round(minutes / (60 * 24))
-    return `${days} days ago`
+    return `${days} ${days === 1 ? 'day' : 'days'} ago`
   } else if (minutes > 60) {
     const hours = Math.round(minutes / 60)
-    return `${hours} hours ago`
+    return `${hours} ${hours === 1 ? 'hour' : 'hours'} ago`
   }
-  return `${minutes} minutes ago`
+  return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'} ago`
 }
