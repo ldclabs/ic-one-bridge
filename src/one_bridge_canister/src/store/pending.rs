@@ -168,8 +168,12 @@ pub fn known_transaction(tx: &BridgeTx) -> Option<u64> {
 pub fn remember_transaction(tx: &BridgeTx, id: u64) -> Result<(), String> {
     INDEX.with_borrow_mut(|index| {
         let key = transaction_key(tx);
-        if index.get(&key).is_some_and(|old| old != id) {
-            return Err("incoming transaction already belongs to another operation".into());
+        if let Some(old) = index.get(&key) {
+            return if old == id {
+                Ok(())
+            } else {
+                Err("incoming transaction already belongs to another operation".into())
+            };
         }
         index.insert(key, id);
         Ok(())
@@ -177,7 +181,10 @@ pub fn remember_transaction(tx: &BridgeTx, id: u64) -> Result<(), String> {
 }
 
 pub fn insert(task: &BridgeLog) {
-    let mut task = task.clone();
+    write_task(task.clone(), get(task.task_id).as_ref());
+}
+
+fn write_task(mut task: BridgeLog, old: Option<&BridgeLog>) {
     if let Some(error) = reconciliation_error(&task) {
         task.stuck = true;
         task.error = Some(error);
@@ -185,27 +192,33 @@ pub fn insert(task: &BridgeLog) {
     }
     assert_ne!(task.task_id, 0, "pending tasks require a stable ID");
     remember_transaction(&task.from_tx, task.task_id).expect("duplicate incoming transaction");
-    if let Some(old) = get(task.task_id) {
-        INDEX.with_borrow_mut(|index| {
-            for key in keys(&old) {
-                index.remove(&key);
-            }
-        });
-    }
+    let old_keys = old.map(keys).unwrap_or_default();
+    let new_keys = keys(&task);
     TASKS.with_borrow_mut(|tasks| {
         tasks.insert(task.task_id, task.clone().into());
     });
     INDEX.with_borrow_mut(|index| {
-        for key in keys(&task) {
-            index.insert(key, task.task_id);
+        for key in &old_keys {
+            // Source identities remain tombstones even if reconciliation
+            // corrects the task's source transaction.
+            if key.first() != Some(&1) && !new_keys.contains(key) {
+                index.remove(key);
+            }
+        }
+        for key in new_keys {
+            // remember_transaction already installed/checked the source key.
+            if key.first() != Some(&1) && !old_keys.contains(&key) {
+                index.insert(key, task.task_id);
+            }
         }
     });
 }
 
 pub fn update<R>(id: u64, f: impl FnOnce(&mut BridgeLog) -> R) -> Option<R> {
-    let mut task = get(id)?;
+    let old = get(id)?;
+    let mut task = old.clone();
     let result = f(&mut task);
-    insert(&task);
+    write_task(task, Some(&old));
     Some(result)
 }
 
@@ -356,6 +369,47 @@ mod tests {
         );
         task.task_id = id;
         task
+    }
+
+    #[test]
+    fn partial_updates_preserve_identity_and_move_only_changed_indexes() {
+        reset();
+        let original = task("ETH");
+        let id = original.task_id;
+        insert(&original);
+        let source = transaction_key(&original.from_tx);
+        let user = suffix(user_prefix(&original.user), id);
+        update(id, |task| task.next_poll_at = 10_000);
+        INDEX.with_borrow(|index| {
+            assert_eq!(index.get(&source), Some(id));
+            assert_eq!(index.get(&user), Some(id));
+            assert!(index.get(&suffix(suffix(vec![2], 0), id)).is_none());
+            assert_eq!(index.get(&suffix(suffix(vec![2], 10_000), id)), Some(id));
+        });
+        update(id, |task| {
+            task.to_tx = Some(BridgeTx::Evm(false, [9; 32].into()));
+            task.error = Some("ETH: temporarily unavailable".into());
+            task.error_chain = Some(BridgeTarget::Evm("ETH".into()));
+        });
+        assert!(chain_reserved_by_other("ETH", id + 1));
+        assert!(chain_error(&BridgeTarget::Evm("ETH".into())).is_some());
+        update(id, |task| {
+            task.stuck = true;
+            task.payout_resolution = Some(PayoutResolution::Failed);
+        });
+        assert!(next_due().is_none());
+        assert!(!chain_reserved_by_other("ETH", id + 1));
+        assert!(chain_error(&BridgeTarget::Evm("ETH".into())).is_none());
+        set_conflict_hold(id, 77, true);
+        update(id, |task| {
+            task.stuck = false;
+            task.next_poll_at = 0;
+        });
+        assert!(get(id).unwrap().stuck);
+        assert!(next_due().is_none());
+        remove(id);
+        assert_eq!(known_transaction(&original.from_tx), Some(id));
+        assert!(by_tx(&original.from_tx).is_none());
     }
     #[test]
     fn three_in_flight_evm_tasks_do_not_starve_solana() {

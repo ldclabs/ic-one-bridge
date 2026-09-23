@@ -1,9 +1,7 @@
 use std::str::FromStr;
 
-use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::Bytes;
+use alloy_primitives::B256;
 use candid::Principal;
-use ic_auth_types::ByteBufB64;
 use serde_bytes::ByteBuf;
 
 use crate::{
@@ -100,8 +98,7 @@ async fn erc20_transfer_tx(chain: String, to: String, icp_amount: u128) -> Resul
         Funding::Verify,
     )
     .await?;
-    let data = signed_tx.encoded_2718();
-    Ok(Bytes::from(data).to_string())
+    store::state::evm_raw_hex(&signed_tx.meta)
 }
 
 #[ic_cdk::update(guard = "admit_request")]
@@ -118,12 +115,12 @@ async fn erc20_transfer(chain: String, to: String, icp_amount: u128) -> Result<S
         Funding::Verify,
     )
     .await?;
-    let tx_hash = signed_tx.hash().to_string();
-
-    let data = signed_tx.encoded_2718();
-    let _ = cli
-        .send_raw_transaction(Bytes::from(data).to_string())
-        .await?;
+    let store::BridgeTx::Evm(_, hash) = signed_tx.tx else {
+        unreachable!("EVM builder returns an EVM transaction")
+    };
+    let tx_hash = B256::from(*hash).to_string();
+    let data = store::state::evm_raw_hex(&signed_tx.meta)?;
+    let _ = cli.send_raw_transaction(data).await?;
 
     Ok(tx_hash)
 }
@@ -142,8 +139,7 @@ async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<
         Funding::Verify,
     )
     .await?;
-    let data = signed_tx.encoded_2718();
-    Ok(Bytes::from(data).to_string())
+    store::state::evm_raw_hex(&signed_tx.meta)
 }
 
 #[ic_cdk::update(guard = "admit_request")]
@@ -151,11 +147,9 @@ async fn spl_transfer_tx(to: String, icp_amount: u128) -> Result<String, String>
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
     let _signing = store::acquire_active_bridge_user(caller)?;
-    let (_, signed_tx, _) =
+    let (_, signed_tx) =
         store::state::build_spl_transfer_tx(&caller, &to_addr, icp_amount, Funding::Verify).await?;
-    let data = bincode::serialize(&signed_tx)
-        .map_err(|err| format!("failed to serialize signed tx: {}", err))?;
-    Ok(ByteBufB64::from(data).to_base64())
+    Ok(store::state::svm_raw(&signed_tx.meta)?.to_base64())
 }
 
 #[ic_cdk::update(guard = "admit_request")]
@@ -163,11 +157,9 @@ async fn sol_transfer_tx(to: String, sol_amount: u64) -> Result<String, String> 
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
     let _signing = store::acquire_active_bridge_user(caller)?;
-    let (_, signed_tx, _) =
+    let (_, signed_tx) =
         store::state::build_sol_transfer_tx(&caller, &to_addr, sol_amount, Funding::Verify).await?;
-    let data = bincode::serialize(&signed_tx)
-        .map_err(|err| format!("failed to serialize signed tx: {}", err))?;
-    Ok(ByteBufB64::from(data).to_base64())
+    Ok(store::state::svm_raw(&signed_tx.meta)?.to_base64())
 }
 
 #[ic_cdk::update(guard = "admit_request")]

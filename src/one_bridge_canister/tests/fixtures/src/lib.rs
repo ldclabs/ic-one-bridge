@@ -23,6 +23,10 @@ mod ledger {
         last_amount: u128,
         last_to: Option<Principal>,
         dedup: BTreeMap<Vec<u8>, u64>,
+        #[serde(default)]
+        metadata_calls: u64,
+        #[serde(default)]
+        fee_calls: u64,
     }
     thread_local! { static STATE:RefCell<Ledger> = RefCell::new(Ledger::default()); }
     #[derive(CandidType, Serialize, Deserialize)]
@@ -31,6 +35,8 @@ mod ledger {
         outgoing: u64,
         last_amount: u128,
         last_to: Option<Principal>,
+        metadata_calls: u64,
+        fee_calls: u64,
     }
     #[ic_cdk::query]
     fn stats() -> Stats {
@@ -39,15 +45,25 @@ mod ledger {
             outgoing: s.outgoing,
             last_amount: s.last_amount,
             last_to: s.last_to,
+            metadata_calls: s.metadata_calls,
+            fee_calls: s.fee_calls,
         })
     }
     #[ic_cdk::query]
     fn icrc1_fee() -> Nat {
+        STATE.with_borrow_mut(|s| s.fee_calls += 1);
         10u64.into()
     }
     #[ic_cdk::query]
     fn icrc1_decimals() -> u8 {
-        8
+        STATE.with_borrow_mut(|s| {
+            s.metadata_calls += 1;
+            match s.mode {
+                3 => ic_cdk::trap("temporary metadata outage"),
+                4 => 9,
+                _ => 8,
+            }
+        })
     }
     #[ic_cdk::query]
     fn icrc1_minting_account() -> Option<Account> {
@@ -73,6 +89,20 @@ mod ledger {
     fn icrc2_transfer_from(args: TransferFromArgs) {
         let key = key(2, &args);
         let (result, bad) = STATE.with_borrow_mut(|s| {
+            let error = match s.mode {
+                5 => Some(TransferFromError::BadFee {
+                    expected_fee: 20u64.into(),
+                }),
+                6 => Some(TransferFromError::InsufficientFunds {
+                    balance: 0u64.into(),
+                }),
+                7 => Some(TransferFromError::TemporarilyUnavailable),
+                8 => Some(TransferFromError::TooOld),
+                _ => None,
+            };
+            if let Some(error) = error {
+                return (Err(error), false);
+            }
             if args.created_at_time.is_some()
                 && let Some(id) = s.dedup.get(&key)
             {
@@ -103,6 +133,20 @@ mod ledger {
     }
     #[ic_cdk::update]
     async fn icrc1_transfer(args: TransferArg) -> Result<Nat, TransferError> {
+        let error = STATE.with_borrow(|s| match s.mode {
+            5 => Some(TransferError::BadFee {
+                expected_fee: 20u64.into(),
+            }),
+            6 => Some(TransferError::InsufficientFunds {
+                balance: 0u64.into(),
+            }),
+            7 => Some(TransferError::TemporarilyUnavailable),
+            8 => Some(TransferError::TooOld),
+            _ => None,
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
         let key = key(1, &args);
         let (id, duplicate, hold) = STATE.with_borrow_mut(|s| {
             if args.created_at_time.is_some()

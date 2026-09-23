@@ -50,8 +50,7 @@ pub(super) async fn finalize_bridging() {
             t.next_poll_at = started.saturating_add(FINALIZE_BRIDGING_LOCK_TIMEOUT_MS)
         });
     }
-    let context = FinalizeContext::default();
-    context.prepare_solana(&tasks).await;
+    let context = FinalizeContext::new(&tasks);
     enum Job {
         Task(Box<BridgeLog>),
         Operation(u64),
@@ -210,11 +209,6 @@ pub(super) async fn finalize_bridging() {
             s.error_rounds.saturating_add(1)
         } else {
             0
-        };
-        s.idle_rounds = if has_progress {
-            0
-        } else {
-            s.idle_rounds.saturating_add(1)
         };
         error_backoff_secs(s.error_rounds).max(3)
     });
@@ -499,7 +493,7 @@ async fn settle_payout(
                 let ledger = task
                     .ledger
                     .unwrap_or_else(|| STATE.with_borrow(|s| s.token_ledger));
-                let fee = ledger_fee(ledger).await?;
+                let fee = context.ledger_fee(ledger).await?;
                 if !finalize_run_is_current(run_generation) {
                     return Ok(());
                 }
@@ -726,17 +720,8 @@ async fn to_evm(
     .await
     .map_err(|err| (None, format!("{chain}: {err}")))?;
 
-    let tx_hash: [u8; 32] = (*signed_tx.hash()).into();
-    let raw = signed_tx.encoded_2718();
-    let payout: Payout = (
-        BridgeTx::Evm(false, tx_hash.into()),
-        TxMeta {
-            deadline: TxDeadline::Nonce(signed_tx.tx().nonce),
-            svm_validity: None,
-            raw: Some(ByteBuf::from(raw.clone())),
-        },
-    );
-    let data = Bytes::from(raw).to_string();
+    let data = evm_raw_hex(&signed_tx.meta).map_err(|e| (None, e))?;
+    let payout = (signed_tx.tx, signed_tx.meta);
     broadcast_payout(run_generation, from_tx, payout, chain, now_ms, || {
         client.send_raw_transaction(data)
     })
@@ -763,7 +748,7 @@ async fn to_svm(
         .await;
     }
 
-    let (client, signed_tx, last_valid_block_height) = build_spl_transfer_tx(
+    let (client, signed_tx) = build_spl_transfer_tx(
         &crate::helper::canister_id(),
         &to_addr,
         icp_amount,
@@ -777,18 +762,10 @@ async fn to_svm(
     .await
     .map_err(|err| (None, format!("SOL: {err}")))?;
 
-    let signature: [u8; 64] = signed_tx.signatures[0].into();
-    let raw = bincode::serialize(&signed_tx).map_err(|err| (None, format!("SOL: {err}")))?;
-    let payout: Payout = (
-        BridgeTx::Sol(false, signature.into()),
-        TxMeta {
-            deadline: TxDeadline::BlockHeight(last_valid_block_height.last_valid_block_height),
-            svm_validity: Some(last_valid_block_height),
-            raw: Some(ByteBuf::from(raw.clone())),
-        },
-    );
+    let raw = svm_raw(&signed_tx.meta).map_err(|e| (None, e))?;
+    let payout = (signed_tx.tx, signed_tx.meta);
     broadcast_payout(run_generation, from_tx, payout, "SOL", now_ms, || {
-        client.send_transaction(ByteBufB64::from(raw))
+        client.send_transaction(raw)
     })
     .await
 }
@@ -918,11 +895,7 @@ async fn check_sol_tx(
 ) -> Result<TxStatus<()>, TxCheckError> {
     let client = svm_client();
     let signature = SvmSignature::from(*signature).to_string();
-    let cached = context.sol_statuses.borrow().get(&signature).cloned();
-    let status = match cached {
-        Some(status) => status?,
-        None => client.get_signature_status(&signature).await?,
-    };
+    let status = context.sol_status(&signature, &client).await?;
 
     match status {
         SolTxStatus::Finalized => Ok(TxStatus::Confirmed(())),

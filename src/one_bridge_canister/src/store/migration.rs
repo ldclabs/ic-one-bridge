@@ -14,6 +14,8 @@ struct Progress {
     next_journal: u64,
     #[serde(default)]
     journal_target: u64,
+    #[serde(default)]
+    recovery_index_version: u8,
 }
 thread_local! {
     static PROGRESS: RefCell<StableCell<Cbor<Progress>, Memory>> = RefCell::new(StableCell::init(memory(9), Cbor(Progress::default())));
@@ -72,7 +74,7 @@ pub fn step(limit: usize) -> bool {
     }
     let mut progress = PROGRESS.with_borrow(|cell| cell.get().0.clone());
     let (cursor, processed) =
-        journal::migrate_conflict_holds(progress.next_journal, progress.journal_target, left);
+        journal::migrate_indexes(progress.next_journal, progress.journal_target, left);
     progress.next_journal = cursor;
     left -= processed;
     while left > 0 {
@@ -128,6 +130,15 @@ fn initialize_indexes() {
             progress.icp_fees = 0;
             progress.archive_index_version = 1;
             progress.journal_target = journal::last_id();
+            cell.set(Cbor(progress));
+        }
+    });
+    PROGRESS.with_borrow_mut(|cell| {
+        let mut progress = cell.get().0.clone();
+        if progress.recovery_index_version == 0 {
+            progress.next_journal = 0;
+            progress.journal_target = journal::last_id();
+            progress.recovery_index_version = 1;
             cell.set(Cbor(progress));
         }
     });

@@ -83,6 +83,8 @@ struct Stats {
     outgoing: u64,
     last_amount: u128,
     last_to: Option<Principal>,
+    metadata_calls: u64,
+    fee_calls: u64,
 }
 #[derive(Debug, CandidType, Deserialize)]
 enum Phase {
@@ -159,6 +161,7 @@ struct Rpc {
     block_transactions: usize,
     header_calls: usize,
     full_block_calls: usize,
+    hold_sol_status: bool,
 }
 impl Default for Rpc {
     fn default() -> Self {
@@ -174,6 +177,7 @@ impl Default for Rpc {
             block_transactions: 0,
             header_calls: 0,
             full_block_calls: 0,
+            hold_sol_status: false,
         }
     }
 }
@@ -327,6 +331,10 @@ impl Rpc {
     fn respond(&mut self, pic: &PocketIc) {
         for request in pic.get_canister_http() {
             assert!(request.max_response_bytes.is_some());
+            let rpc_request: Value = serde_json::from_slice(&request.body).unwrap();
+            if self.hold_sol_status && rpc_request["method"] == "getSignatureStatuses" {
+                continue;
+            }
             let body = serde_json::to_vec(&self.answer(&request.url, &request.body)).unwrap();
             if body.len() as u64 > request.max_response_bytes.unwrap() {
                 pic.mock_canister_http_response(MockCanisterHttpResponse {
@@ -442,6 +450,322 @@ fn register_evm_chain(
             .unwrap()
             .unwrap();
     }
+}
+
+fn setup_bridge(hooks: bool) -> (PocketIc, Rpc, Principal, Principal, Principal, Principal) {
+    let pic = test_network();
+    let user = Principal::self_authenticating([7; 32]);
+    let admin = Principal::self_authenticating([9; 32]);
+    let ledger = deploy(&pic, wasm("ledger.wasm"), encode_args(()).unwrap());
+    let bridge = deploy(
+        &pic,
+        wasm(if hooks {
+            "bridge-hooks.wasm"
+        } else {
+            "bridge.wasm"
+        }),
+        encode_one(Some(Args::Init(Init {
+            key_name: "test_key_1".into(),
+            token_name: "Fixture".into(),
+            token_symbol: "TEST".into(),
+            token_decimals: 8,
+            token_logo: "".into(),
+            token_ledger: ledger,
+            token_bridge_fee: 1,
+            min_threshold_to_bridge: 2,
+            governance_canister: Some(admin),
+            erc20_gas_limit: None,
+        })))
+        .unwrap(),
+    );
+    let mut rpc = Rpc::default();
+    ready(&pic, &mut rpc, bridge);
+    rpc.bridge = info(&pic, bridge).evm_address.parse().unwrap();
+    rpc.user = query::<Result<String, String>>(
+        &pic,
+        bridge,
+        user,
+        "evm_address",
+        encode_one(None::<Principal>).unwrap(),
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    register_evm_chain(&pic, &mut rpc, bridge, admin, "ETH", 1);
+    (pic, rpc, bridge, ledger, user, admin)
+}
+
+fn set_ledger_mode(pic: &PocketIc, rpc: &mut Rpc, ledger: Principal, mode: u8) {
+    update(
+        pic,
+        rpc,
+        ledger,
+        Principal::anonymous(),
+        "set_mode",
+        encode_one(mode).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "build fixture and test Wasm with make integration-test"]
+fn initialization_retries_temporary_outages_and_stops_on_configuration_mismatch() {
+    let (pic, mut rpc, bridge, ledger, user, _) = setup_bridge(false);
+    set_ledger_mode(&pic, &mut rpc, ledger, 7);
+    bridge_result(
+        update(
+            &pic,
+            &mut rpc,
+            bridge,
+            user,
+            "bridge",
+            encode_args(("ETH", "ICP", 100u128, None::<String>)).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    pump(&pic, &mut rpc, 30);
+    assert_eq!(info(&pic, bridge).pending_count, 1);
+    assert_eq!(stats(&pic, ledger).outgoing, 0);
+    set_ledger_mode(&pic, &mut rpc, ledger, 3);
+    pic.upgrade_canister(
+        bridge,
+        wasm("bridge.wasm"),
+        encode_one(None::<u8>).unwrap(),
+        None,
+    )
+    .unwrap();
+    pump(&pic, &mut rpc, 10);
+    assert!(!info(&pic, bridge).ledger_verified);
+    set_ledger_mode(&pic, &mut rpc, ledger, 0);
+    // No restart, init or resume ingress: the initialization timer recovers
+    // readiness and the outstanding ledger payment by itself.
+    ready(&pic, &mut rpc, bridge);
+    pump(&pic, &mut rpc, 60);
+    assert_eq!(stats(&pic, ledger).outgoing, 1);
+    assert_eq!(info(&pic, bridge).pending_count, 0);
+
+    set_ledger_mode(&pic, &mut rpc, ledger, 4);
+    pic.upgrade_canister(
+        bridge,
+        wasm("bridge.wasm"),
+        encode_one(None::<u8>).unwrap(),
+        None,
+    )
+    .unwrap();
+    pump(&pic, &mut rpc, 20);
+    assert!(!info(&pic, bridge).ledger_verified);
+    let calls = stats(&pic, ledger).metadata_calls;
+    pump(&pic, &mut rpc, 60);
+    assert_eq!(stats(&pic, ledger).metadata_calls, calls);
+    assert_eq!(stats(&pic, ledger).outgoing, 1);
+}
+
+#[test]
+#[ignore = "build fixture and test Wasm with make integration-test"]
+fn slow_solana_status_does_not_delay_an_independent_icp_payout() {
+    let (pic, mut rpc, bridge, ledger, user, admin) = setup_bridge(false);
+    for (method, args) in [
+        (
+            "admin_set_svm_providers",
+            encode_one(vec!["https://sol-a.example", "https://sol-b.example"]).unwrap(),
+        ),
+        (
+            "admin_add_svm_contract",
+            encode_one(solana_pubkey::Pubkey::new_from_array([44; 32]).to_string()).unwrap(),
+        ),
+    ] {
+        decode_one::<Result<(), String>>(
+            &update(&pic, &mut rpc, bridge, admin, method, args).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    }
+    bridge_result(
+        update(
+            &pic,
+            &mut rpc,
+            bridge,
+            user,
+            "bridge",
+            encode_args((
+                "ICP",
+                "SOL",
+                100u128,
+                Some(solana_pubkey::Pubkey::new_from_array([33; 32]).to_string()),
+            ))
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Finish the initial broadcast at fixed time, before the next poll is due.
+    for _ in 0..60 {
+        rpc.respond(&pic);
+        pic.tick();
+    }
+    assert_eq!(rpc.sol_messages.len(), 1);
+    assert!(!info(&pic, bridge).finalize_bridging_round.1);
+    rpc.hold_sol_status = true;
+    bridge_result(
+        update(
+            &pic,
+            &mut rpc,
+            bridge,
+            user,
+            "bridge",
+            encode_args(("ETH", "ICP", 100u128, None::<String>)).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    pump(&pic, &mut rpc, 30);
+    assert!(pic.get_canister_http().iter().any(|request| {
+        serde_json::from_slice::<Value>(&request.body).unwrap()["method"] == "getSignatureStatuses"
+    }));
+    assert_eq!(stats(&pic, ledger).outgoing, 1);
+    assert_eq!(info(&pic, bridge).pending_count, 1);
+    rpc.hold_sol_status = false;
+    pump(&pic, &mut rpc, 40);
+    assert_eq!(info(&pic, bridge).pending_count, 0);
+}
+
+#[test]
+#[ignore = "build fixture and test Wasm with make integration-test"]
+fn reconciled_external_deposit_is_paid_without_owner_resume() {
+    let (pic, mut rpc, bridge, ledger, user, admin) = setup_bridge(true);
+    update(
+        &pic,
+        &mut rpc,
+        bridge,
+        Principal::anonymous(),
+        "test_trap_after_signature",
+        encode_one(true).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        update(
+            &pic,
+            &mut rpc,
+            bridge,
+            user,
+            "bridge",
+            encode_args(("ETH", "ICP", 100u128, None::<String>)).unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(info(&pic, bridge).pending_count, 0);
+    let entries = query::<Result<Vec<Operation>, String>>(
+        &pic,
+        bridge,
+        user,
+        "my_operations",
+        encode_args((10u32, None::<u64>)).unwrap(),
+    )
+    .unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| matches!(entry.phase, Phase::Submitted))
+        .unwrap();
+    #[derive(CandidType)]
+    enum Resolution {
+        Completed(Tx),
+    }
+    // Governance supplies external evidence for the uncertain signature intent.
+    decode_one::<Result<(), String>>(
+        &update(
+            &pic,
+            &mut rpc,
+            bridge,
+            admin,
+            "admin_resolve_operation",
+            encode_args((
+                entry.id,
+                entry.revision,
+                Resolution::Completed(Tx::Evm(true, vec![95; 32].into())),
+                "fixture: controller verified the finalized external transfer",
+            ))
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    pump(&pic, &mut rpc, 60);
+    assert_eq!(stats(&pic, ledger).outgoing, 1);
+    assert_eq!(stats(&pic, ledger).last_amount, 99);
+    assert_eq!(info(&pic, bridge).pending_count, 0);
+    assert_eq!(info(&pic, bridge).total_bridge_count, 1);
+    pic.upgrade_canister(
+        bridge,
+        wasm("bridge.wasm"),
+        encode_one(None::<u8>).unwrap(),
+        None,
+    )
+    .unwrap();
+    ready(&pic, &mut rpc, bridge);
+    pump(&pic, &mut rpc, 30);
+    assert_eq!(stats(&pic, ledger).outgoing, 1);
+}
+
+#[test]
+#[ignore = "build fixture and test Wasm with make integration-test"]
+fn ledger_rejections_and_temporary_failures_do_not_duplicate_deposits() {
+    let (pic, mut rpc, bridge, ledger, _, _) = setup_bridge(false);
+    for mode in 5..=8 {
+        let user = Principal::self_authenticating([mode; 32]);
+        let before = stats(&pic, ledger).incoming;
+        set_ledger_mode(&pic, &mut rpc, ledger, mode);
+        assert!(
+            bridge_result(
+                update(
+                    &pic,
+                    &mut rpc,
+                    bridge,
+                    user,
+                    "bridge",
+                    encode_args(("ICP", "ETH", 100u128, None::<String>)).unwrap()
+                )
+                .unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(stats(&pic, ledger).incoming, before);
+        let entries = query::<Result<Vec<Operation>, String>>(
+            &pic,
+            bridge,
+            user,
+            "my_operations",
+            encode_args((10u32, None::<u64>)).unwrap(),
+        )
+        .unwrap();
+        let entry = &entries[0];
+        match mode {
+            5 | 6 => assert!(matches!(entry.phase, Phase::Rejected(_))),
+            7 => assert!(matches!(entry.phase, Phase::Prepared)),
+            _ => assert!(matches!(entry.phase, Phase::NeedsReview(_))),
+        }
+        set_ledger_mode(&pic, &mut rpc, ledger, 0);
+        pump(&pic, &mut rpc, 60);
+        assert_eq!(stats(&pic, ledger).incoming, before + u64::from(mode == 7));
+        if mode == 7 {
+            bridge_result(
+                update(
+                    &pic,
+                    &mut rpc,
+                    bridge,
+                    user,
+                    "resume_deposit",
+                    encode_one(entry.id).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stats(&pic, ledger).incoming, before + 1);
+        }
+    }
+    // Successful EVM payouts do not query ledger fees.
+    assert_eq!(stats(&pic, ledger).fee_calls, 0);
 }
 
 #[test]

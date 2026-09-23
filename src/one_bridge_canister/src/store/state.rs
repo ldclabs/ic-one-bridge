@@ -51,138 +51,8 @@ pub static DEFAULT_CEL_EXPR: LazyLock<String> =
 pub static DEFAULT_CERT_ENTRY: LazyLock<HttpCertificationTreeEntry> =
     LazyLock::new(|| HttpCertificationTreeEntry::new(&*DEFAULT_EXPR_PATH, *DEFAULT_CERTIFICATION));
 
-/// Fetches the subnet master keys and derives the bridge's own addresses.
-///
-/// Every user address is derived from these, so a failure is logged and
-/// retried on the next upgrade or `admin_init_public_keys` rather than
-/// trapping the install. Until a key is there, bridging that needs it is
-/// refused.
-pub async fn init_public_keys() {
-    let key_name = STATE.with_borrow(|s| s.key_name.clone());
-    init_ecdsa_public_key(key_name.clone()).await;
-    init_ed25519_public_key(key_name).await;
-    verify_ledger_metadata().await;
-    crate::http_config::refresh();
-}
-
-/// Fetches whichever master key is still missing; a no-op once both are
-/// there.
-pub async fn try_init_public_keys() {
-    let (key_name, ecdsa_missing, ed25519_missing) = STATE.with_borrow(|s| {
-        (
-            s.key_name.clone(),
-            s.ecdsa_public_key.public_key.is_empty(),
-            s.ed25519_public_key.public_key.is_empty(),
-        )
-    });
-
-    if ecdsa_missing {
-        init_ecdsa_public_key(key_name.clone()).await;
-    }
-    if ed25519_missing {
-        init_ed25519_public_key(key_name).await;
-    }
-    let (mint, providers, verified) = STATE.with_borrow(|s| {
-        (
-            s.svm_token_address.0,
-            s.svm_providers.clone(),
-            s.svm_mint_verified,
-        )
-    });
-    if mint != Pubkey::default() && !verified {
-        let client = SvmClient::new(providers.clone(), DefaultHttpOutcall);
-        match client.get_mint_config(&mint.to_string()).await {
-            Ok(config) => STATE.with_borrow_mut(|s| {
-                if s.svm_providers == providers
-                    && s.svm_token_address.0 == mint
-                    && s.svm_token_address.1 == config.decimals
-                    && s.svm_token_address.2.to_string() == config.program
-                {
-                    s.svm_mint_verified = true;
-                    s.svm_token_account_size = config.token_account_size;
-                }
-            }),
-            Err(err) => ic_cdk::api::debug_print(format!("SOL mint verification failed: {err}")),
-        }
-    }
-    verify_ledger_metadata().await;
-    crate::http_config::refresh();
-}
-
-async fn verify_ledger_metadata() {
-    let (ledger, decimals, verified) =
-        STATE.with_borrow(|s| (s.token_ledger, s.token_decimals, s.ledger_verified));
-    if verified {
-        return;
-    }
-    let result = async {
-        let actual: u8 = crate::helper::read_call(ledger, "icrc1_decimals", ()).await?;
-        let minting: Option<Account> =
-            crate::helper::read_call(ledger, "icrc1_minting_account", ()).await?;
-        if actual != decimals {
-            return Err("configured decimals disagree with the ledger".to_string());
-        }
-        if minting
-            == Some(Account {
-                owner: crate::helper::canister_id(),
-                subaccount: None,
-            })
-        {
-            return Err("a lock/release bridge must not be the ledger minting account".to_string());
-        }
-        STATE.with_borrow_mut(|s| {
-            if s.token_ledger == ledger && s.token_decimals == decimals {
-                s.ledger_verified = true;
-                s.ledger_minting_account = minting;
-            }
-        });
-        Ok::<_, String>(())
-    }
-    .await;
-    if let Err(error) = result {
-        ic_cdk::api::debug_print(format!("ICP ledger verification failed: {error}"));
-    } else {
-        schedule_finalize(Duration::ZERO);
-    }
-}
-
-async fn init_ecdsa_public_key(key_name: String) {
-    match ecdsa_public_key(key_name, vec![]).await {
-        Ok(root_pk) => {
-            STATE.with_borrow_mut(|s| match derive_evm_address(&root_pk, &s.icp_address) {
-                Ok(evm_address) => {
-                    s.ecdsa_public_key = root_pk;
-                    s.evm_address = evm_address;
-                }
-                Err(err) => {
-                    ic_cdk::api::debug_print(format!("failed to derive EVM address: {err}"))
-                }
-            })
-        }
-        Err(err) => {
-            ic_cdk::api::debug_print(format!("failed to retrieve ECDSA public key: {err}"));
-        }
-    }
-}
-
-async fn init_ed25519_public_key(key_name: String) {
-    match schnorr_public_key(key_name, vec![]).await {
-        Ok(root_pk) => {
-            STATE.with_borrow_mut(|s| match derive_svm_address(&root_pk, &s.icp_address) {
-                Ok(svm_address) => {
-                    s.ed25519_public_key = root_pk;
-                    s.svm_address = svm_address;
-                }
-                Err(err) => {
-                    ic_cdk::api::debug_print(format!("failed to derive SVM address: {err}"))
-                }
-            })
-        }
-        Err(err) => {
-            ic_cdk::api::debug_print(format!("failed to retrieve Schnorr public key: {err}"));
-        }
-    }
-}
+mod initialization;
+pub use initialization::try_init_public_keys;
 
 pub fn with<R>(f: impl FnOnce(&State) -> R) -> R {
     STATE.with_borrow(f)
@@ -571,14 +441,14 @@ impl Deposit {
     }
 }
 
-fn evm_raw_hex(meta: &TxMeta) -> Result<String, String> {
+pub(crate) fn evm_raw_hex(meta: &TxMeta) -> Result<String, String> {
     meta.raw
         .as_ref()
         .map(|raw| Bytes::copy_from_slice(raw).to_string())
         .ok_or_else(|| "no signed transaction to broadcast".to_string())
 }
 
-fn svm_raw(meta: &TxMeta) -> Result<ByteBufB64, String> {
+pub(crate) fn svm_raw(meta: &TxMeta) -> Result<ByteBufB64, String> {
     meta.raw
         .as_ref()
         .map(|raw| ByteBufB64::from(raw.to_vec()))
@@ -758,13 +628,7 @@ async fn resume_deposit_entry_inner(entry: journal::Entry) -> Result<BridgeTx, S
                         Funding::Deposit(entry.id),
                     )
                     .await?;
-                    let tx = BridgeTx::Evm(false, <[u8; 32]>::from(*signed.hash()).into());
-                    let meta = TxMeta {
-                        deadline: TxDeadline::Nonce(signed.tx().nonce),
-                        raw: Some(signed.encoded_2718().into()),
-                        svm_validity: None,
-                    };
-                    (tx, meta)
+                    (signed.tx, signed.meta)
                 };
                 Deposit::Evm { tx, meta, client }
             }
@@ -774,24 +638,14 @@ async fn resume_deposit_entry_inner(entry: journal::Entry) -> Result<BridgeTx, S
                     signed
                 } else {
                     let bridge = STATE.with_borrow(|s| s.svm_address);
-                    let (_, signed, validity) = build_spl_transfer_tx(
+                    let (_, signed) = build_spl_transfer_tx(
                         &plan.user,
                         &bridge,
                         plan.amount,
                         Funding::Deposit(entry.id),
                     )
                     .await?;
-                    let tx = BridgeTx::Sol(false, <[u8; 64]>::from(signed.signatures[0]).into());
-                    let meta = TxMeta {
-                        deadline: TxDeadline::BlockHeight(validity.last_valid_block_height),
-                        raw: Some(
-                            bincode::serialize(&signed)
-                                .map_err(|e| e.to_string())?
-                                .into(),
-                        ),
-                        svm_validity: Some(validity),
-                    };
-                    (tx, meta)
+                    (signed.tx, signed.meta)
                 };
                 Deposit::Sol { tx, meta, client }
             }
@@ -828,7 +682,6 @@ async fn resume_deposit_entry_inner(entry: journal::Entry) -> Result<BridgeTx, S
         });
     }
     journal::handled(entry.id);
-    STATE.with_borrow_mut(|s| s.idle_rounds = 0);
     schedule_finalize(Duration::from_secs(
         if matches!(deposit, Deposit::Settled(_)) {
             0
@@ -928,7 +781,6 @@ fn archive_bridge_log(log: &BridgeLog) -> Result<u64, String> {
 pub fn restart_finalize_bridging() -> u64 {
     let round = STATE.with_borrow_mut(|s| {
         s.error_rounds = 0;
-        s.idle_rounds = 0;
         s.finalize_bridging_round.0
     });
 
@@ -1345,7 +1197,7 @@ pub fn operations(owner: Principal, take: usize, before: Option<u64>) -> Vec<Ope
     journal::page(owner, take, before)
 }
 
-async fn ledger_fee(ledger: Principal) -> Result<u128, String> {
+pub(super) async fn ledger_fee(ledger: Principal) -> Result<u128, String> {
     let fee: Nat = crate::helper::read_call(ledger, "icrc1_fee", ()).await?;
     u128::try_from(&fee.0).map_err(|_| "ICP: ledger fee exceeds supported range".into())
 }

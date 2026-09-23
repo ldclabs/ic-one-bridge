@@ -207,9 +207,9 @@ fn sync_conflict_hold(entry: &Entry) {
     }
 }
 
-/// Backfills holds for journal rows written before the hold index existed.
-/// The upper bound is captured at upgrade; new writes update the index in put.
-pub fn migrate_conflict_holds(after: u64, through: u64, limit: usize) -> (u64, usize) {
+/// Backfills reconciliation holds and automatic recovery indexes. The upper
+/// bound is captured at upgrade; new writes update both indexes in put.
+pub fn migrate_indexes(after: u64, through: u64, limit: usize) -> (u64, usize) {
     if after >= through || limit == 0 {
         return (after, 0);
     }
@@ -225,6 +225,7 @@ pub fn migrate_conflict_holds(after: u64, through: u64, limit: usize) -> (u64, u
     });
     for entry in &entries {
         sync_conflict_hold(entry);
+        sync_open_index(entry);
     }
     let cursor = if entries.len() < limit {
         through
@@ -240,27 +241,7 @@ pub fn put(entry: &Entry) {
     ENTRIES.with_borrow_mut(|entries| {
         entries.insert(entry.id, Cbor(entry.clone()));
     });
-    OPEN.with_borrow_mut(|open| {
-        open.remove(&(0, entry.id));
-        open.remove(&(1, entry.id));
-        open.remove(&(2, entry.id));
-        if !entry.handled && !matches!(entry.phase, Phase::Rejected(_)) {
-            open.insert((0, entry.id), ());
-            if !matches!(entry.purpose, Purpose::Payout(_)) {
-                open.insert((2, entry.id), ());
-            }
-            if matches!(
-                entry.request,
-                Some(Request::TransferFrom { .. } | Request::Transfer { .. })
-            ) && matches!(
-                entry.phase,
-                Phase::Prepared | Phase::Submitted | Phase::Completed(_)
-            ) && !matches!(entry.purpose, Purpose::Payout(_))
-            {
-                open.insert((1, entry.id), ());
-            }
-        }
-    });
+    sync_open_index(&entry);
     let mut key = vec![255];
     key.extend_from_slice(&UserLogKey::new(&entry.owner, entry.id).0);
     REQUEST_IDS.with_borrow_mut(|ids| {
@@ -277,6 +258,33 @@ pub fn put(entry: &Entry) {
         }
     });
     sync_conflict_hold(&entry);
+}
+
+fn sync_open_index(entry: &Entry) {
+    OPEN.with_borrow_mut(|open| {
+        open.remove(&(0, entry.id));
+        open.remove(&(1, entry.id));
+        open.remove(&(2, entry.id));
+        if !entry.handled && !matches!(entry.phase, Phase::Rejected(_)) {
+            open.insert((0, entry.id), ());
+            if !matches!(entry.purpose, Purpose::Payout(_)) {
+                open.insert((2, entry.id), ());
+            }
+            let ledger_request = matches!(
+                entry.request,
+                Some(Request::TransferFrom { .. } | Request::Transfer { .. })
+            ) && matches!(
+                entry.phase,
+                Phase::Prepared | Phase::Submitted | Phase::Completed(_)
+            );
+            let completed_deposit = matches!(entry.purpose, Purpose::Deposit(_))
+                && matches!(entry.phase, Phase::Completed(_));
+            if !matches!(entry.purpose, Purpose::Payout(_)) && (ledger_request || completed_deposit)
+            {
+                open.insert((1, entry.id), ());
+            }
+        }
+    });
 }
 pub fn unresolved() -> bool {
     OPEN.with_borrow(|open| !open.is_empty())
@@ -1130,5 +1138,159 @@ mod tests {
             find_request(owner, b"adopted-request").unwrap().unwrap().id,
             original.id
         );
+    }
+
+    #[test]
+    fn reconciled_external_deposits_are_recoverable_and_old_indexes_are_backfilled() {
+        for (from, scheme, tx) in [
+            (
+                BridgeTarget::Evm("ETH".into()),
+                "ecdsa",
+                BridgeTx::Evm(true, [73; 32].into()),
+            ),
+            (
+                BridgeTarget::Sol,
+                "ed25519",
+                BridgeTx::Sol(true, [74; 64].into()),
+            ),
+        ] {
+            let owner = Principal::from_slice(&[75]);
+            let entry = create(
+                owner,
+                Purpose::Deposit(DepositPlan {
+                    user: owner,
+                    from,
+                    to: BridgeTarget::Icp,
+                    to_addr: None,
+                    ledger: Principal::from_slice(&[76]),
+                    amount: 100,
+                    fee: 1,
+                }),
+                now_ms(),
+            );
+            prepare(
+                entry.id,
+                Request::Signature {
+                    scheme: scheme.into(),
+                    key_name: "test".into(),
+                    sender: owner,
+                    message: vec![0; 32].into(),
+                    deadline: TxDeadline::Nonce(0),
+                    validity: None,
+                },
+            )
+            .unwrap();
+            start_signature(entry.id).unwrap();
+            resolve(
+                entry.id,
+                get(entry.id).unwrap().revision,
+                Resolution::Completed(tx),
+                "operator verified the finalized external deposit".into(),
+                owner,
+            )
+            .unwrap();
+            assert!(open_ids(100).contains(&entry.id));
+            // Simulate the index written before Completed Signature deposits
+            // were included, then rebuild without changing the operation.
+            OPEN.with_borrow_mut(|open| open.remove(&(1, entry.id)));
+            let revision = get(entry.id).unwrap().revision;
+            migrate_indexes(entry.id - 1, entry.id, 1);
+            assert!(open_ids(100).contains(&entry.id));
+            assert_eq!(get(entry.id).unwrap().revision, revision);
+            handled(entry.id);
+            assert!(!open_ids(100).contains(&entry.id));
+        }
+    }
+
+    struct RejectingLedger(u8);
+    impl LedgerTransport for RejectingLedger {
+        async fn transfer(
+            &self,
+            _: Principal,
+            _: TransferArg,
+        ) -> Result<Result<Nat, TransferError>, CallFailure> {
+            Ok(Err(match self.0 {
+                0 => TransferError::BadFee {
+                    expected_fee: 20u64.into(),
+                },
+                1 => TransferError::InsufficientFunds {
+                    balance: 0u64.into(),
+                },
+                2 => TransferError::TemporarilyUnavailable,
+                _ => TransferError::TooOld,
+            }))
+        }
+        async fn transfer_from(
+            &self,
+            _: Principal,
+            _: TransferFromArgs,
+        ) -> Result<Result<Nat, TransferFromError>, CallFailure> {
+            Ok(Err(match self.0 {
+                0 => TransferFromError::BadFee {
+                    expected_fee: 20u64.into(),
+                },
+                1 => TransferFromError::InsufficientFunds {
+                    balance: 0u64.into(),
+                },
+                2 => TransferFromError::TemporarilyUnavailable,
+                _ => TransferFromError::TooOld,
+            }))
+        }
+    }
+
+    #[test]
+    fn ledger_errors_distinguish_rejection_retry_and_unknown_execution() {
+        STATE.with_borrow_mut(|s| {
+            s.icp_collected_fees_migrated = true;
+            s.icp_collected_fees = 100_000;
+        });
+        for mode in 0..4 {
+            for uncertain in [false, true] {
+                let entry = withdrawal(Principal::from_slice(&[mode, u8::from(uncertain)]), 50);
+                prepare(entry.id, transfer_request(&entry, 50)).unwrap();
+                if uncertain {
+                    assert!(
+                        futures::executor::block_on(execute_with(entry.id, &LostReply::new()))
+                            .is_err()
+                    );
+                }
+                let before = cbor_into_vec(&get(entry.id).unwrap().request).unwrap();
+                assert!(
+                    futures::executor::block_on(execute_with(entry.id, &RejectingLedger(mode)))
+                        .is_err()
+                );
+                let after = get(entry.id).unwrap();
+                assert_eq!(cbor_into_vec(&after.request).unwrap(), before);
+                match (mode, uncertain) {
+                    (0 | 1, false) => {
+                        assert!(matches!(after.phase, Phase::Rejected(_)));
+                        assert!(!after.withdrawal_counted);
+                        assert!(safe_to_reset(entry.id));
+                    }
+                    (2, false) => assert!(matches!(after.phase, Phase::Prepared)),
+                    (2, true) => assert!(matches!(after.phase, Phase::Submitted)),
+                    _ => assert!(matches!(after.phase, Phase::NeedsReview(_))),
+                }
+                if uncertain || mode >= 2 {
+                    assert!(after.withdrawal_counted);
+                }
+
+                let deposit = deposit();
+                if uncertain {
+                    assert!(
+                        futures::executor::block_on(execute_with(deposit.id, &LostReply::new()))
+                            .is_err()
+                    );
+                }
+                assert!(
+                    futures::executor::block_on(execute_with(deposit.id, &RejectingLedger(mode)))
+                        .is_err()
+                );
+                assert_eq!(
+                    std::mem::discriminant(&get(deposit.id).unwrap().phase),
+                    std::mem::discriminant(&after.phase)
+                );
+            }
+        }
     }
 }

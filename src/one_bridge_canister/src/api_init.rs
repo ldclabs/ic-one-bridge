@@ -76,7 +76,7 @@ fn init(args: Option<CanisterArgs>) {
     store::state::with(|s| validate_config(s).unwrap_or_else(|e| ic_cdk::trap(e)));
     store::state::start_migrations();
     store::state::init_http_certified_data();
-    ic_cdk_timers::set_timer(Duration::from_secs(0), store::state::init_public_keys());
+    ic_cdk_timers::set_timer(Duration::from_secs(0), store::state::try_init_public_keys());
 }
 
 #[ic_cdk::pre_upgrade]

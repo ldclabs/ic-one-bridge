@@ -54,9 +54,6 @@ pub struct State {
     // when the running round took the lock, in ms; 0 when no round is running
     #[serde(default)]
     pub finalize_bridging_started_at: u64,
-    // consecutive finalization rounds in which no pending task advanced
-    #[serde(default)]
-    pub idle_rounds: u64,
     #[serde(default)]
     pub total_bridged_tokens: u128,
     #[serde(default)]
@@ -265,7 +262,6 @@ impl State {
             legacy_pending: VecDeque::new(),
             finalize_bridging_round: (0, false),
             finalize_bridging_started_at: 0,
-            idle_rounds: 0,
             total_bridged_tokens: 0,
             total_collected_fees: 0,
             icp_collected_fees: 0,

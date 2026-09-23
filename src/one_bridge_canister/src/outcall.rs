@@ -4,12 +4,13 @@ use ic_cdk_management_canister::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use crate::{
-    helper::APP_AGENT,
-    types::{RPCRequest, RPCResponse},
+    helper::{APP_AGENT, now_ms},
+    types::{RPCRequest, RPCResponse, RpcField},
 };
 
 /// Response budget for a JSON-RPC call that returns a scalar or a small object.
@@ -44,6 +45,37 @@ pub const BLOCK_RESPONSE: u64 = 2_000_000;
 /// [`LARGE_RESPONSE`] long and the message ends up in the pending queue, the
 /// archive and users' error strings.
 const ERROR_BODY_EXCERPT: usize = 200;
+
+const METHOD_CACHE_TTL_MS: u64 = 60 * 60 * 1000;
+const METHOD_CACHE_LIMIT: usize = 512;
+thread_local! {
+    static UNSUPPORTED_METHODS: RefCell<BTreeMap<(String, String), u64>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+pub fn clear_method_cache() {
+    UNSUPPORTED_METHODS.with_borrow_mut(BTreeMap::clear);
+}
+
+fn method_unsupported(url: &str, method: &str, now: u64) -> bool {
+    UNSUPPORTED_METHODS.with_borrow(|cache| {
+        cache
+            .get(&(url.into(), method.into()))
+            .is_some_and(|expires| *expires > now)
+    })
+}
+
+fn remember_unsupported(url: &str, method: &str, now: u64) {
+    UNSUPPORTED_METHODS.with_borrow_mut(|cache| {
+        cache.retain(|_, expires| *expires > now);
+        if cache.len() >= METHOD_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(
+            (url.into(), method.into()),
+            now.saturating_add(METHOD_CACHE_TTL_MS),
+        );
+    });
+}
 
 /// # Trust model
 ///
@@ -226,9 +258,17 @@ pub async fn json_rpc_call_with_fallback<H: HttpOutcall, R: DeserializeOwned, T>
                 let interpret = &interpret;
                 let fallback_args = fallback_args.as_ref();
                 async move {
+                    if let Some(fallback) = fallback_args
+                        && method_unsupported(url, call.method, now_ms())
+                    {
+                        let mut fallback = fallback.clone();
+                        fallback.url = url.clone();
+                        return provider_reply(outcall, fallback, interpret).await;
+                    }
                     match provider_reply(outcall, args, interpret).await {
                         Err(error) if error.method_unsupported => {
                             if let Some(fallback) = fallback_args {
+                                remember_unsupported(url, call.method, now_ms());
                                 let mut fallback = fallback.clone();
                                 fallback.url = url.clone();
                                 provider_reply(outcall, fallback, interpret).await
@@ -335,33 +375,44 @@ async fn provider_reply<H: HttpOutcall, R: DeserializeOwned, T>(
             method_unsupported: false,
         });
     }
+    // Serde structs can also deserialize from positional arrays. A single
+    // JSON-RPC reply must be an object, not a batch or a struct-shaped array.
+    if response
+        .body
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(&b'{')
+    {
+        return Err(ProviderError {
+            message: format!("provider {host} did not return a JSON-RPC response object"),
+            rpc: false,
+            method_unsupported: false,
+        });
+    }
     let answer = match serde_json::from_slice::<RPCResponse<R>>(&response.body) {
+        Ok(answer) if answer.jsonrpc != "2.0" || answer.id != 1 => {
+            Err("invalid JSON-RPC version or response ID".to_string())
+        }
         Ok(RPCResponse {
-            error: Some(error), ..
+            result: RpcField::Missing,
+            error: RpcField::Present(error),
+            ..
         }) => {
             return Err(ProviderError {
                 message: format!(
                     "provider {host}: JSON-RPC {}: {}",
-                    error.get("code").and_then(Value::as_i64).unwrap_or(0),
-                    error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("invalid error response")
+                    error.code, error.message
                 ),
                 rpc: true,
-                method_unsupported: matches!(
-                    error.get("code").and_then(Value::as_i64),
-                    Some(-32601 | -32004)
-                ),
+                method_unsupported: matches!(error.code, -32601 | -32004),
             });
         }
         Ok(RPCResponse {
-            result: Some(result),
+            result: RpcField::Present(result),
+            error: RpcField::Missing,
             ..
         }) => interpret(result),
-        Ok(RPCResponse { result: None, .. }) => serde_json::from_value::<R>(Value::Null)
-            .map_err(|_| "neither a result nor an error".to_string())
-            .and_then(interpret),
+        Ok(_) => Err("JSON-RPC response must contain exactly one of result or error".into()),
         Err(error) => Err(format!(
             "undecodable body: {error}, body: {}",
             excerpt(&response.body)
@@ -674,6 +725,88 @@ pub mod tests {
 
         assert_eq!(value, None);
         assert_eq!(mock.urls().len(), 1);
+    }
+
+    #[test]
+    fn malformed_envelopes_fail_over_instead_of_becoming_absence_votes() {
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!(["2.0", 1, null]),
+            serde_json::json!({"jsonrpc":"2.0","id":1}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"result":null}),
+            serde_json::json!({"jsonrpc":"1.0","id":1,"result":null}),
+            serde_json::json!({"id":1,"result":null}),
+            serde_json::json!({"jsonrpc":"2.0","result":null}),
+            serde_json::json!({"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-1,"message":"bad"}}),
+            serde_json::json!({"jsonrpc":"2.0","id":1,"error":null}),
+            serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"message":"missing code"}}),
+        ] {
+            let mock =
+                MockHttpOutcall::new(vec![success_response(invalid), result("receipt".into())]);
+            assert_eq!(
+                call::<Option<String>>(&mock, &providers(2), Agreement::First).unwrap(),
+                Some("receipt".into())
+            );
+            assert_eq!(mock.urls().len(), 2);
+        }
+    }
+
+    #[test]
+    fn unsupported_method_cache_expires_and_never_replaces_a_provider_vote() {
+        clear_method_cache();
+        let urls = providers(2);
+        let unsupported = || {
+            success_response(
+                serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"unsupported"}}),
+            )
+        };
+        let mock = MockHttpOutcall::new(vec![
+            unsupported(),
+            result(7.into()),
+            unsupported(),
+            result(7.into()),
+            result(8.into()),
+            result(8.into()),
+            result(9.into()),
+            result(9.into()),
+        ]);
+        let read = || {
+            futures::executor::block_on(json_rpc_call_with_fallback(
+                &mock,
+                &urls,
+                RpcCall {
+                    method: "header",
+                    params: &[],
+                    max_response_bytes: SMALL_RESPONSE,
+                },
+                Some(RpcCall {
+                    method: "block",
+                    params: &[],
+                    max_response_bytes: BLOCK_RESPONSE,
+                }),
+                as_is::<u64>,
+                Agreement::Two(same),
+            ))
+        };
+        assert_eq!(read(), Ok(7));
+        assert_eq!(read(), Ok(8));
+        assert_eq!(
+            mock.methods(),
+            ["header", "block", "header", "block", "block", "block"]
+        );
+        assert!(method_unsupported(
+            &urls[0],
+            "header",
+            now_ms() + METHOD_CACHE_TTL_MS - 1
+        ));
+        assert!(!method_unsupported(
+            &urls[0],
+            "header",
+            now_ms() + METHOD_CACHE_TTL_MS
+        ));
+        clear_method_cache();
+        assert_eq!(read(), Ok(9));
+        assert_eq!(&mock.methods()[6..], &["header", "header"]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use alloy_consensus::{SignableTransaction, Signed, TxEip1559};
+use alloy_consensus::{SignableTransaction, TxEip1559};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, Signature, TxHash, U256, hex};
 use candid::{CandidType, Nat, Principal};
@@ -465,6 +465,12 @@ impl TaskOutcome {
 /// A payout as a round records it on its task before broadcasting it.
 type Payout = (BridgeTx, TxMeta);
 
+/// One encoding shared by the durable intent, pending task and broadcaster.
+pub struct SignedTransfer {
+    pub tx: BridgeTx,
+    pub meta: TxMeta,
+}
+
 /// The payout a task carries: the metadata is missing on tasks recorded by a
 /// version that did not keep it.
 type PayoutRecord = (BridgeTx, Option<TxMeta>);
@@ -531,17 +537,33 @@ enum BlockTag {
 /// failed, the tasks parked behind it inherit that failure instead of each
 /// serially repeating the same sweep — which could otherwise stretch a round
 /// toward the stale-lock takeover.
-type BlockSlot = Rc<futures::lock::Mutex<Option<Result<u64, String>>>>;
-type BlockCache = Rc<RefCell<HashMap<(String, BlockTag), BlockSlot>>>;
+type ReadSlot<T> = Rc<futures::lock::Mutex<Option<Result<T, String>>>>;
+type BlockCache = Rc<RefCell<HashMap<(String, BlockTag), ReadSlot<u64>>>>;
+type LedgerFeeCache = Rc<RefCell<HashMap<Principal, ReadSlot<u128>>>>;
+
+async fn read_once<T: Clone>(
+    slot: &ReadSlot<T>,
+    read: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let mut cached = slot.lock().await;
+    if let Some(result) = &*cached {
+        return result.clone();
+    }
+    let result = read.await;
+    *cached = Some(result.clone());
+    result
+}
 
 #[derive(Clone, Default)]
 struct FinalizeContext {
     evm_blocks: BlockCache,
-    sol_statuses: Rc<RefCell<HashMap<String, Result<SolTxStatus, String>>>>,
+    sol_signatures: Vec<String>,
+    sol_statuses: ReadSlot<Vec<SolTxStatus>>,
+    ledger_fees: LedgerFeeCache,
 }
 
 impl FinalizeContext {
-    async fn prepare_solana(&self, tasks: &[BridgeLog]) {
+    fn new(tasks: &[BridgeLog]) -> Self {
         let mut signatures = Vec::new();
         for task in tasks {
             for tx in [Some(&task.from_tx), task.to_tx.as_ref()]
@@ -555,19 +577,53 @@ impl FinalizeContext {
         }
         signatures.sort();
         signatures.dedup();
-        if signatures.is_empty() {
-            return;
+        Self {
+            sol_signatures: signatures,
+            ..Default::default()
         }
-        let results = state::svm_client()
-            .get_signature_statuses(&signatures)
-            .await;
-        let values = match results {
-            Ok(values) => values.into_iter().map(Ok).collect(),
-            Err(error) => vec![Err(error); signatures.len()],
+    }
+
+    async fn sol_status<H: HttpOutcall>(
+        &self,
+        signature: &str,
+        client: &SvmClient<H>,
+    ) -> Result<SolTxStatus, String> {
+        let Ok(index) = self
+            .sol_signatures
+            .binary_search_by(|value| value.as_str().cmp(signature))
+        else {
+            return client.get_signature_status(signature).await;
         };
-        self.sol_statuses
+        // Only Solana tasks wait for this batch. Other chains can settle while
+        // its providers are slow, and concurrent Solana tasks reuse the result.
+        let statuses = read_once(
+            &self.sol_statuses,
+            client.get_signature_statuses(&self.sol_signatures),
+        )
+        .await?;
+        statuses
+            .get(index)
+            .cloned()
+            .ok_or_else(|| "missing signature status".into())
+    }
+
+    async fn ledger_fee(&self, ledger: Principal) -> Result<u128, String> {
+        self.ledger_fee_with(ledger, state::ledger_fee(ledger))
+            .await
+    }
+
+    async fn ledger_fee_with(
+        &self,
+        ledger: Principal,
+        read: impl Future<Output = Result<u128, String>>,
+    ) -> Result<u128, String> {
+        let slot = self
+            .ledger_fees
             .borrow_mut()
-            .extend(signatures.into_iter().zip(values));
+            .entry(ledger)
+            .or_default()
+            .clone();
+        read_once(&slot, read).await
     }
     async fn evm_block_number<H: HttpOutcall>(
         &self,
@@ -581,17 +637,13 @@ impl FinalizeContext {
             .entry((chain.to_string(), tag))
             .or_insert_with(|| Rc::new(futures::lock::Mutex::new(None)))
             .clone();
-        let mut cached = slot.lock().await;
-        if let Some(result) = cached.clone() {
-            return result;
-        }
-
-        let result = match tag {
-            BlockTag::Latest => client.block_number().await,
-            BlockTag::Finalized => client.finalized_block_number().await,
-        };
-        *cached = Some(result.clone());
-        result
+        read_once(&slot, async {
+            match tag {
+                BlockTag::Latest => client.block_number().await,
+                BlockTag::Finalized => client.finalized_block_number().await,
+            }
+        })
+        .await
     }
 }
 

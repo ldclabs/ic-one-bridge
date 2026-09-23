@@ -63,7 +63,7 @@ async fn sign_evm_tx(
     plan: EvmTxPlan,
     now_ms: u64,
     funding: Funding,
-) -> Result<(EvmClient<DefaultHttpOutcall>, Signed<TxEip1559>), String> {
+) -> Result<(EvmClient<DefaultHttpOutcall>, SignedTransfer), String> {
     let operation = signing_operation(funding)?;
     let EvmTxPlan {
         to,
@@ -179,6 +179,8 @@ async fn sign_evm_tx(
         }
         e.message
     })?;
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::after_signature_reply();
     if sig.len() != 64 {
         return Err(format!("invalid ECDSA signature length: {}", sig.len()));
     }
@@ -189,19 +191,22 @@ async fn sign_evm_tx(
     );
 
     let signed = tx.into_signed(signature);
+    let raw = signed.encoded_2718();
+    let transfer = SignedTransfer {
+        tx: BridgeTx::Evm(
+            false,
+            <[u8; 32]>::from(alloy_primitives::keccak256(&raw)).into(),
+        ),
+        meta: TxMeta {
+            deadline: TxDeadline::Nonce(signed.tx().nonce),
+            raw: Some(raw.into()),
+            svm_validity: None,
+        },
+    };
     if let Some(id) = operation {
-        journal::record_signed(
-            id,
-            BridgeTx::Evm(false, <[u8; 32]>::from(*signed.hash()).into()),
-            TxMeta {
-                deadline: TxDeadline::Nonce(signed.tx().nonce),
-                raw: Some(signed.encoded_2718().into()),
-                svm_validity: None,
-            },
-            sig,
-        )?;
+        journal::record_signed(id, transfer.tx.clone(), transfer.meta.clone(), sig)?;
     }
-    Ok((client, signed))
+    Ok((client, transfer))
 }
 
 /// Refuses to sign for an address that cannot pay for the transaction:
@@ -239,7 +244,7 @@ pub async fn build_erc20_transfer_tx(
     icp_amount: u128,
     now_ms: u64,
     funding: Funding,
-) -> Result<(EvmClient<DefaultHttpOutcall>, Signed<TxEip1559>), String> {
+) -> Result<(EvmClient<DefaultHttpOutcall>, SignedTransfer), String> {
     let plan = STATE.with_borrow(|s| {
         let (contract, decimals, _) = s
             .evm_token_contracts
@@ -273,7 +278,7 @@ pub async fn build_evm_transfer_tx(
     amount: u128,
     now_ms: u64,
     funding: Funding,
-) -> Result<(EvmClient<DefaultHttpOutcall>, Signed<TxEip1559>), String> {
+) -> Result<(EvmClient<DefaultHttpOutcall>, SignedTransfer), String> {
     if amount == 0 {
         return Err("amount must be greater than 0".to_string());
     }
@@ -290,9 +295,8 @@ pub async fn build_evm_transfer_tx(
     sign_evm_tx(chain, from, plan, now_ms, funding).await
 }
 
-/// A signed Solana transaction, its client, and the last block height its
-/// blockhash is valid at.
-type SignedSvmTx = (SvmClient<DefaultHttpOutcall>, Transaction, SolValidity);
+/// An encoded Solana transaction with its client and blockhash validity.
+type SignedSvmTx = (SvmClient<DefaultHttpOutcall>, SignedTransfer);
 
 pub async fn build_spl_transfer_tx(
     from: &Principal,
@@ -473,6 +477,8 @@ async fn sign_svm_tx(
                 }
                 e.message
             })?;
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::after_signature_reply();
     let signature: [u8; 64] = sig
         .try_into()
         .map_err(|_| "invalid signature length".to_string())?;
@@ -482,21 +488,25 @@ async fn sign_svm_tx(
     };
 
     let validity: SolValidity = blockhash.into();
+    let transfer = SignedTransfer {
+        tx: BridgeTx::Sol(false, signature.into()),
+        meta: TxMeta {
+            deadline: TxDeadline::BlockHeight(validity.last_valid_block_height),
+            raw: Some(
+                bincode::serialize(&transaction)
+                    .map_err(|e| e.to_string())?
+                    .into(),
+            ),
+            svm_validity: Some(validity),
+        },
+    };
     if let Some(id) = operation {
         journal::record_signed(
             id,
-            BridgeTx::Sol(false, signature.into()),
-            TxMeta {
-                deadline: TxDeadline::BlockHeight(validity.last_valid_block_height),
-                raw: Some(
-                    bincode::serialize(&transaction)
-                        .map_err(|e| e.to_string())?
-                        .into(),
-                ),
-                svm_validity: Some(validity.clone()),
-            },
+            transfer.tx.clone(),
+            transfer.meta.clone(),
             signature.to_vec(),
         )?;
     }
-    Ok((client, transaction, validity))
+    Ok((client, transfer))
 }

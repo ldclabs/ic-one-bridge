@@ -36,8 +36,37 @@ pub struct RPCRequest<'a> {
 
 #[derive(Debug, Deserialize)]
 pub struct RPCResponse<T> {
-    pub result: Option<T>,
-    pub error: Option<Value>,
+    pub jsonrpc: String,
+    pub id: u64,
+    #[serde(default = "RpcField::missing")]
+    pub result: RpcField<T>,
+    #[serde(default = "RpcField::missing")]
+    pub error: RpcField<RPCError>,
+}
+
+/// Unlike Option, a present JSON null remains distinct from a missing member.
+#[derive(Debug)]
+pub enum RpcField<T> {
+    Missing,
+    Present(T),
+}
+
+impl<T> RpcField<T> {
+    fn missing() -> Self {
+        Self::Missing
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for RpcField<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RPCError {
+    pub code: i64,
+    pub message: String,
 }
 
 #[cfg(test)]

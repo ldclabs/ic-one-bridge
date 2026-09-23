@@ -47,6 +47,10 @@ independent of the transaction list. A provider that explicitly reports this met
 can fall back to `eth_getBlockByNumber` with a 2,000,000-byte response budget. Use independent
 providers supporting the compact header method for chains whose full blocks can exceed that limit;
 an oversized or disagreeing response never bypasses confirmation checks.
+Unsupported compact-header methods are cached per provider for one hour (and cleared when RPC
+configuration changes), so compatibility reads do not repeatedly pay for a known unsupported call.
+JSON-RPC replies must identify the request and contain exactly one result or error; an explicit null
+receipt remains valid, while a missing result is a provider failure.
 
 **Recovering payments.** Every ledger transfer and bridge signature has a durable operation record
 before the external call. An unknown ledger result retains its original request and reservation;
@@ -55,6 +59,8 @@ across lost replies, `my_operations` to inspect the operation, and `resume_opera
 The original `bridge` API can also resume a matching unresolved deposit. Never reset a payout merely
 because an RPC cannot currently find it: ordinary retry refuses unresolved attempts, while explicit
 governance reconciliation records the evidence and exact operation revision.
+An externally confirmed deposit without a pending task is queued automatically after governance
+reconciliation, including EVM and Solana deposits. Upgrade backfills that recovery index in bounded batches.
 Legacy duplicate sources remain under a durable reconciliation hold: neither user/admin rechecks
 nor an ordinary retry can clear it. Resolve every associated legacy-conflict operation through
 governance before resuming a source not yet archived. A source already in the archive must be
@@ -77,6 +83,10 @@ Pending results are bounded; use `my_pending_logs_page(take, after_task_id)` or
 `pending_logs_page(take, after_task_id)` for later pages. New optional `runtime` fields carry task IDs,
 readiness, resource limits and fee-withdrawal availability without requiring older bridge instances to
 return those fields.
+Missing keys and metadata are initialized independently. Temporary initialization failures retry
+after 5 seconds with backoff capped at 5 minutes; explicit ledger/mint metadata mismatches require
+configuration correction. Within a finalization round, Solana status batches only delay the tasks
+that need them, and ICP payouts share a ledger-fee read.
 
 Public signing/RPC work is subsidized within configurable quotas: 12 requests per user and 120
 requests globally per IC clock hour by default, with a 2T-cycle reserve plus 100B cycles of headroom

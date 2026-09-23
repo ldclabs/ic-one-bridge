@@ -207,6 +207,7 @@ fn admin_set_evm_providers(
 ) -> Result<(), String> {
     check_evm_providers(&chain_name, max_confirmations, &providers)?;
 
+    crate::outcall::clear_method_cache();
     store::state::with_mut(|s| {
         s.evm_providers
             .insert(chain_name, (max_confirmations, providers));
@@ -244,6 +245,7 @@ fn check_evm_providers(
 fn admin_set_svm_providers(providers: Vec<String>) -> Result<(), String> {
     check_providers(&providers)?;
 
+    crate::outcall::clear_method_cache();
     store::state::with_mut(|s| {
         s.svm_providers = providers;
         Ok(())
@@ -398,8 +400,9 @@ async fn admin_init_public_keys() -> Result<(String, String), String> {
         s.ecdsa_public_key.public_key.is_empty()
             || s.ed25519_public_key.public_key.is_empty()
             || !s.ledger_verified
+            || (s.svm_token_address.0 != Pubkey::default() && !s.svm_mint_verified)
     }) {
-        return Err("public keys or ledger verification are still unavailable; check canister logs and retry".into());
+        return Err("public keys, ledger or configured SOL mint verification are still unavailable; check canister logs and retry".into());
     }
     Ok(store::state::with(|s| {
         (s.evm_address.to_string(), s.svm_address.to_string())

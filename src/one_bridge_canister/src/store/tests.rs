@@ -259,6 +259,66 @@ fn finalization_shares_failed_block_outcalls_per_chain() {
 }
 
 #[test]
+fn ledger_fee_reads_are_shared_only_within_one_round_and_ledger() {
+    let ledger = principal(&[81]);
+    for answer in [Ok(10), Err("ledger temporarily unavailable".to_string())] {
+        let context = FinalizeContext::default();
+        let calls = Cell::new(0);
+        let read = || async {
+            calls.set(calls.get() + 1);
+            answer.clone()
+        };
+        let results = futures::executor::block_on(async {
+            futures::join!(
+                context.ledger_fee_with(ledger, read()),
+                context.ledger_fee_with(ledger, read()),
+                context.ledger_fee_with(ledger, read())
+            )
+        });
+        assert_eq!(results, (answer.clone(), answer.clone(), answer.clone()));
+        assert_eq!(calls.get(), 1);
+        let other = principal(&[82]);
+        assert_eq!(
+            futures::executor::block_on(context.ledger_fee_with(other, read())),
+            answer
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            futures::executor::block_on(FinalizeContext::default().ledger_fee_with(ledger, read())),
+            answer
+        );
+        assert_eq!(calls.get(), 3);
+    }
+}
+
+#[test]
+fn solana_tasks_share_the_lazy_batch() {
+    let tasks: Vec<_> = (1..=3)
+        .map(|seed| {
+            log(
+                principal(&[seed]),
+                BridgeTarget::Sol,
+                BridgeTarget::Icp,
+                BridgeTx::Sol(false, [seed; 64].into()),
+            )
+        })
+        .collect();
+    let context = FinalizeContext::new(&tasks);
+    let reply = serde_json::json!({"context":{"slot":1},"value":[null,null,null]});
+    let mock = MockHttpOutcall::new(vec![result(reply.clone()), result(reply)]);
+    let client = SvmClient::new(vec!["https://a".into(), "https://b".into()], mock.clone());
+    assert!(mock.urls().is_empty());
+    let statuses = futures::executor::block_on(futures::future::join_all(
+        context
+            .sol_signatures
+            .iter()
+            .map(|signature| context.sol_status(signature, &client)),
+    ));
+    assert_eq!(statuses, vec![Ok(SolTxStatus::Unknown); 3]);
+    assert_eq!(mock.urls().len(), 2);
+}
+
+#[test]
 fn superseded_finalize_run_cannot_merge() {
     assert!(finalize_run_matches(2, 2, true));
     assert!(!finalize_run_matches(1, 2, true));
