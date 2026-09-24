@@ -1,4 +1,6 @@
+use candid::Principal;
 use http::Uri;
+use ic_cdk::call::Call;
 use ic_cdk_management_canister::{
     HttpHeader, HttpMethod, HttpRequest, HttpRequestArgs, HttpRequestResult,
 };
@@ -15,11 +17,13 @@ use crate::{
 
 /// Response budget for a JSON-RPC call that returns a scalar or a small object.
 ///
-/// Outcalls use pricing version 2, which bills the bytes that come back, but
-/// the cycles attached up front are sized from `max_response_bytes`, and
-/// leaving it unset reserves for the 2 MB maximum. The surplus is refunded, yet
-/// it has to be in the balance and stays held while the call runs. So every
-/// method names one.
+/// Outcalls ask for pricing version 2, which bills what a call consumes, but a
+/// subnet that has not enabled it prices them with the legacy fee on
+/// `max_response_bytes` — the bytes reserved, not the bytes that come back.
+/// Either way the cycles attached up front are sized from it, and leaving it
+/// unset reserves the 2 MB maximum. The surplus is refunded, yet it has to be
+/// in the balance and stays held while the call runs. So every method names
+/// one.
 ///
 /// The budgets are deliberately far larger than the few hundred bytes of JSON
 /// these calls answer with. A response that overruns its budget is rejected
@@ -92,11 +96,39 @@ pub struct DefaultHttpOutcall;
 
 impl HttpOutcall for DefaultHttpOutcall {
     async fn request(&self, args: &HttpRequestArgs) -> Result<HttpRequestResult, String> {
-        HttpRequest::from_args(args.clone())
-            .send()
+        // `HttpRequest::send` attaches only the version 2 estimate. A subnet
+        // without pay-as-you-go pricing downgrades the call to version 1 and
+        // rejects it when that estimate is below the legacy fee, as it is for
+        // a 2 MB response budget. Both versions refund what is not charged.
+        let request = HttpRequest::from_args(args.clone());
+        let cycles = request.get_cost().max(legacy_cost(request.args()));
+        Call::unbounded_wait(Principal::management_canister(), "http_request")
+            .with_arg(request.args())
+            .with_cycles(cycles)
             .await
-            .map_err(|err| format!("{err}"))
+            .map_err(|err| err.to_string())?
+            .candid()
+            .map_err(|err| err.to_string())
     }
+}
+
+/// The pricing version 1 fee, over the request bytes the replica counts.
+fn legacy_cost(args: &HttpRequestArgs) -> u128 {
+    let request_size = args.url.len()
+        + args
+            .headers
+            .iter()
+            .map(|header| header.name.len() + header.value.len())
+            .sum::<usize>()
+        + args.body.as_ref().map_or(0, Vec::len)
+        + args.transform.as_ref().map_or(0, |transform| {
+            transform.function.0.method.len() + transform.context.len()
+        });
+    ic_cdk::api::cost_http_request(
+        request_size as u64,
+        // An unset budget is priced as the 2 MB system maximum.
+        args.max_response_bytes.unwrap_or(2_000_000),
+    )
 }
 
 /// A JSON-RPC request and the response budget reserved for its answer.
