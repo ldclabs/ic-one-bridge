@@ -847,6 +847,8 @@ fn icp_payouts_need_no_fee_funding_before_or_after_upgrade() {
             if legacy { 100 } else { 99 }
         );
         assert_eq!(stats(&pic, ledger).last_to, Some(user));
+        // The transfer leaves its fee to the ledger instead of reading it.
+        assert_eq!(stats(&pic, ledger).fee_calls, 0);
         assert_eq!(info(&pic, bridge).icp_collected_fees, 0);
         assert_eq!(info(&pic, bridge).pending_count, 0);
         pic.upgrade_canister(

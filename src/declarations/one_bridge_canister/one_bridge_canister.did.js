@@ -73,6 +73,7 @@ export const idlFactory = ({ IDL }) => {
     'payout_attempt' : IDL.Opt(IDL.Nat64),
     'payout_resolution' : IDL.Opt(PayoutResolution),
     'ledger' : IDL.Opt(IDL.Principal),
+    'payout_mined' : IDL.Bool,
     'error_chain' : IDL.Opt(BridgeTarget),
   });
   const BridgeLog = IDL.Record({

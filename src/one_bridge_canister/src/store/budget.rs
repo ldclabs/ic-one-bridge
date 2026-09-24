@@ -106,7 +106,26 @@ struct Usage {
     gas: HashMap<String, (u64, u128)>,
 }
 thread_local! {
-    static USAGE: RefCell<StableCell<Cbor<Usage>, Memory>> = RefCell::new(StableCell::init(memory(10), Cbor(Usage::default())));
+    static USAGE_STORE: RefCell<StableCell<Cbor<Usage>, Memory>> = RefCell::new(StableCell::init(memory(mem::USAGE), Cbor(Usage::default())));
+    /// The working copy, loaded on first use and written back by `save`
+    /// before an upgrade, so a request does not re-encode every caller's
+    /// count. A trap rolls it back like any other state.
+    static USAGE: RefCell<Option<Usage>> = const { RefCell::new(None) };
+}
+
+fn with_usage<R>(f: impl FnOnce(&mut Usage) -> R) -> R {
+    USAGE.with_borrow_mut(|usage| {
+        f(usage.get_or_insert_with(|| USAGE_STORE.with_borrow(|cell| cell.get().0.clone())))
+    })
+}
+
+/// Persists the budgets so that an upgrade does not reset them.
+pub fn save() {
+    if let Some(usage) = USAGE.with_borrow(Clone::clone) {
+        USAGE_STORE.with_borrow_mut(|cell| {
+            cell.set(Cbor(usage));
+        });
+    }
 }
 
 fn charge(
@@ -148,24 +167,12 @@ fn charge(
 pub fn admit(user: Principal) -> Result<(), String> {
     let limits = STATE.with_borrow(|s| s.resource_limits.clone());
     let active = ACTIVE_BRIDGE_USERS.with_borrow(BTreeSet::len);
-    USAGE.with_borrow_mut(|cell| {
-        let mut usage = cell.get().0.clone();
-        charge(
-            &mut usage,
-            &limits,
-            user,
-            now_ms(),
-            ic_cdk::api::canister_cycle_balance(),
-            active,
-        )?;
-        cell.set(Cbor(usage));
-        Ok(())
-    })
+    let cycles = ic_cdk::api::canister_cycle_balance();
+    with_usage(|usage| charge(usage, &limits, user, now_ms(), cycles, active))
 }
 
 pub fn reserve_gas(chain: &str, cost: u128, now: u64, limit: u128) -> Result<(), String> {
-    USAGE.with_borrow_mut(|cell| {
-        let mut usage = cell.get().0.clone();
+    with_usage(|usage| {
         let bucket = usage.gas.entry(chain.into()).or_insert((now / HOUR_MS, 0));
         if bucket.0 != now / HOUR_MS {
             *bucket = (now / HOUR_MS, 0);
@@ -178,7 +185,6 @@ pub fn reserve_gas(chain: &str, cost: u128, now: u64, limit: u128) -> Result<(),
             return Err("hourly bridge gas budget exhausted".into());
         }
         bucket.1 = total;
-        cell.set(Cbor(usage));
         Ok(())
     })
 }

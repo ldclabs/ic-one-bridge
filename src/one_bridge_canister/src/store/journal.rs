@@ -182,11 +182,37 @@ pub fn info(entry: Entry) -> OperationInfo {
 }
 
 thread_local! {
-    static ENTRIES: RefCell<StableBTreeMap<u64, Cbor<Entry>, Memory>> = RefCell::new(StableBTreeMap::init(memory(8)));
-    static USERS: RefCell<StableBTreeMap<UserLogKey, (), Memory>> = RefCell::new(StableBTreeMap::init(memory(11)));
+    static ENTRIES: RefCell<StableBTreeMap<u64, Cbor<Entry>, Memory>> = RefCell::new(StableBTreeMap::init(memory(mem::JOURNAL_ENTRIES)));
+    static USERS: RefCell<StableBTreeMap<UserLogKey, (), Memory>> = RefCell::new(StableBTreeMap::init(memory(mem::JOURNAL_USERS)));
     // The key is owner || caller request ID. It outlives completion and upgrades.
-    static REQUEST_IDS: RefCell<StableBTreeMap<Vec<u8>, u64, Memory>> = RefCell::new(StableBTreeMap::init(memory(12)));
-    static OPEN: RefCell<StableBTreeMap<(u8, u64), (), Memory>> = RefCell::new(StableBTreeMap::init(memory(13)));
+    static REQUEST_IDS: RefCell<StableBTreeMap<Vec<u8>, u64, Memory>> = RefCell::new(StableBTreeMap::init(memory(mem::REQUEST_IDS)));
+    static OPEN: RefCell<StableBTreeMap<(u8, u64), (), Memory>> = RefCell::new(StableBTreeMap::init(memory(mem::OPEN_OPERATIONS)));
+}
+
+/// Makes `key` map to `value`, or be absent, writing only when that changes.
+fn set_key<K, V>(map: &mut StableBTreeMap<K, V, Memory>, key: K, value: Option<V>)
+where
+    K: Storable + Ord + Clone,
+    V: Storable + PartialEq,
+{
+    match value {
+        Some(value) => {
+            if map.get(&key).as_ref() != Some(&value) {
+                map.insert(key, value);
+            }
+        }
+        None => {
+            map.remove(&key);
+        }
+    }
+}
+
+/// The key under which an unresolved deposit or withdrawal of `owner` is
+/// found without a caller request ID.
+fn open_request_key(owner: &Principal, id: u64) -> Vec<u8> {
+    let mut key = vec![255];
+    key.extend_from_slice(&UserLogKey::new(owner, id).0);
+    key
 }
 
 pub fn get(id: u64) -> Option<Entry> {
@@ -199,11 +225,7 @@ pub fn last_id() -> u64 {
 
 fn sync_conflict_hold(entry: &Entry) {
     if let Purpose::LegacyConflict { existing_task, .. } = &entry.purpose {
-        pending::set_conflict_hold(
-            *existing_task,
-            entry.id,
-            !entry.handled && !matches!(entry.phase, Phase::Rejected(_)),
-        );
+        pending::set_conflict_hold(*existing_task, entry.id, is_open(entry));
     }
 }
 
@@ -235,55 +257,50 @@ pub fn migrate_indexes(after: u64, through: u64, limit: usize) -> (u64, usize) {
     (cursor, entries.len())
 }
 
-pub fn put(entry: &Entry) {
-    let mut entry = entry.clone();
-    entry.revision = get(entry.id).map_or(1, |old| old.revision.saturating_add(1));
+/// Stores `entry` as its next revision. Callers write back the entry they
+/// read in the same message, so its revision is the stored one.
+pub fn put(entry: &mut Entry) {
+    entry.revision = entry.revision.saturating_add(1);
     ENTRIES.with_borrow_mut(|entries| {
         entries.insert(entry.id, Cbor(entry.clone()));
     });
-    sync_open_index(&entry);
-    let mut key = vec![255];
-    key.extend_from_slice(&UserLogKey::new(&entry.owner, entry.id).0);
+    sync_open_index(entry);
+    let open_request = is_open(entry)
+        && matches!(
+            entry.purpose,
+            Purpose::Deposit(_) | Purpose::Withdrawal { .. }
+        );
     REQUEST_IDS.with_borrow_mut(|ids| {
-        if !entry.handled
-            && !matches!(entry.phase, Phase::Rejected(_))
-            && matches!(
-                entry.purpose,
-                Purpose::Deposit(_) | Purpose::Withdrawal { .. }
-            )
-        {
-            ids.insert(key, entry.id);
-        } else {
-            ids.remove(&key);
-        }
+        set_key(
+            ids,
+            open_request_key(&entry.owner, entry.id),
+            open_request.then_some(entry.id),
+        );
     });
-    sync_conflict_hold(&entry);
+    sync_conflict_hold(entry);
+}
+
+fn is_open(entry: &Entry) -> bool {
+    !entry.handled && !matches!(entry.phase, Phase::Rejected(_))
 }
 
 fn sync_open_index(entry: &Entry) {
-    OPEN.with_borrow_mut(|open| {
-        open.remove(&(0, entry.id));
-        open.remove(&(1, entry.id));
-        open.remove(&(2, entry.id));
-        if !entry.handled && !matches!(entry.phase, Phase::Rejected(_)) {
-            open.insert((0, entry.id), ());
-            if !matches!(entry.purpose, Purpose::Payout(_)) {
-                open.insert((2, entry.id), ());
-            }
-            let ledger_request = matches!(
-                entry.request,
-                Some(Request::TransferFrom { .. } | Request::Transfer { .. })
-            ) && matches!(
-                entry.phase,
-                Phase::Prepared | Phase::Submitted | Phase::Completed(_)
-            );
-            let completed_deposit = matches!(entry.purpose, Purpose::Deposit(_))
-                && matches!(entry.phase, Phase::Completed(_));
-            if !matches!(entry.purpose, Purpose::Payout(_)) && (ledger_request || completed_deposit)
-            {
-                open.insert((1, entry.id), ());
-            }
-        }
+    let open = is_open(entry);
+    let payout = matches!(entry.purpose, Purpose::Payout(_));
+    let ledger_request = matches!(
+        entry.request,
+        Some(Request::TransferFrom { .. } | Request::Transfer { .. })
+    ) && matches!(
+        entry.phase,
+        Phase::Prepared | Phase::Submitted | Phase::Completed(_)
+    );
+    let completed_deposit =
+        matches!(entry.purpose, Purpose::Deposit(_)) && matches!(entry.phase, Phase::Completed(_));
+    let recoverable = open && !payout && (ledger_request || completed_deposit);
+    OPEN.with_borrow_mut(|index| {
+        set_key(index, (0, entry.id), open.then_some(()));
+        set_key(index, (1, entry.id), recoverable.then_some(()));
+        set_key(index, (2, entry.id), (open && !payout).then_some(()));
     });
 }
 pub fn unresolved() -> bool {
@@ -301,28 +318,24 @@ pub fn open_count() -> u64 {
     OPEN.with_borrow(|open| open.range((2, 0)..(3, 0)).count() as u64)
 }
 
-pub fn open_deposit(owner: Principal) -> Option<Entry> {
-    let mut start = vec![255];
-    start.extend_from_slice(&UserLogKey::new(&owner, 0).0);
-    let mut end = vec![255];
-    end.extend_from_slice(&UserLogKey::new(&owner, u64::MAX).0);
+/// The owner's unresolved deposit or withdrawal that `wanted` picks.
+fn open_entry(owner: Principal, wanted: impl Fn(&Purpose) -> bool) -> Option<Entry> {
+    let range = open_request_key(&owner, 0)..open_request_key(&owner, u64::MAX);
     REQUEST_IDS
-        .with_borrow(|ids| ids.range(start..end).map(|e| e.value()).collect::<Vec<_>>())
+        .with_borrow(|ids| ids.range(range).map(|e| e.value()).collect::<Vec<_>>())
         .into_iter()
         .filter_map(get)
-        .find(|e| matches!(e.purpose, Purpose::Deposit(_)))
+        .find(|e| wanted(&e.purpose))
+}
+
+pub fn open_deposit(owner: Principal) -> Option<Entry> {
+    open_entry(owner, |purpose| matches!(purpose, Purpose::Deposit(_)))
 }
 
 pub fn open_withdrawal(owner: Principal) -> Option<Entry> {
-    let mut start = vec![255];
-    start.extend_from_slice(&UserLogKey::new(&owner, 0).0);
-    let mut end = vec![255];
-    end.extend_from_slice(&UserLogKey::new(&owner, u64::MAX).0);
-    let ids =
-        REQUEST_IDS.with_borrow(|ids| ids.range(start..end).map(|e| e.value()).collect::<Vec<_>>());
-    ids.into_iter()
-        .filter_map(get)
-        .find(|e| matches!(e.purpose, Purpose::Withdrawal { .. }))
+    open_entry(owner, |purpose| {
+        matches!(purpose, Purpose::Withdrawal { .. })
+    })
 }
 
 fn explicit_request_key(owner: Principal, id: &[u8]) -> Result<Vec<u8>, String> {
@@ -383,13 +396,16 @@ pub fn draft(owner: Principal, purpose: Purpose, created_at: u64) -> Entry {
 pub fn create(owner: Principal, purpose: Purpose, created_at: u64) -> Entry {
     let mut entry = draft(owner, purpose, created_at);
     entry.id = pending::next_id();
-    put(&entry);
+    put(&mut entry);
     USERS.with_borrow_mut(|users| {
         users.insert(UserLogKey::new(&owner, entry.id), ());
     });
     entry
 }
 
+/// Records a new deposit intent, bound to the caller's request ID if it
+/// brought one. The caller has already resumed any intent that ID or the
+/// user's unresolved deposit points at.
 pub fn for_deposit(
     plan: DepositPlan,
     request_id: Option<&[u8]>,
@@ -398,31 +414,6 @@ pub fn for_deposit(
     let key = request_id
         .map(|id| explicit_request_key(plan.user, id))
         .transpose()?;
-    if let Some(key) = &key
-        && let Some(id) = REQUEST_IDS.with_borrow(|ids| ids.get(key))
-    {
-        let existing = get(id).ok_or_else(|| "operation index is inconsistent".to_string())?;
-        if matches!(&existing.purpose, Purpose::Deposit(old) if old == &plan) {
-            return Ok(existing);
-        }
-        return Err("request_id already belongs to different bridge arguments".into());
-    }
-    // The legacy bridge API can recover its outstanding deposit without a new
-    // ingress field. Explicit IDs are recommended for retries after completion.
-    if let Some(existing) = open_deposit(plan.user)
-        && let Purpose::Deposit(old) = &existing.purpose
-    {
-        if old == &plan {
-            if let Some(key) = &key {
-                bind_request_key(key, existing.id)?;
-            }
-            return Ok(existing);
-        }
-        return Err(format!(
-            "resume unresolved deposit operation {} first",
-            existing.id
-        ));
-    }
     let entry = create(plan.user, Purpose::Deposit(plan), now);
     if let Some(key) = key {
         bind_request_key(&key, entry.id)?;
@@ -470,7 +461,7 @@ pub fn prepare(id: u64, request: Request) -> Result<(), String> {
     }
     entry.request = Some(request);
     entry.phase = Phase::Prepared;
-    put(&entry);
+    put(&mut entry);
     Ok(())
 }
 
@@ -513,7 +504,7 @@ pub fn completed(id: u64, tx: BridgeTx) -> Result<BridgeTx, String> {
     settle_withdrawal(&mut entry, true);
     entry.phase = Phase::Completed(tx.clone());
     entry.error = None;
-    put(&entry);
+    put(&mut entry);
     Ok(tx)
 }
 
@@ -525,7 +516,7 @@ pub fn handled(id: u64) {
             entry.signed = None;
             entry.signature = None;
         }
-        put(&entry);
+        put(&mut entry);
     }
 }
 
@@ -548,7 +539,7 @@ pub fn failed(id: u64, error: String, uncertain: bool, retryable: bool) -> Strin
             settle_withdrawal(&mut entry, false);
             Phase::Rejected(error.clone())
         };
-        put(&entry);
+        put(&mut entry);
     }
     error
 }
@@ -603,7 +594,7 @@ pub async fn execute_with(id: u64, ledger: &impl LedgerTransport) -> Result<Brid
     entry.call_generation = entry.call_generation.saturating_add(1);
     let call_generation = entry.call_generation;
     entry.phase = Phase::Submitted;
-    put(&entry); // commits before the call
+    put(&mut entry); // commits before the call
     let result: Result<Nat, (String, bool, bool)> = match request {
         Request::Transfer {
             ledger: target,
@@ -699,24 +690,38 @@ pub fn start_signature(id: u64) -> Result<Request, String> {
         return Err("not a signature request".into());
     }
     entry.phase = Phase::Submitted;
-    put(&entry);
+    put(&mut entry);
     Ok(request)
 }
 
-pub fn record_signed(
-    id: u64,
-    tx: BridgeTx,
-    meta: TxMeta,
-    signature: Vec<u8>,
-) -> Result<(), String> {
+/// A signature intent the signer refused outright: nothing was signed, so a
+/// fresh intent cannot pay twice.
+pub fn signature_refused(entry: &Entry) -> bool {
+    matches!(entry.phase, Phase::Rejected(_))
+        && entry.signed.is_none()
+        && matches!(entry.request, Some(Request::Signature { .. }))
+}
+
+/// Whether the operation waits for a controller: its outcome is unknown, or
+/// it was refused in a way a retry cannot fix.
+pub fn needs_review(entry: &Entry) -> bool {
+    match entry.phase {
+        Phase::NeedsReview(_) => true,
+        Phase::Rejected(_) => !signature_refused(entry),
+        Phase::Submitted => matches!(entry.request, Some(Request::Signature { .. })),
+        _ => false,
+    }
+}
+
+pub fn record_signed(id: u64, transfer: &SignedTransfer, signature: Vec<u8>) -> Result<(), String> {
     let mut entry = get(id).ok_or_else(|| "signature intent not found".to_string())?;
     if !matches!(entry.phase, Phase::Submitted | Phase::NeedsReview(_)) {
         return Err("signature operation has already been resolved".into());
     }
     entry.phase = Phase::Signed;
-    entry.signed = Some((tx, meta));
+    entry.signed = Some((transfer.tx.clone(), transfer.meta.clone()));
     entry.signature = Some(signature.into());
-    put(&entry);
+    put(&mut entry);
     if let Purpose::Payout(task_id) = entry.purpose {
         let wake = pending::update(task_id, |task| {
             if !task.stuck {
@@ -729,12 +734,9 @@ pub fn record_signed(
             true
         })
         .unwrap_or(false);
-        #[cfg(not(test))]
         if wake {
             state::schedule_finalize(Duration::ZERO);
         }
-        #[cfg(test)]
-        let _ = wake;
     }
     Ok(())
 }
@@ -770,8 +772,8 @@ pub fn record_legacy_conflict(existing_task: u64, mut record: BridgeLog) -> Entr
     );
     entry.phase = Phase::NeedsReview(error.clone());
     entry.error = Some(error);
-    put(&entry);
-    get(entry.id).expect("legacy conflict entry")
+    put(&mut entry);
+    entry
 }
 
 pub fn check_resolution(
@@ -852,7 +854,7 @@ pub fn resolve(
         evidence: evidence.clone(),
         resolution: resolution.clone(),
     });
-    put(&entry);
+    put(&mut entry);
     match resolution {
         Resolution::Completed(tx) => {
             completed(id, tx)?;
@@ -973,7 +975,8 @@ mod tests {
         assert!(futures::executor::block_on(execute_with(entry.id, &ledger)).is_err());
         assert!(matches!(get(entry.id).unwrap().phase, Phase::Submitted));
         assert!(!safe_to_reset(entry.id));
-        let reopened: StableBTreeMap<u64, Cbor<Entry>, Memory> = StableBTreeMap::init(memory(8));
+        let reopened: StableBTreeMap<u64, Cbor<Entry>, Memory> =
+            StableBTreeMap::init(memory(mem::JOURNAL_ENTRIES));
         assert!(matches!(
             reopened.get(&entry.id).unwrap().0.phase,
             Phase::Submitted
@@ -1105,6 +1108,20 @@ mod tests {
         assert!(!safe_to_reset(entry.id));
     }
     #[test]
+    fn each_write_is_one_revision_and_the_open_indexes_follow_it() {
+        let entry = deposit();
+        // Created, then prepared.
+        assert_eq!(entry.revision, 2);
+        assert!(open_ids(10).contains(&entry.id));
+        assert_eq!(open_count(), 1);
+        assert_eq!(open_deposit(entry.owner).map(|e| e.id), Some(entry.id));
+        handled(entry.id);
+        assert_eq!(get(entry.id).unwrap().revision, 3);
+        assert!(!unresolved());
+        assert!(open_deposit(entry.owner).is_none());
+    }
+
+    #[test]
     fn idempotency_key_cannot_be_reused_for_different_arguments() {
         let entry = deposit();
         let Purpose::Deposit(plan) = entry.purpose else {
@@ -1112,27 +1129,58 @@ mod tests {
         };
         handled(entry.id);
         let first = for_deposit(plan.clone(), Some(b"request"), now_ms()).unwrap();
-        let again = for_deposit(plan.clone(), Some(b"request"), now_ms() + 10).unwrap();
+        handled(first.id);
+        let again = state::deposit_entry(
+            plan.user,
+            "ICP",
+            "ETH",
+            100,
+            None,
+            Some(b"request"),
+            now_ms() + 10,
+        )
+        .unwrap();
         assert_eq!(first.id, again.id);
-        let mut different = plan;
-        different.amount += 1;
-        assert!(for_deposit(different, Some(b"request"), now_ms()).is_err());
+        assert!(
+            state::deposit_entry(
+                plan.user,
+                "ICP",
+                "ETH",
+                101,
+                None,
+                Some(b"request"),
+                now_ms()
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn an_id_can_adopt_and_recover_a_matching_unkeyed_deposit() {
         let owner = Principal::from_slice(&[91, 92, 93]);
+        let to = "0x0000000000000000000000000000000000000001";
         let plan = DepositPlan {
             user: owner,
             from: BridgeTarget::Icp,
             to: BridgeTarget::Evm("ETH".into()),
-            to_addr: Some("0x0000000000000000000000000000000000000001".into()),
+            to_addr: Some(to.into()),
             ledger: Principal::from_slice(&[94]),
             amount: 100,
             fee: 1,
         };
-        let original = for_deposit(plan.clone(), None, now_ms()).unwrap();
-        let adopted = for_deposit(plan, Some(b"adopted-request"), now_ms()).unwrap();
+        let original = for_deposit(plan, None, now_ms()).unwrap();
+        let other = state::deposit_entry(owner, "ICP", "ETH", 99, Some(to), None, now_ms());
+        assert!(other.err().unwrap().contains("resume deposit operation"));
+        let adopted = state::deposit_entry(
+            owner,
+            "ICP",
+            "ETH",
+            100,
+            Some(to),
+            Some(b"adopted-request"),
+            now_ms(),
+        )
+        .unwrap();
         assert_eq!(adopted.id, original.id);
         assert_eq!(
             find_request(owner, b"adopted-request").unwrap().unwrap().id,

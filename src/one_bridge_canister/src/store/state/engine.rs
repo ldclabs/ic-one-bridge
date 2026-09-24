@@ -99,46 +99,7 @@ pub(super) async fn finalize_bridging() {
                 };
                 task.payout_attempt = task.payout_attempt.or(live.payout_attempt);
                 task.ledger = task.ledger.or(live.ledger);
-                if let Some(id) = task.payout_attempt {
-                    if task.payout_resolution.is_none()
-                        && journal::get(id)
-                            .is_some_and(|e| matches!(e.phase, journal::Phase::Rejected(_)))
-                    {
-                        task.payout_resolution = Some(PayoutResolution::Failed);
-                    }
-                    match task.payout_resolution {
-                        Some(PayoutResolution::Expired) => {
-                            journal::failed(
-                                id,
-                                "transaction is provably expired or replaced".into(),
-                                false,
-                                false,
-                            );
-                            journal::handled(id);
-                            task.payout_attempt = None;
-                            task.payout_started_at = 0;
-                            task.payout_resolution = None;
-                        }
-                        Some(PayoutResolution::Failed) => {
-                            journal::failed(
-                                id,
-                                task.error.clone().unwrap_or_default(),
-                                false,
-                                false,
-                            );
-                            journal::handled(id);
-                        }
-                        Some(PayoutResolution::Incomplete) => {
-                            journal::failed(
-                                id,
-                                task.error.clone().unwrap_or_default(),
-                                true,
-                                false,
-                            );
-                        }
-                        _ => {}
-                    }
-                }
+                conclude_payout_attempt(&mut task);
 
                 has_error |= task.has_transient_error();
                 let progress = baseline != task_progress(&task) || abandon || task.stuck;
@@ -179,8 +140,7 @@ pub(super) async fn finalize_bridging() {
                         );
                     }
                     journal::handled(task.task_id);
-                    archive_bridge_log(&task).expect("archive task");
-                    pending::remove(task.task_id);
+                    archive_task(&task).expect("archive task");
                 } else {
                     task.poll_attempts = if progress {
                         0
@@ -225,20 +185,55 @@ pub(super) async fn finalize_bridging() {
     }
 }
 
-async fn recover_operation(id: u64) -> Result<BridgeTx, String> {
-    let entry = journal::get(id).ok_or_else(|| "operation disappeared".to_string())?;
-    match entry.purpose {
-        journal::Purpose::Deposit(_) => resume_deposit_entry(entry).await,
-        journal::Purpose::Withdrawal { .. } => {
-            let tx = journal::execute(id).await?;
+/// Settles the journal of a payout attempt the round reached a verdict on.
+/// An attempt that can never land, or whose signature the signer refused,
+/// is closed and forgotten, and the task pays afresh.
+fn conclude_payout_attempt(task: &mut BridgeLog) {
+    let Some(id) = task.payout_attempt else {
+        return;
+    };
+    let rejected = journal::get(id).filter(|e| matches!(e.phase, journal::Phase::Rejected(_)));
+    if task.payout_resolution.is_none()
+        && let Some(entry) = rejected
+    {
+        if journal::signature_refused(&entry) {
+            // Nothing was signed, so nothing can land: close the intent,
+            // and a later round signs afresh once the task's transient
+            // error has backed off.
             journal::handled(id);
-            Ok(tx)
-        }
-        journal::Purpose::Payout(_) => Err("payout is recovered through its task".into()),
-        journal::Purpose::LegacyConflict { .. } => {
-            Err("legacy conflicts require controller reconciliation".into())
+            task.payout_attempt = None;
+            task.payout_started_at = 0;
+        } else {
+            task.payout_resolution = Some(PayoutResolution::Failed);
         }
     }
+    match task.payout_resolution {
+        Some(PayoutResolution::Expired) => {
+            journal::failed(
+                id,
+                "transaction is provably expired or replaced".into(),
+                false,
+                false,
+            );
+            journal::handled(id);
+            task.payout_attempt = None;
+            task.payout_started_at = 0;
+            task.payout_resolution = None;
+        }
+        Some(PayoutResolution::Failed) => {
+            journal::failed(id, task.error.clone().unwrap_or_default(), false, false);
+            journal::handled(id);
+        }
+        Some(PayoutResolution::Incomplete) => {
+            journal::failed(id, task.error.clone().unwrap_or_default(), true, false);
+        }
+        _ => {}
+    }
+}
+
+async fn recover_operation(id: u64) -> Result<BridgeTx, String> {
+    let entry = journal::get(id).ok_or_else(|| "operation disappeared".to_string())?;
+    run_operation(entry).await
 }
 
 async fn process_task(
@@ -319,13 +314,12 @@ async fn settle_deposit(
     match (task.from.clone(), task.from_tx.clone()) {
         (BridgeTarget::Evm(chain), BridgeTx::Evm(false, hash)) => {
             let tx_hash: TxHash = (*hash).into();
-            let sender = evm_address(&task.user)
-                .map_err(|err| TaskFault::Transient(format!("{chain}: {err}")))?;
+            let user = task.user;
             let status = check_evm_tx(
                 context,
                 &chain,
                 &tx_hash,
-                &sender,
+                || evm_address(&user),
                 task.from_meta.as_ref(),
                 task.created_at,
                 now_ms,
@@ -339,9 +333,10 @@ async fn settle_deposit(
                     task.from_meta = None;
                     Ok(true)
                 }
+                TxStatus::Mined => Ok(false),
                 TxStatus::Pending { seen } => {
                     if !seen {
-                        rebroadcast_evm(&chain, task.from_meta.as_ref(), task.created_at, now_ms)
+                        rebroadcast(&task.from, task.from_meta.as_ref(), task.created_at, now_ms)
                             .await;
                     }
                     Ok(false)
@@ -369,9 +364,11 @@ async fn settle_deposit(
                     task.from_meta = None;
                     Ok(true)
                 }
+                TxStatus::Mined => Ok(false),
                 TxStatus::Pending { seen } => {
                     if !seen {
-                        rebroadcast_svm(task.from_meta.as_ref(), task.created_at, now_ms).await;
+                        rebroadcast(&task.from, task.from_meta.as_ref(), task.created_at, now_ms)
+                            .await;
                     }
                     Ok(false)
                 }
@@ -445,12 +442,23 @@ fn verify_evm_payout(chain: &str, task: &BridgeLog, receipt: &EvmReceipt) -> Res
     Ok(())
 }
 
-fn record_payout(task: &mut BridgeLog, record: PayoutRecord, now_ms: u64) {
-    task.to_tx = Some(record.0);
-    task.to_meta = record.1;
+/// Records a payout on the task. The metadata is missing on payouts recorded
+/// by a version that did not keep it.
+fn record_payout(task: &mut BridgeLog, tx: BridgeTx, meta: Option<TxMeta>, now_ms: u64) {
+    task.to_tx = Some(tx);
+    task.to_meta = meta;
+    task.payout_mined = false;
     if task.payout_started_at == 0 {
         task.payout_started_at = now_ms;
     }
+}
+
+/// Drops a payout that can never land, so the next round pays afresh.
+fn drop_dead_payout(task: &mut BridgeLog) {
+    task.payout_resolution = Some(PayoutResolution::Expired);
+    task.payout_mined = false;
+    task.to_tx = None;
+    task.to_meta = None;
 }
 
 /// When the payout was first handed to a chain, for the grace period
@@ -493,10 +501,6 @@ async fn settle_payout(
                 let ledger = task
                     .ledger
                     .unwrap_or_else(|| STATE.with_borrow(|s| s.token_ledger));
-                let fee = context.ledger_fee(ledger).await?;
-                if !finalize_run_is_current(run_generation) {
-                    return Ok(());
-                }
                 journal::prepare(
                     id,
                     journal::Request::Transfer {
@@ -507,7 +511,9 @@ async fn settle_payout(
                                 owner: to,
                                 subaccount: None,
                             },
-                            fee: Some(fee.into()),
+                            // The ledger charges its current fee, so a fee
+                            // change cannot reject the persisted request.
+                            fee: None,
                             created_at_time: Some(entry.created_at.saturating_mul(1_000_000)),
                             memo: Some(journal::memo(id)),
                             amount: amount.into(),
@@ -524,39 +530,8 @@ async fn settle_payout(
                 Err(error) => Err(payout_fault(task, error)),
             }
         }
-        (BridgeTarget::Evm(chain), None) => {
-            let to_addr = match &task.to_addr {
-                Some(addr) => parse_evm_address(addr)
-                    .map_err(|err| TaskFault::Stuck(format!("{chain}: {err}")))?,
-                None => evm_address(&task.user)
-                    .map_err(|err| TaskFault::Transient(format!("{chain}: {err}")))?,
-            };
-            let to_amount =
-                bridge_amount_after_fee(task.icp_amount, task.fee).map_err(TaskFault::Stuck)?;
-            match to_evm(
-                run_generation,
-                &task.from_tx,
-                &chain,
-                to_addr,
-                to_amount,
-                now_ms,
-            )
-            .await
-            {
-                Ok(Some(record)) => {
-                    record_payout(task, record, now_ms);
-                    Ok(())
-                }
-                // This round was superseded, or a concurrent round
-                // removed the task while the transaction was built.
-                Ok(None) => Ok(()),
-                Err((claimed, err)) => {
-                    if let Some(record) = claimed {
-                        record_payout(task, record, now_ms);
-                    }
-                    Err(payout_fault(task, err))
-                }
-            }
+        (BridgeTarget::Evm(_) | BridgeTarget::Sol, None) => {
+            send_payout(task, now_ms, run_generation).await
         }
         (BridgeTarget::Evm(chain), Some(BridgeTx::Evm(false, hash))) => {
             let tx_hash: TxHash = (*hash).into();
@@ -566,7 +541,7 @@ async fn settle_payout(
                 context,
                 &chain,
                 &tx_hash,
-                &sender,
+                || Ok(sender),
                 task.to_meta.as_ref(),
                 since,
                 now_ms,
@@ -582,9 +557,15 @@ async fn settle_payout(
                     task.to_meta = None;
                     Ok(())
                 }
+                // Its nonce is spent: the next payout on this chain may be
+                // signed while this one waits to finalize.
+                TxStatus::Mined => {
+                    task.payout_mined = true;
+                    Ok(())
+                }
                 TxStatus::Pending { seen } => {
                     if !seen {
-                        rebroadcast_evm(&chain, task.to_meta.as_ref(), since, now_ms).await;
+                        rebroadcast(&task.to, task.to_meta.as_ref(), since, now_ms).await;
                     }
                     Ok(())
                 }
@@ -603,34 +584,8 @@ async fn settle_payout(
                     ic_cdk::api::debug_print(format!(
                         "{chain}: outgoing transaction {tx_hash} {reason}; it is rebuilt next round"
                     ));
-                    task.payout_resolution = Some(PayoutResolution::Expired);
-                    task.to_tx = None;
-                    task.to_meta = None;
+                    drop_dead_payout(task);
                     Ok(())
-                }
-            }
-        }
-        (BridgeTarget::Sol, None) => {
-            let to_addr = match &task.to_addr {
-                Some(addr) => Pubkey::from_str(addr).map_err(|_| {
-                    TaskFault::Stuck(format!("SOL: invalid to_addr address: {addr}"))
-                })?,
-                None => svm_address(&task.user)
-                    .map_err(|err| TaskFault::Transient(format!("SOL: {err}")))?,
-            };
-            let to_amount =
-                bridge_amount_after_fee(task.icp_amount, task.fee).map_err(TaskFault::Stuck)?;
-            match to_svm(run_generation, &task.from_tx, to_addr, to_amount, now_ms).await {
-                Ok(Some(record)) => {
-                    record_payout(task, record, now_ms);
-                    Ok(())
-                }
-                Ok(None) => Ok(()),
-                Err((claimed, err)) => {
-                    if let Some(record) = claimed {
-                        record_payout(task, record, now_ms);
-                    }
-                    Err(payout_fault(task, err))
                 }
             }
         }
@@ -646,9 +601,10 @@ async fn settle_payout(
                     task.to_meta = None;
                     Ok(())
                 }
+                TxStatus::Mined => Ok(()),
                 TxStatus::Pending { seen } => {
                     if !seen {
-                        rebroadcast_svm(task.to_meta.as_ref(), since, now_ms).await;
+                        rebroadcast(&task.to, task.to_meta.as_ref(), since, now_ms).await;
                     }
                     Ok(())
                 }
@@ -662,9 +618,7 @@ async fn settle_payout(
                     ic_cdk::api::debug_print(format!(
                         "SOL: outgoing transaction {reason}; it is rebuilt next round"
                     ));
-                    task.payout_resolution = Some(PayoutResolution::Expired);
-                    task.to_tx = None;
-                    task.to_meta = None;
+                    drop_dead_payout(task);
                     Ok(())
                 }
             }
@@ -673,136 +627,80 @@ async fn settle_payout(
     }
 }
 
-/// Broadcasts an outgoing payout transaction.
+/// Sends the payout of a task whose deposit is in.
 ///
-/// A successful `Some` is the payout this task must poll. `None` means
-/// the round was superseded or the task disappeared while its candidate was
-/// being built. On failure the error's `Option` carries the payout that
-/// was atomically recorded before it was handed to the provider, if any:
-/// the provider may have accepted and propagated it even though the RPC
-/// call itself failed.
-type BroadcastResult = Result<Option<PayoutRecord>, (Option<PayoutRecord>, String)>;
-
-async fn to_evm(
-    run_generation: u64,
-    from_tx: &BridgeTx,
-    chain: &str,
-    to_addr: Address,
-    icp_amount: u128,
+/// A transfer its intent already signed is sent as it is; otherwise a fresh
+/// one is signed. It is recorded on the task before it is handed to a
+/// provider, so a broadcast whose outcome is unknown is never signed again.
+/// A claim that finds the slot taken, the round superseded or the task gone
+/// sends nothing, see [`PayoutClaim`].
+async fn send_payout(
+    task: &mut BridgeLog,
     now_ms: u64,
-) -> BroadcastResult {
-    if let Some((tx, meta)) = pending::by_tx(from_tx)
-        .and_then(|t| t.payout_attempt)
+    run_generation: u64,
+) -> Result<(), TaskFault> {
+    let recorded = pending::get(task.task_id)
+        .and_then(|live| live.payout_attempt)
         .and_then(journal::get)
-        .and_then(|e| e.signed)
-    {
-        let client = evm_client(chain).map_err(|e| (None, e))?;
-        let raw = evm_raw_hex(&meta).map_err(|e| (None, e))?;
-        return broadcast_payout(run_generation, from_tx, (tx, meta), chain, now_ms, || {
-            client.send_raw_transaction(raw)
-        })
-        .await;
-    }
-
-    let (client, signed_tx) = build_erc20_transfer_tx(
-        chain,
-        &crate::helper::canister_id(),
-        &to_addr,
-        icp_amount,
-        now_ms,
-        Funding::Payout {
-            task_id: pending::by_tx(from_tx)
-                .ok_or_else(|| (None, "task disappeared".to_string()))?
-                .task_id,
-            run_generation,
-        },
-    )
-    .await
-    .map_err(|err| (None, format!("{chain}: {err}")))?;
-
-    let data = evm_raw_hex(&signed_tx.meta).map_err(|e| (None, e))?;
-    let payout = (signed_tx.tx, signed_tx.meta);
-    broadcast_payout(run_generation, from_tx, payout, chain, now_ms, || {
-        client.send_raw_transaction(data)
-    })
-    .await
-}
-
-async fn to_svm(
-    run_generation: u64,
-    from_tx: &BridgeTx,
-    to_addr: Pubkey,
-    icp_amount: u128,
-    now_ms: u64,
-) -> BroadcastResult {
-    if let Some((tx, meta)) = pending::by_tx(from_tx)
-        .and_then(|t| t.payout_attempt)
-        .and_then(journal::get)
-        .and_then(|e| e.signed)
-    {
-        let client = svm_client();
-        let raw = svm_raw(&meta).map_err(|e| (None, e))?;
-        return broadcast_payout(run_generation, from_tx, (tx, meta), "SOL", now_ms, || {
-            client.send_transaction(raw)
-        })
-        .await;
-    }
-
-    let (client, signed_tx) = build_spl_transfer_tx(
-        &crate::helper::canister_id(),
-        &to_addr,
-        icp_amount,
-        Funding::Payout {
-            task_id: pending::by_tx(from_tx)
-                .ok_or_else(|| (None, "task disappeared".to_string()))?
-                .task_id,
-            run_generation,
-        },
-    )
-    .await
-    .map_err(|err| (None, format!("SOL: {err}")))?;
-
-    let raw = svm_raw(&signed_tx.meta).map_err(|e| (None, e))?;
-    let payout = (signed_tx.tx, signed_tx.meta);
-    broadcast_payout(run_generation, from_tx, payout, "SOL", now_ms, || {
-        client.send_transaction(raw)
-    })
-    .await
-}
-
-/// Records the payout on its task, then hands it to the provider.
-///
-/// The claim comes first so that a broadcast whose outcome is unknown is
-/// never rebuilt: the error carries the claimed payout for exactly that
-/// case. A claim that finds the slot taken, the round superseded or the
-/// task gone returns without broadcasting, see [`PayoutClaim`].
-async fn broadcast_payout<F, Fut, T>(
-    run_generation: u64,
-    from_tx: &BridgeTx,
-    payout: Payout,
-    chain: &str,
-    now_ms: u64,
-    send: F,
-) -> BroadcastResult
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<T, String>>,
-{
-    match claim_pending_payout(run_generation, from_tx, &payout, now_ms) {
+        .and_then(|entry| entry.signed);
+    let signed = match recorded {
+        Some(signed) => SignedTransfer::from(signed),
+        None => sign_payout(task, now_ms, run_generation).await?,
+    };
+    match claim_pending_payout(run_generation, task.task_id, &signed, now_ms) {
         PayoutClaim::Claimed => {}
-        PayoutClaim::Existing(existing) => return Ok(Some(existing)),
-        PayoutClaim::RunSuperseded | PayoutClaim::TaskGone => return Ok(None),
-        PayoutClaim::ReconciliationRequired(error) => return Err((None, error)),
+        PayoutClaim::Existing(tx, meta) => {
+            record_payout(task, tx, meta, now_ms);
+            return Ok(());
+        }
+        PayoutClaim::RunSuperseded | PayoutClaim::TaskGone => return Ok(()),
+        PayoutClaim::ReconciliationRequired(error) => return Err(payout_fault(task, error)),
     }
+    let SignedTransfer { tx, meta } = signed;
+    record_payout(task, tx, Some(meta.clone()), now_ms);
+    broadcast_raw(&task.to, &meta)
+        .await
+        .map_err(|err| payout_fault(task, format!("{}: {err}", task.to.name())))
+}
 
-    let (tx, meta) = payout;
-    send().await.map_err(|err| {
-        (
-            Some((tx.clone(), Some(meta.clone()))),
-            format!("{chain}: {err}"),
-        )
-    })?;
-    Ok(Some((tx, Some(meta))))
+/// Signs a fresh payout transfer to the task's destination.
+async fn sign_payout(
+    task: &BridgeLog,
+    now_ms: u64,
+    run_generation: u64,
+) -> Result<SignedTransfer, TaskFault> {
+    let chain = task.to.name();
+    let amount = bridge_amount_after_fee(task.icp_amount, task.fee).map_err(TaskFault::Stuck)?;
+    let funding = Funding::Payout {
+        task_id: task.task_id,
+        run_generation,
+    };
+    let bridge = crate::helper::canister_id();
+    let signed = match &task.to {
+        BridgeTarget::Evm(chain) => {
+            let to = match &task.to_addr {
+                Some(addr) => parse_evm_address(addr)
+                    .map_err(|err| TaskFault::Stuck(format!("{chain}: {err}")))?,
+                None => evm_address(&task.user)
+                    .map_err(|err| TaskFault::Transient(format!("{chain}: {err}")))?,
+            };
+            build_erc20_transfer_tx(chain, &bridge, &to, amount, now_ms, funding).await
+        }
+        BridgeTarget::Sol => {
+            let to = match &task.to_addr {
+                Some(addr) => Pubkey::from_str(addr).map_err(|_| {
+                    TaskFault::Stuck(format!("SOL: invalid to_addr address: {addr}"))
+                })?,
+                None => svm_address(&task.user)
+                    .map_err(|err| TaskFault::Transient(format!("SOL: {err}")))?,
+            };
+            build_spl_transfer_tx(&bridge, &to, amount, funding).await
+        }
+        BridgeTarget::Icp => {
+            return Err(TaskFault::Stuck("ICP payouts are ledger transfers".into()));
+        }
+    };
+    signed.map_err(|err| payout_fault(task, format!("{chain}: {err}")))
 }
 
 /// Where an EVM transaction sent by `sender` has got to.
@@ -810,12 +708,13 @@ where
 /// A transaction no provider has is not necessarily still coming: once
 /// the sender's nonce has moved past the one it spends, it has been
 /// replaced and can never be mined. See [`EvmClient::replaced`] for how
-/// that is established without mistaking a provider's lag for it.
+/// that is established without mistaking a provider's lag for it. The
+/// sender is only worked out for that check.
 async fn check_evm_tx(
     context: &FinalizeContext,
     chain: &str,
     tx_hash: &TxHash,
-    sender: &Address,
+    sender: impl FnOnce() -> Result<Address, String>,
     meta: Option<&TxMeta>,
     since_ms: u64,
     now_ms: u64,
@@ -846,7 +745,7 @@ async fn check_evm_tx(
                     >= client.max_confirmations
             };
             if !confirmed {
-                return Ok(TxStatus::Pending { seen: true });
+                return Ok(TxStatus::Mined);
             }
             if !client.receipt_is_canonical(&receipt).await? {
                 return Ok(TxStatus::Pending { seen: true });
@@ -869,7 +768,7 @@ async fn check_evm_tx(
                     deadline: TxDeadline::Nonce(nonce),
                     ..
                 }) = meta
-                && client.replaced(sender, *nonce, tx_hash).await?
+                && client.replaced(&sender()?, *nonce, tx_hash).await?
             {
                 return Ok(TxStatus::Dead(format!(
                     "was replaced: nonce {nonce} was spent by another transaction"
@@ -921,42 +820,113 @@ async fn check_sol_tx(
 /// Hands a signed transaction no provider has seen to the providers again.
 /// Best effort: a provider that already has it answers with an error, and
 /// one that is down is tried again next round.
-async fn rebroadcast_evm(chain: &str, meta: Option<&TxMeta>, since_ms: u64, now_ms: u64) {
+async fn rebroadcast(target: &BridgeTarget, meta: Option<&TxMeta>, since_ms: u64, now_ms: u64) {
     if now_ms.saturating_sub(since_ms) < UNSEEN_TX_GRACE_MS {
         return;
     }
-    let Some(raw) = meta.and_then(|meta| meta.raw.as_ref()) else {
+    let Some(meta) = meta.filter(|meta| meta.raw.is_some()) else {
         return;
     };
-    let Ok(client) = evm_client(chain) else {
-        return;
-    };
-    if let Err(err) = client
-        .send_raw_transaction(Bytes::copy_from_slice(raw).to_string())
-        .await
-    {
-        ic_cdk::api::debug_print(format!("{chain}: re-broadcast failed: {err}"));
-    }
-}
-
-async fn rebroadcast_svm(meta: Option<&TxMeta>, since_ms: u64, now_ms: u64) {
-    if now_ms.saturating_sub(since_ms) < UNSEEN_TX_GRACE_MS {
-        return;
-    }
-    let Some(raw) = meta.and_then(|meta| meta.raw.as_ref()) else {
-        return;
-    };
-    if let Err(err) = svm_client()
-        .send_transaction(ByteBufB64::from(raw.to_vec()))
-        .await
-    {
-        ic_cdk::api::debug_print(format!("SOL: re-broadcast failed: {err}"));
+    if let Err(err) = broadcast_raw(target, meta).await {
+        ic_cdk::api::debug_print(format!("{}: re-broadcast failed: {err}", target.name()));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pending ICP→ETH task with a payout attempt whose `request` the
+    /// other side refused, cleanly or with an unknown outcome.
+    fn attempt(seed: u64, request: journal::Request, ambiguous: bool) -> (BridgeLog, u64) {
+        STATE.with_borrow_mut(|s| s.icp_collected_fees_migrated = true);
+        let mut task = crate::store::tests::log(
+            Principal::from_slice(&[61]),
+            BridgeTarget::Icp,
+            BridgeTarget::Evm("ETH".into()),
+            BridgeTx::Icp(true, seed),
+        );
+        task.task_id = pending::next_id();
+        pending::insert(&task);
+        let entry = journal::create(task.user, journal::Purpose::Payout(task.task_id), now_ms());
+        pending::update(task.task_id, |t| {
+            t.payout_attempt = Some(entry.id);
+            t.payout_started_at = entry.created_at;
+        });
+        let signature = matches!(request, journal::Request::Signature { .. });
+        journal::prepare(entry.id, request).unwrap();
+        if signature {
+            journal::start_signature(entry.id).unwrap();
+        }
+        journal::failed(entry.id, "request refused".into(), ambiguous, false);
+        (pending::get(task.task_id).unwrap(), entry.id)
+    }
+
+    fn signature() -> journal::Request {
+        journal::Request::Signature {
+            scheme: "ecdsa".into(),
+            key_name: "test_key_1".into(),
+            sender: Principal::from_slice(&[61]),
+            message: vec![1; 32].into(),
+            deadline: TxDeadline::Nonce(3),
+            validity: None,
+        }
+    }
+
+    #[test]
+    fn a_refused_signature_is_signed_afresh_instead_of_waiting_for_governance() {
+        let (mut task, id) = attempt(7_001, signature(), false);
+        assert!(matches!(
+            payout_fault(&task, "ETH: threshold signature failed".into()),
+            TaskFault::Transient(_)
+        ));
+        conclude_payout_attempt(&mut task);
+        assert_eq!(task.payout_attempt, None);
+        assert_eq!(task.payout_started_at, 0);
+        assert_eq!(task.payout_resolution, None);
+        // It no longer holds the chain's nonce, and its intent is closed.
+        assert!(!task.holds_nonce());
+        assert!(journal::get(id).unwrap().handled);
+    }
+
+    #[test]
+    fn an_unknown_signature_outcome_still_waits_for_reconciliation() {
+        let (mut task, id) = attempt(7_002, signature(), true);
+        assert!(matches!(
+            payout_fault(&task, "ETH: threshold signature failed".into()),
+            TaskFault::Stuck(_)
+        ));
+        conclude_payout_attempt(&mut task);
+        assert_eq!(task.payout_attempt, Some(id));
+        assert!(!journal::get(id).unwrap().handled);
+    }
+
+    #[test]
+    fn a_ledger_rejection_is_still_left_for_an_administrator() {
+        let transfer = journal::Request::Transfer {
+            ledger: Principal::from_slice(&[62]),
+            args: TransferArg {
+                from_subaccount: None,
+                to: Account {
+                    owner: Principal::from_slice(&[61]),
+                    subaccount: None,
+                },
+                fee: None,
+                created_at_time: Some(1),
+                memo: None,
+                amount: 99u64.into(),
+            },
+        };
+        let (mut task, id) = attempt(7_003, transfer, false);
+        assert!(matches!(
+            payout_fault(&task, "ICP: insufficient funds".into()),
+            TaskFault::Stuck(_)
+        ));
+        conclude_payout_attempt(&mut task);
+        assert_eq!(task.payout_resolution, Some(PayoutResolution::Failed));
+        assert!(journal::get(id).unwrap().handled);
+    }
+
     #[test]
     fn a_successful_receipt_without_the_promised_transfer_does_not_settle_a_payout() {
         let token = Address::from([1; 20]);

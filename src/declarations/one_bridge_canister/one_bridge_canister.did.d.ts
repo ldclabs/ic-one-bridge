@@ -68,6 +68,7 @@ export interface LogRuntime {
   'payout_attempt' : [] | [bigint],
   'payout_resolution' : [] | [PayoutResolution],
   'ledger' : [] | [Principal],
+  'payout_mined' : boolean,
   'error_chain' : [] | [BridgeTarget],
 }
 export interface OperationInfo {

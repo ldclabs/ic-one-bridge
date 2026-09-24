@@ -69,6 +69,9 @@ type LogRuntime = record {
   payout_attempt : opt nat64;
   payout_resolution : opt PayoutResolution;
   ledger : opt principal;
+  // EVM: the payout is in a block. Its nonce is spent, so it no longer
+  // holds the chain's reservation while it waits to finalize.
+  payout_mined : bool;
   error_chain : opt BridgeTarget;
 };
 type OperationInfo = record {
@@ -304,6 +307,7 @@ service : (opt CanisterArgs) -> {
   pending_logs : () -> (Result_7) query;
   pending_logs_page : (nat32, opt nat64) -> (Result_7) query;
   recheck_task : (BridgeTx) -> (Result);
+  // Deprecated: the same as `resume_operation`, kept for older clients.
   resume_deposit : (nat64) -> (Result_2);
   resume_operation : (nat64) -> (Result_2);
   sol_transfer_tx : (text, nat64) -> (Result_5);

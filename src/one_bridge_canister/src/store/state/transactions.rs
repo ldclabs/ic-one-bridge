@@ -63,7 +63,7 @@ async fn sign_evm_tx(
     plan: EvmTxPlan,
     now_ms: u64,
     funding: Funding,
-) -> Result<(EvmClient<DefaultHttpOutcall>, SignedTransfer), String> {
+) -> Result<SignedTransfer, String> {
     let operation = signing_operation(funding)?;
     let EvmTxPlan {
         to,
@@ -111,16 +111,39 @@ async fn sign_evm_tx(
     }
 
     let client = evm_client(chain)?;
-    if gas_updated_at.saturating_add(120_000) >= now_ms {
-        tx.nonce = client.get_transaction_count(&from_addr).await?;
-    } else {
-        let (nonce, gas_price, max_priority_fee_per_gas) = futures::future::try_join3(
-            client.get_transaction_count(&from_addr),
-            client.gas_price(),
-            client.max_priority_fee_per_gas(),
-        )
-        .await?;
-        tx.nonce = nonce;
+    // The reads are independent, so they share one round of outcalls: the
+    // nonce, a gas quote when the cached one is stale, and, for a sender
+    // other than the bridge, the balances it pays with.
+    let gas_is_fresh = gas_updated_at.saturating_add(120_000) >= now_ms;
+    let verify_funds = !matches!(funding, Funding::Payout { .. });
+    let gas_quote = async {
+        if gas_is_fresh {
+            Ok(None)
+        } else {
+            futures::future::try_join(client.gas_price(), client.max_priority_fee_per_gas())
+                .await
+                .map(Some)
+        }
+    };
+    let funds = async {
+        if !verify_funds {
+            return Ok(None);
+        }
+        let token_balance = async {
+            match token_transfer {
+                Some(_) => client.erc20_balance_of(&to, &from_addr).await.map(Some),
+                None => Ok(None),
+            }
+        };
+        futures::future::try_join(client.get_balance(&from_addr), token_balance)
+            .await
+            .map(Some)
+    };
+    let (nonce, gas_quote, funds) =
+        futures::future::try_join3(client.get_transaction_count(&from_addr), gas_quote, funds)
+            .await?;
+    tx.nonce = nonce;
+    if let Some((gas_price, max_priority_fee_per_gas)) = gas_quote {
         tx.max_priority_fee_per_gas = bump_priority_fee(max_priority_fee_per_gas)?;
         tx.max_fee_per_gas = calculate_max_fee_per_gas(gas_price, tx.max_priority_fee_per_gas)?;
         STATE.with_borrow_mut(|s| {
@@ -130,15 +153,8 @@ async fn sign_evm_tx(
             );
         })
     }
-
-    if !matches!(funding, Funding::Payout { .. }) {
-        verify_evm_funds(
-            &client,
-            &from_addr,
-            &tx,
-            token_transfer.map(|amount| (to, amount)),
-        )
-        .await?;
+    if let Some((balance, token_balance)) = funds {
+        check_evm_funds(&from_addr, &tx, balance, token_transfer.zip(token_balance))?;
     }
 
     signing_run_current(funding)?;
@@ -204,35 +220,33 @@ async fn sign_evm_tx(
         },
     };
     if let Some(id) = operation {
-        journal::record_signed(id, transfer.tx.clone(), transfer.meta.clone(), sig)?;
+        journal::record_signed(id, &transfer, sig)?;
     }
-    Ok((client, transfer))
+    Ok(transfer)
 }
 
 /// Refuses to sign for an address that cannot pay for the transaction:
 /// its native balance must cover the value and the gas, and for a token
-/// transfer its token balance must cover the amount.
-async fn verify_evm_funds(
-    client: &EvmClient<DefaultHttpOutcall>,
+/// transfer its token balance, `(amount, held)`, must cover the amount.
+fn check_evm_funds(
     from: &Address,
     tx: &TxEip1559,
-    token: Option<(Address, u128)>,
+    balance: U256,
+    token: Option<(u128, U256)>,
 ) -> Result<(), String> {
     let gas = U256::from(tx.gas_limit).saturating_mul(U256::from(tx.max_fee_per_gas));
     let needed = gas.saturating_add(tx.value);
-    let balance = client.get_balance(from).await?;
     if balance < needed {
         return Err(format!(
             "address {from} holds {balance} wei, and the transaction needs {needed} for its value and gas"
         ));
     }
-    if let Some((contract, amount)) = token {
-        let held = client.erc20_balance_of(&contract, from).await?;
-        if held < U256::from(amount) {
-            return Err(format!(
-                "address {from} holds {held} token units, and the transfer needs {amount}"
-            ));
-        }
+    if let Some((amount, held)) = token
+        && held < U256::from(amount)
+    {
+        return Err(format!(
+            "address {from} holds {held} token units, and the transfer needs {amount}"
+        ));
     }
     Ok(())
 }
@@ -244,7 +258,7 @@ pub async fn build_erc20_transfer_tx(
     icp_amount: u128,
     now_ms: u64,
     funding: Funding,
-) -> Result<(EvmClient<DefaultHttpOutcall>, SignedTransfer), String> {
+) -> Result<SignedTransfer, String> {
     let plan = STATE.with_borrow(|s| {
         let (contract, decimals, _) = s
             .evm_token_contracts
@@ -278,7 +292,7 @@ pub async fn build_evm_transfer_tx(
     amount: u128,
     now_ms: u64,
     funding: Funding,
-) -> Result<(EvmClient<DefaultHttpOutcall>, SignedTransfer), String> {
+) -> Result<SignedTransfer, String> {
     if amount == 0 {
         return Err("amount must be greater than 0".to_string());
     }
@@ -295,15 +309,12 @@ pub async fn build_evm_transfer_tx(
     sign_evm_tx(chain, from, plan, now_ms, funding).await
 }
 
-/// An encoded Solana transaction with its client and blockhash validity.
-type SignedSvmTx = (SvmClient<DefaultHttpOutcall>, SignedTransfer);
-
 pub async fn build_spl_transfer_tx(
     from: &Principal,
     to_addr: &Pubkey,
     icp_amount: u128,
     funding: Funding,
-) -> Result<SignedSvmTx, String> {
+) -> Result<SignedTransfer, String> {
     let (from_addr, from_ata, to_ata, amount, ixs) = STATE.with_borrow(|s| {
         if !s.svm_mint_verified && !matches!(funding, Funding::Verify) {
             return Err("SOL mint has not passed the supported-token checks".to_string());
@@ -335,6 +346,7 @@ pub async fn build_spl_transfer_tx(
         let ix0 = create_associated_token_account_idempotent(
             &from_addr,
             to_addr,
+            &to_ata,
             &mint_pubkey,
             &token_program_id,
         );
@@ -397,7 +409,7 @@ pub async fn build_sol_transfer_tx(
     to_addr: &Pubkey,
     sol_amount: u64,
     funding: Funding,
-) -> Result<SignedSvmTx, String> {
+) -> Result<SignedTransfer, String> {
     if sol_amount == 0 {
         return Err("amount must be greater than 0".to_string());
     }
@@ -435,7 +447,7 @@ async fn sign_svm_tx(
     from_addr: Pubkey,
     ixs: &[Instruction],
     funding: Funding,
-) -> Result<SignedSvmTx, String> {
+) -> Result<SignedTransfer, String> {
     let operation = signing_operation(funding)?;
     let key_name = STATE.with_borrow(|s| s.key_name.clone());
     let blockhash = client
@@ -501,12 +513,7 @@ async fn sign_svm_tx(
         },
     };
     if let Some(id) = operation {
-        journal::record_signed(
-            id,
-            transfer.tx.clone(),
-            transfer.meta.clone(),
-            signature.to_vec(),
-        )?;
+        journal::record_signed(id, &transfer, signature.to_vec())?;
     }
-    Ok((client, transfer))
+    Ok(transfer)
 }

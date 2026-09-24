@@ -18,21 +18,22 @@ fn production_payout_claim_reuses_the_first_transaction_and_fences_old_runs() {
         s.icp_collected_fees_migrated = true;
     });
     let generation = next_finalize_run_generation();
-    let first = (evm_tx(1), meta(1));
-    let second = (evm_tx(2), meta(2));
+    let first = SignedTransfer::from((evm_tx(1), meta(1)));
+    let second = SignedTransfer::from((evm_tx(2), meta(2)));
     assert!(matches!(
-        claim_pending_payout(generation, &task.from_tx, &first, 10),
+        claim_pending_payout(generation, task.task_id, &first, 10),
         PayoutClaim::Claimed
     ));
-    assert!(
-        matches!(claim_pending_payout(generation,&task.from_tx,&second,20),PayoutClaim::Existing((tx,_)) if tx==first.0)
-    );
+    assert!(matches!(
+        claim_pending_payout(generation, task.task_id, &second, 20),
+        PayoutClaim::Existing(tx, _) if tx == first.tx
+    ));
     next_finalize_run_generation();
     assert!(matches!(
-        claim_pending_payout(generation, &task.from_tx, &second, 30),
+        claim_pending_payout(generation, task.task_id, &second, 30),
         PayoutClaim::RunSuperseded
     ));
-    assert!(pending::get(task.task_id).unwrap().to_tx == Some(first.0));
+    assert!(pending::get(task.task_id).unwrap().to_tx == Some(first.tx));
 }
 
 #[test]
@@ -157,6 +158,39 @@ fn legacy_pending_fee_defaults_to_zero() {
     assert_eq!(task.fee, 0);
 }
 
+#[test]
+fn stored_logs_leave_default_runtime_fields_out() {
+    let mut task = log(
+        principal(&[5]),
+        BridgeTarget::Icp,
+        evm("ETH"),
+        BridgeTx::Icp(true, 5),
+    );
+    task.task_id = 42;
+    let stored = |task: &BridgeLog| cbor_into_vec(&BridgeLogLocal::from(task.clone())).unwrap();
+    let has = |bytes: &[u8], key: &[u8]| bytes.windows(key.len()).any(|w| w == key);
+    let bytes = stored(&task);
+    for key in [
+        &b"next_poll_at"[..],
+        b"poll_attempts",
+        b"payout_mined",
+        b"payout_resolution",
+        b"error_chain",
+    ] {
+        assert!(!has(&bytes, key));
+    }
+    // Every reader, an older one included, defaults what is left out.
+    let decoded: BridgeLogLocal = cbor_from_slice(&bytes).unwrap();
+    assert_eq!((decoded.task_id, decoded.next_poll_at), (42, 0));
+
+    task.next_poll_at = 7;
+    task.payout_mined = true;
+    let bytes = stored(&task);
+    assert!(has(&bytes, b"next_poll_at") && has(&bytes, b"payout_mined"));
+    let decoded: BridgeLogLocal = cbor_from_slice(&bytes).unwrap();
+    assert_eq!((decoded.next_poll_at, decoded.payout_mined), (7, true));
+}
+
 fn principal(bytes: &[u8]) -> Principal {
     Principal::from_slice(bytes)
 }
@@ -168,15 +202,7 @@ pub(super) fn log(
     from_tx: BridgeTx,
 ) -> BridgeLog {
     BridgeLog {
-        runtime: Some(LogRuntime {
-            task_id: 0,
-            ledger: None,
-            payout_attempt: None,
-            payout_resolution: None,
-            next_poll_at: 0,
-            poll_attempts: 0,
-            error_chain: None,
-        }),
+        runtime: Some(LogRuntime::default()),
         id: None,
         user,
         from,
@@ -256,39 +282,6 @@ fn finalization_shares_failed_block_outcalls_per_chain() {
     assert!(first.is_err());
     assert_eq!(first, second);
     assert_eq!(mock.urls().len(), 2);
-}
-
-#[test]
-fn ledger_fee_reads_are_shared_only_within_one_round_and_ledger() {
-    let ledger = principal(&[81]);
-    for answer in [Ok(10), Err("ledger temporarily unavailable".to_string())] {
-        let context = FinalizeContext::default();
-        let calls = Cell::new(0);
-        let read = || async {
-            calls.set(calls.get() + 1);
-            answer.clone()
-        };
-        let results = futures::executor::block_on(async {
-            futures::join!(
-                context.ledger_fee_with(ledger, read()),
-                context.ledger_fee_with(ledger, read()),
-                context.ledger_fee_with(ledger, read())
-            )
-        });
-        assert_eq!(results, (answer.clone(), answer.clone(), answer.clone()));
-        assert_eq!(calls.get(), 1);
-        let other = principal(&[82]);
-        assert_eq!(
-            futures::executor::block_on(context.ledger_fee_with(other, read())),
-            answer
-        );
-        assert_eq!(calls.get(), 2);
-        assert_eq!(
-            futures::executor::block_on(FinalizeContext::default().ledger_fee_with(ledger, read())),
-            answer
-        );
-        assert_eq!(calls.get(), 3);
-    }
 }
 
 #[test]

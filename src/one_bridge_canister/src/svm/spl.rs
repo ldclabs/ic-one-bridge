@@ -22,19 +22,21 @@ pub fn get_associated_token_address(
     .0
 }
 
+/// Opens `associated_account`, the wallet's token account from
+/// [`get_associated_token_address`], unless it exists already. The caller
+/// passes the address it derived: finding it is a program-address search.
 pub fn create_associated_token_account_idempotent(
     funding_address: &Pubkey,
     wallet_address: &Pubkey,
+    associated_account: &Pubkey,
     token_mint_address: &Pubkey,
     token_program_id: &Pubkey,
 ) -> Instruction {
-    let associated_account =
-        get_associated_token_address(wallet_address, token_mint_address, token_program_id);
     Instruction {
         program_id: ASSOCIATED_TOKEN_PROGRAM_ID,
         accounts: vec![
             AccountMeta::new(*funding_address, true),
-            AccountMeta::new(associated_account, false),
+            AccountMeta::new(*associated_account, false),
             AccountMeta::new_readonly(*wallet_address, false),
             AccountMeta::new_readonly(*token_mint_address, false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
@@ -122,16 +124,19 @@ mod tests {
         let wallet = Pubkey::new_from_array([2; 32]);
         let mint = Pubkey::new_from_array([3; 32]);
         let token_program = Pubkey::new_from_array([4; 32]);
-        let instruction =
-            create_associated_token_account_idempotent(&payer, &wallet, &mint, &token_program);
+        let account = get_associated_token_address(&wallet, &mint, &token_program);
+        let instruction = create_associated_token_account_idempotent(
+            &payer,
+            &wallet,
+            &account,
+            &mint,
+            &token_program,
+        );
 
         assert_eq!(instruction.program_id, ASSOCIATED_TOKEN_PROGRAM_ID);
         assert_eq!(instruction.accounts.len(), 6);
         assert_eq!(instruction.data, [1]);
-        assert_eq!(
-            instruction.accounts[1].pubkey,
-            get_associated_token_address(&wallet, &mint, &token_program)
-        );
+        assert_eq!(instruction.accounts[1].pubkey, account);
     }
 
     #[test]

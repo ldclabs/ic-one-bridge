@@ -34,6 +34,83 @@ mod tests {
         state.svm_token_address.1 = 8;
         assert!(plan_bridge(&state, "ICP", "SOL", 2_000_000_000, None, user).is_ok());
     }
+
+    fn task(seed: u64) -> BridgeLog {
+        let mut task = crate::store::tests::log(
+            Principal::from_slice(&[71]),
+            BridgeTarget::Icp,
+            BridgeTarget::Evm("ETH".into()),
+            BridgeTx::Icp(true, seed),
+        );
+        task.task_id = pending::next_id();
+        task
+    }
+
+    /// A task whose payout reverted on chain, waiting for an administrator.
+    fn failed_payout(seed: u64) -> BridgeLog {
+        let mut task = task(seed);
+        task.to_tx = Some(BridgeTx::Evm(false, [9; 32].into()));
+        task.payout_resolution = Some(PayoutResolution::Failed);
+        task.stuck = true;
+        task.error = Some("ETH: outgoing transaction reverted on chain".into());
+        pending::insert(&task);
+        task
+    }
+
+    #[test]
+    fn a_recheck_does_not_wait_for_a_running_round() {
+        pending::reset();
+        STATE.with_borrow_mut(|s| {
+            s.icp_collected_fees_migrated = true;
+            s.finalize_bridging_round.1 = true;
+            s.finalize_bridging_started_at = now_ms();
+        });
+        let task = failed_payout(8_001);
+        recheck_task(&task.from_tx, task.user, false).unwrap();
+        let live = pending::get(task.task_id).unwrap();
+        assert!(!live.stuck && live.error.is_none());
+        assert_eq!(live.next_poll_at, now_ms());
+        // The round that is running keeps its lock.
+        assert!(STATE.with_borrow(|s| s.finalize_bridging_round.1));
+    }
+
+    #[test]
+    fn an_admin_retry_wakes_only_its_own_task() {
+        pending::reset();
+        STATE.with_borrow_mut(|s| s.icp_collected_fees_migrated = true);
+        let failed = failed_payout(8_002);
+        let mut waiting = task(8_003);
+        waiting.next_poll_at = now_ms() + 600_000;
+        waiting.poll_attempts = 50;
+        pending::insert(&waiting);
+
+        retry_pending_task(&failed.from_tx, None, None).unwrap();
+        let retried = pending::get(failed.task_id).unwrap();
+        assert!(retried.to_tx.is_none() && !retried.stuck);
+        assert_eq!(retried.next_poll_at, now_ms());
+        let untouched = pending::get(waiting.task_id).unwrap();
+        assert_eq!(
+            (untouched.next_poll_at, untouched.poll_attempts),
+            (waiting.next_poll_at, 50)
+        );
+    }
+
+    #[test]
+    fn archived_tasks_leave_the_queue_without_their_scheduling_state() {
+        pending::reset();
+        let mut task = task(8_004);
+        task.next_poll_at = 99;
+        task.poll_attempts = 3;
+        pending::insert(&task);
+        let id = archive_task(&task).unwrap();
+        assert!(pending::get(task.task_id).is_none());
+        assert_eq!(pending::archived_source(&task.from_tx), Some(id));
+        let stored = BRIDGE_LOGS.with_borrow(|logs| logs.get(id)).unwrap();
+        assert_eq!(
+            (stored.task_id, stored.next_poll_at, stored.poll_attempts),
+            (task.task_id, 0, 0)
+        );
+    }
 }
 mod engine;
 mod transactions;
@@ -98,6 +175,7 @@ pub fn save() {
             r.set(buf);
         });
     });
+    budget::save();
 }
 
 pub fn info() -> StateInfo {
@@ -293,6 +371,10 @@ fn checked_chain_amount(s: &State, target: &BridgeTarget, amount: u128) -> Resul
 /// rejected as stale — which would leave the slot empty and the queue
 /// unserved until the next deposit or an admin restart.
 pub fn schedule_finalize(delay: Duration) {
+    // Unit tests run natively, without the canister's timer API.
+    if cfg!(test) {
+        return;
+    }
     let now_ms = now_ms();
     let (running, started_at) =
         STATE.with_borrow(|s| (s.finalize_bridging_round.1, s.finalize_bridging_started_at));
@@ -400,47 +482,6 @@ fn plan_bridge(
     })
 }
 
-/// A signed deposit, recorded on its task before it is broadcast so that
-/// a broadcast whose outcome is unknown cannot strand the user's funds.
-enum Deposit {
-    /// Transferred on the ICP ledger: nothing left to broadcast.
-    Settled(BridgeTx),
-    Evm {
-        tx: BridgeTx,
-        meta: TxMeta,
-        client: EvmClient<DefaultHttpOutcall>,
-    },
-    Sol {
-        tx: BridgeTx,
-        meta: TxMeta,
-        client: SvmClient<DefaultHttpOutcall>,
-    },
-}
-
-impl Deposit {
-    fn record(&self) -> (BridgeTx, Option<TxMeta>) {
-        match self {
-            Self::Settled(tx) => (tx.clone(), None),
-            Self::Evm { tx, meta, .. } | Self::Sol { tx, meta, .. } => {
-                (tx.clone(), Some(meta.clone()))
-            }
-        }
-    }
-
-    async fn broadcast(self) -> Result<(), String> {
-        match self {
-            Self::Settled(_) => Ok(()),
-            Self::Evm { meta, client, .. } => client
-                .send_raw_transaction(evm_raw_hex(&meta)?)
-                .await
-                .map(|_| ()),
-            Self::Sol { meta, client, .. } => {
-                client.send_transaction(svm_raw(&meta)?).await.map(|_| ())
-            }
-        }
-    }
-}
-
 pub(crate) fn evm_raw_hex(meta: &TxMeta) -> Result<String, String> {
     meta.raw
         .as_ref()
@@ -453,6 +494,25 @@ pub(crate) fn svm_raw(meta: &TxMeta) -> Result<ByteBufB64, String> {
         .as_ref()
         .map(|raw| ByteBufB64::from(raw.to_vec()))
         .ok_or_else(|| "no signed transaction to broadcast".to_string())
+}
+
+/// Hands a signed transaction to `target`'s providers. Broadcasting the same
+/// bytes again is harmless, so every first send and resend goes through here.
+pub(crate) async fn broadcast_raw(target: &BridgeTarget, meta: &TxMeta) -> Result<(), String> {
+    match target {
+        BridgeTarget::Evm(chain) => {
+            let raw = evm_raw_hex(meta)?;
+            evm_client(chain)?
+                .send_raw_transaction(raw)
+                .await
+                .map(|_| ())
+        }
+        BridgeTarget::Sol => svm_client()
+            .send_transaction(svm_raw(meta)?)
+            .await
+            .map(|_| ()),
+        BridgeTarget::Icp => Err("ICP transfers are not broadcast".into()),
+    }
 }
 
 pub async fn bridge(
@@ -475,55 +535,78 @@ pub async fn bridge_with_id(
     now: u64,
     request_id: Option<ByteBuf>,
 ) -> Result<BridgeTx, String> {
+    let _active = acquire_active_bridge_user(user)?;
+    let entry = deposit_entry(
+        user,
+        &from_chain,
+        &to_chain,
+        amount,
+        to_addr.as_deref(),
+        request_id.as_deref().map(Vec::as_slice),
+        now,
+    )?;
+    resume_deposit_entry(entry).await
+}
+
+/// Whether a recorded deposit plan is the one these bridge arguments ask
+/// for. Only the caller's own arguments count, so a retry never depends on
+/// today's fee or admission state.
+fn deposit_matches(
+    plan: &journal::DepositPlan,
+    from_chain: &str,
+    to_chain: &str,
+    amount: u128,
+    to_addr: Option<&str>,
+) -> Result<bool, String> {
+    Ok(plan.from.name() == from_chain
+        && plan.to.name() == to_chain
+        && plan.amount == amount
+        && check_destination(&plan.to, to_addr, &ForbiddenDestinations::default())? == plan.to_addr)
+}
+
+/// The deposit intent a bridge call carries on: the one its request ID
+/// names, the user's unresolved one when the arguments match it, or a new
+/// one that passed every check.
+pub(super) fn deposit_entry(
+    user: Principal,
+    from_chain: &str,
+    to_chain: &str,
+    amount: u128,
+    to_addr: Option<&str>,
+    request_id: Option<&[u8]>,
+    now: u64,
+) -> Result<journal::Entry, String> {
     if from_chain == to_chain {
         return Err("from_chain and to_chain cannot be the same".into());
     }
-    let _active = acquire_active_bridge_user(user)?;
-    // An explicit request ID is checked against the immutable original plan,
-    // so a completed retry never depends on today's fee or admission state.
-    if let Some(id) = request_id.as_deref()
+    if let Some(id) = request_id
         && let Some(entry) = journal::find_request(user, id)?
     {
         let journal::Purpose::Deposit(plan) = &entry.purpose else {
             return Err("request ID is not a deposit".into());
         };
-        if plan.from.name() != from_chain
-            || plan.to.name() != to_chain
-            || plan.amount != amount
-            || check_destination(
-                &plan.to,
-                to_addr.as_deref(),
-                &ForbiddenDestinations::default(),
-            )? != plan.to_addr
-        {
+        if !deposit_matches(plan, from_chain, to_chain, amount, to_addr)? {
             return Err("request ID belongs to different bridge arguments".into());
         }
-        return resume_deposit_entry(entry).await;
+        return Ok(entry);
     }
+    // The legacy bridge API recovers its outstanding deposit without a
+    // request ID; one given now is bound to it for later retries.
     if let Some(entry) = journal::open_deposit(user) {
         let journal::Purpose::Deposit(plan) = &entry.purpose else {
-            unreachable!()
+            unreachable!("open_deposit returns deposits")
         };
-        if plan.from.name() == from_chain
-            && plan.to.name() == to_chain
-            && plan.amount == amount
-            && check_destination(
-                &plan.to,
-                to_addr.as_deref(),
-                &ForbiddenDestinations::default(),
-            )? == plan.to_addr
-        {
-            if let Some(request_id) = request_id.as_deref() {
-                journal::bind_request(user, request_id, entry.id)?;
-            }
-            return resume_deposit_entry(entry).await;
+        if !deposit_matches(plan, from_chain, to_chain, amount, to_addr)? {
+            return Err(format!("resume deposit operation {} first", entry.id));
         }
-        return Err(format!("resume deposit operation {} first", entry.id));
+        if let Some(request_id) = request_id {
+            journal::bind_request(user, request_id, entry.id)?;
+        }
+        return Ok(entry);
     }
-    let plan = STATE.with_borrow(|s| {
-        plan_bridge(s, &from_chain, &to_chain, amount, to_addr.as_deref(), user)
-    })?;
-    let entry = journal::for_deposit(
+    let plan =
+        STATE.with_borrow(|s| plan_bridge(s, from_chain, to_chain, amount, to_addr, user))?;
+    journal::for_deposit(
         journal::DepositPlan {
             user,
             from: plan.from,
@@ -533,18 +616,9 @@ pub async fn bridge_with_id(
             amount,
             fee: plan.fee,
         },
-        request_id.as_deref().map(Vec::as_slice),
+        request_id,
         now,
-    )?;
-    resume_deposit_entry(entry).await
-}
-
-pub async fn resume_deposit(id: u64, owner: Principal) -> Result<BridgeTx, String> {
-    let _active = acquire_active_bridge_user(owner)?;
-    let entry = journal::get(id)
-        .filter(|e| e.owner == owner)
-        .ok_or_else(|| "deposit operation not found".to_string())?;
-    resume_deposit_entry(entry).await
+    )
 }
 
 async fn resume_deposit_entry(entry: journal::Entry) -> Result<BridgeTx, String> {
@@ -582,86 +656,67 @@ async fn resume_deposit_entry_inner(entry: journal::Entry) -> Result<BridgeTx, S
             _ => Err("deposit has already been handled".into()),
         };
     }
-    let deposit = if let journal::Phase::Completed(tx) = entry.phase.clone() {
-        Deposit::Settled(tx)
-    } else {
-        match &plan.from {
-            BridgeTarget::Icp => {
-                if entry.request.is_none() {
-                    journal::prepare(
-                        entry.id,
-                        journal::Request::TransferFrom {
-                            ledger: plan.ledger,
-                            args: TransferFromArgs {
-                                spender_subaccount: None,
-                                from: Account {
-                                    owner: plan.user,
-                                    subaccount: None,
-                                },
-                                to: Account {
-                                    owner: crate::helper::canister_id(),
-                                    subaccount: None,
-                                },
-                                fee: None,
-                                created_at_time: Some(entry.created_at.saturating_mul(1_000_000)),
-                                memo: Some(journal::memo(entry.id)),
-                                amount: plan.amount.into(),
+    // The signed transfer is recorded on its task before it is broadcast, so
+    // a broadcast whose outcome is unknown cannot strand the user's funds. A
+    // ledger transfer has nothing left to broadcast.
+    let (from_tx, from_meta) = match (entry.phase.clone(), &plan.from, entry.signed) {
+        (journal::Phase::Completed(tx), _, _) => (tx, None),
+        (_, BridgeTarget::Icp, _) => {
+            if entry.request.is_none() {
+                journal::prepare(
+                    entry.id,
+                    journal::Request::TransferFrom {
+                        ledger: plan.ledger,
+                        args: TransferFromArgs {
+                            spender_subaccount: None,
+                            from: Account {
+                                owner: plan.user,
+                                subaccount: None,
                             },
+                            to: Account {
+                                owner: crate::helper::canister_id(),
+                                subaccount: None,
+                            },
+                            fee: None,
+                            created_at_time: Some(entry.created_at.saturating_mul(1_000_000)),
+                            memo: Some(journal::memo(entry.id)),
+                            amount: plan.amount.into(),
                         },
-                    )?;
-                }
-                schedule_finalize(Duration::from_secs(5));
-                Deposit::Settled(journal::execute(entry.id).await?)
+                    },
+                )?;
             }
-            BridgeTarget::Evm(chain) => {
-                let client = evm_client(chain)?;
-                let (tx, meta) = if let Some(signed) = entry.signed {
-                    signed
-                } else {
-                    let bridge = STATE.with_borrow(|s| s.evm_address);
-                    let (_, signed) = build_erc20_transfer_tx(
-                        chain,
-                        &plan.user,
-                        &bridge,
-                        plan.amount,
-                        now_ms(),
-                        Funding::Deposit(entry.id),
-                    )
+            schedule_finalize(Duration::from_secs(5));
+            (journal::execute(entry.id).await?, None)
+        }
+        (_, _, Some((tx, meta))) => (tx, Some(meta)),
+        (_, BridgeTarget::Evm(chain), None) => {
+            let bridge = STATE.with_borrow(|s| s.evm_address);
+            let signed = build_erc20_transfer_tx(
+                chain,
+                &plan.user,
+                &bridge,
+                plan.amount,
+                now_ms(),
+                Funding::Deposit(entry.id),
+            )
+            .await?;
+            (signed.tx, Some(signed.meta))
+        }
+        (_, BridgeTarget::Sol, None) => {
+            let bridge = STATE.with_borrow(|s| s.svm_address);
+            let signed =
+                build_spl_transfer_tx(&plan.user, &bridge, plan.amount, Funding::Deposit(entry.id))
                     .await?;
-                    (signed.tx, signed.meta)
-                };
-                Deposit::Evm { tx, meta, client }
-            }
-            BridgeTarget::Sol => {
-                let client = svm_client();
-                let (tx, meta) = if let Some(signed) = entry.signed {
-                    signed
-                } else {
-                    let bridge = STATE.with_borrow(|s| s.svm_address);
-                    let (_, signed) = build_spl_transfer_tx(
-                        &plan.user,
-                        &bridge,
-                        plan.amount,
-                        Funding::Deposit(entry.id),
-                    )
-                    .await?;
-                    (signed.tx, signed.meta)
-                };
-                Deposit::Sol { tx, meta, client }
-            }
+            (signed.tx, Some(signed.meta))
         }
     };
-    let (from_tx, from_meta) = deposit.record();
     if pending::by_tx(&from_tx).is_none() {
         pending::insert(&BridgeLog {
             runtime: Some(LogRuntime {
                 task_id: entry.id,
                 ledger: Some(plan.ledger),
-                payout_attempt: None,
-                payout_resolution: None,
                 next_poll_at: now_ms(),
-                poll_attempts: 0,
-                error_chain: None,
+                ..Default::default()
             }),
             id: None,
             user: plan.user,
@@ -677,19 +732,14 @@ async fn resume_deposit_entry_inner(entry: journal::Entry) -> Result<BridgeTx, S
             error: None,
             stuck: false,
             payout_started_at: 0,
-            from_meta,
+            from_meta: from_meta.clone(),
             to_meta: None,
         });
     }
     journal::handled(entry.id);
-    schedule_finalize(Duration::from_secs(
-        if matches!(deposit, Deposit::Settled(_)) {
-            0
-        } else {
-            5
-        },
-    ));
-    if let Err(error) = deposit.broadcast().await
+    schedule_finalize(Duration::from_secs(if from_meta.is_none() { 0 } else { 5 }));
+    if let Some(meta) = &from_meta
+        && let Err(error) = broadcast_raw(&plan.from, meta).await
         && let Some(task) = pending::by_tx(&from_tx)
     {
         pending::update(task.task_id, |t| {
@@ -755,16 +805,23 @@ pub fn logs(take: usize, prev: Option<u64>) -> Vec<BridgeLog> {
     })
 }
 
-/// Moves a log into the permanent store and indexes it under its user,
-/// returning the id it was stored under.
-fn archive_bridge_log(log: &BridgeLog) -> Result<u64, String> {
+/// Moves a finished task out of the queue into the permanent store, indexes
+/// it under its user and returns the id it was stored under.
+fn archive_task(task: &BridgeLog) -> Result<u64, String> {
+    let mut log = BridgeLogLocal::from(task.clone());
+    // Scheduling state means nothing once a task is done; left at its
+    // default it is not stored at all.
+    log.next_poll_at = 0;
+    log.poll_attempts = 0;
+    log.payout_mined = false;
     let log_id = BRIDGE_LOGS
-        .with_borrow_mut(|r| r.append(&log.clone().into()))
+        .with_borrow_mut(|r| r.append(&log))
         .map_err(|err| format!("failed to append to BRIDGE_LOGS: {}", format_error(err)))?;
+    pending::remove(task.task_id);
     USER_LOG_INDEX.with_borrow_mut(|index| {
-        index.insert(UserLogKey::new(&log.user, log_id), ());
+        index.insert(UserLogKey::new(&task.user, log_id), ());
     });
-    migration::archive_appended(log_id, log);
+    migration::archive_appended(log_id, task);
     Ok(log_id)
 }
 
@@ -787,6 +844,27 @@ pub fn restart_finalize_bridging() -> u64 {
     pending::wake_all();
     schedule_finalize(Duration::from_secs(0));
     round
+}
+
+/// Lets the next round act on an administrator's edit right away and lifts
+/// the circuit breaker. The edited task is due now; the rest of the queue
+/// keeps its own backoff instead of being woken and re-polled all at once.
+fn run_after_edit() {
+    STATE.with_borrow_mut(|s| s.error_rounds = 0);
+    schedule_finalize(Duration::ZERO);
+}
+
+/// Releases a round lock that `ensure_finalize_bridging_idle` found
+/// abandoned. The generation moves first, so a late callback of that round
+/// can neither merge nor broadcast over the edit that goes with this.
+fn release_stale_round(stale: bool) {
+    if stale {
+        next_finalize_run_generation();
+        STATE.with_borrow_mut(|s| {
+            s.finalize_bridging_round.1 = false;
+            s.finalize_bridging_started_at = 0;
+        });
+    }
 }
 
 /// Rejects manual edits to `pending` while a finalization round is in flight.
@@ -905,6 +983,7 @@ pub fn retry_pending_task(
     task.to_meta = None;
     task.payout_attempt = None;
     task.payout_resolution = None;
+    task.payout_mined = false;
     task.error = None;
     task.error_chain = None;
     task.stuck = false;
@@ -912,19 +991,17 @@ pub fn retry_pending_task(
     task.poll_attempts = 0;
     task.next_poll_at = now_ms();
     pending::insert(&task);
-    if stale {
-        next_finalize_run_generation();
-        STATE.with_borrow_mut(|s| {
-            s.finalize_bridging_round.1 = false;
-            s.finalize_bridging_started_at = 0;
-        });
-    }
-    restart_finalize_bridging();
+    release_stale_round(stale);
+    run_after_edit();
     Ok(task)
 }
 
+/// Clears a task's error and has the next round look at it again.
+///
+/// Unlike the administrative edits this does not wait for a running round:
+/// it touches neither the payout nor its reservation, and a round that is
+/// working on the task writes its own fresher result over these fields.
 pub fn recheck_task(from_tx: &BridgeTx, owner: Principal, controller: bool) -> Result<(), String> {
-    let stale = ensure_finalize_bridging_idle()?;
     let task = pending_task(from_tx)?;
     if !controller && task.user != owner {
         return Err("task belongs to another user".into());
@@ -936,13 +1013,7 @@ pub fn recheck_task(from_tx: &BridgeTx, owner: Principal, controller: bool) -> R
         task.error_chain = None;
         task.next_poll_at = now_ms();
     });
-    if stale {
-        next_finalize_run_generation();
-        STATE.with_borrow_mut(|s| {
-            s.finalize_bridging_round.1 = false;
-            s.finalize_bridging_started_at = 0;
-        });
-    }
+    release_stale_round(ensure_finalize_bridging_idle().unwrap_or(false));
     schedule_finalize(Duration::ZERO);
     Ok(())
 }
@@ -978,22 +1049,15 @@ pub fn close_pending_task(from_tx: &BridgeTx, now: u64, force: bool) -> Result<B
     if task.error.is_none() {
         task.error = Some("closed by administrator after external settlement".into());
     }
-    let id = archive_bridge_log(&task)?;
+    let id = archive_task(&task)?;
     if let Some(operation) = task.payout_attempt {
         // can_close_task requires a handled attempt or the exact finalized
         // payout of a quarantined duplicate. Closing never sends another one.
         journal::handled(operation);
     }
-    pending::remove(task.task_id);
     task.id = Some(id);
-    if stale {
-        next_finalize_run_generation();
-        STATE.with_borrow_mut(|s| {
-            s.finalize_bridging_round.1 = false;
-            s.finalize_bridging_started_at = 0;
-        });
-    }
-    restart_finalize_bridging();
+    release_stale_round(stale);
+    run_after_edit();
     Ok(task)
 }
 
@@ -1072,8 +1136,7 @@ pub fn resolve_operation(
                     task.stuck = false;
                     task.finalized_at = now_ms();
                     task.from_meta = None;
-                    archive_bridge_log(&task)?;
-                    pending::remove(id);
+                    archive_task(&task)?;
                 }
                 journal::handled(id);
             } else if let Some(task) = pending::get(id) {
@@ -1093,14 +1156,8 @@ pub fn resolve_operation(
         }
         _ => journal::handled(id),
     }
-    if stale {
-        next_finalize_run_generation();
-        STATE.with_borrow_mut(|s| {
-            s.finalize_bridging_round.1 = false;
-            s.finalize_bridging_started_at = 0;
-        });
-    }
-    restart_finalize_bridging();
+    release_stale_round(stale);
+    run_after_edit();
     Ok(())
 }
 
@@ -1140,17 +1197,12 @@ pub fn resolve_legacy_payout(
 ) -> Result<(), String> {
     let stale = ensure_finalize_bridging_idle()?;
     let mut entry = legacy_resolution_candidate(&from_tx, task_id, &resolution, &evidence)?;
-    entry.id = journal::create(entry.owner, entry.purpose.clone(), entry.created_at).id;
-    journal::put(&entry);
-    let entry = journal::get(entry.id).expect("legacy reconciliation entry");
+    let created = journal::create(entry.owner, entry.purpose.clone(), entry.created_at);
+    entry.id = created.id;
+    entry.revision = created.revision;
+    journal::put(&mut entry);
     pending::update(task_id, |task| task.payout_attempt = Some(entry.id));
-    if stale {
-        next_finalize_run_generation();
-        STATE.with_borrow_mut(|s| {
-            s.finalize_bridging_round.1 = false;
-            s.finalize_bridging_started_at = 0;
-        });
-    }
+    release_stale_round(stale);
     resolve_operation(entry.id, entry.revision, resolution, evidence, controller)
 }
 
@@ -1159,11 +1211,17 @@ pub async fn resume_operation(id: u64, owner: Principal) -> Result<BridgeTx, Str
     let entry = journal::get(id)
         .filter(|e| e.owner == owner)
         .ok_or_else(|| "operation not found".to_string())?;
+    run_operation(entry).await
+}
+
+/// Carries an operation as far as it can go by itself: its owner's resume
+/// and a finalization round's recovery both come here.
+pub(super) async fn run_operation(entry: journal::Entry) -> Result<BridgeTx, String> {
     match entry.purpose {
         journal::Purpose::Deposit(_) => resume_deposit_entry(entry).await,
         journal::Purpose::Withdrawal { .. } => {
-            let tx = journal::execute(id).await?;
-            journal::handled(id);
+            let tx = journal::execute(entry.id).await?;
+            journal::handled(entry.id);
             Ok(tx)
         }
         journal::Purpose::Payout(_) => {
@@ -1197,7 +1255,9 @@ pub fn operations(owner: Principal, take: usize, before: Option<u64>) -> Vec<Ope
     journal::page(owner, take, before)
 }
 
-pub(super) async fn ledger_fee(ledger: Principal) -> Result<u128, String> {
+/// The ledger's current transfer fee. Only a withdrawal proposal shows it:
+/// transfers leave `fee` unset and the ledger charges its own.
+async fn ledger_fee(ledger: Principal) -> Result<u128, String> {
     let fee: Nat = crate::helper::read_call(ledger, "icrc1_fee", ()).await?;
     u128::try_from(&fee.0).map_err(|_| "ICP: ledger fee exceeds supported range".into())
 }
@@ -1253,19 +1313,10 @@ fn payout_fault(task: &BridgeLog, error: String) -> TaskFault {
     let id = task
         .payout_attempt
         .or_else(|| pending::get(task.task_id).and_then(|t| t.payout_attempt));
-    let needs_review = id.and_then(journal::get).is_some_and(|entry| {
-        matches!(
-            entry.phase,
-            journal::Phase::NeedsReview(_) | journal::Phase::Rejected(_)
-        ) || matches!(
-            (entry.phase, entry.request),
-            (
-                journal::Phase::Submitted,
-                Some(journal::Request::Signature { .. })
-            )
-        )
-    });
-    if needs_review {
+    if id
+        .and_then(journal::get)
+        .is_some_and(|entry| journal::needs_review(&entry))
+    {
         TaskFault::Stuck(error)
     } else {
         TaskFault::Transient(error)
@@ -1310,7 +1361,6 @@ pub async fn collect_fees(
         unreachable!()
     };
     if entry.request.is_none() {
-        let fee = ledger_fee(ledger).await?;
         journal::prepare(
             entry.id,
             journal::Request::Transfer {
@@ -1321,7 +1371,10 @@ pub async fn collect_fees(
                         owner: to,
                         subaccount: None,
                     },
-                    fee: Some(fee.into()),
+                    // The ledger charges its current fee, so a fee change can
+                    // never reject the persisted request; resending the same
+                    // arguments still deduplicates.
+                    fee: None,
                     memo: Some(journal::memo(entry.id)),
                     created_at_time: Some(entry.created_at.saturating_mul(1_000_000)),
                     amount: amount.into(),

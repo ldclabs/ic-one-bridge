@@ -161,6 +161,7 @@ function log(id, archived = false) {
         payout_attempt: [],
         payout_resolution: [],
         ledger: [token],
+        payout_mined: false,
         error_chain: []
       }
     ]

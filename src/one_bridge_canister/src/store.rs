@@ -57,8 +57,27 @@ pub mod pending;
 pub use budget::{EvmFeeLimits, ResourceLimits};
 pub use journal::{OperationInfo, Resolution};
 
-fn memory(id: u8) -> Memory {
-    MEMORY_MANAGER.with_borrow(|m| m.get(MemoryId::new(id)))
+/// Every stable structure's memory, in one place so that an id is never
+/// handed out twice. Id 1 held the legacy user index and stays retired.
+mod mem {
+    use super::MemoryId;
+    pub const STATE: MemoryId = MemoryId::new(0);
+    pub const BRIDGE_LOGS_INDEX: MemoryId = MemoryId::new(2);
+    pub const BRIDGE_LOGS_DATA: MemoryId = MemoryId::new(3);
+    pub const USER_LOG_INDEX: MemoryId = MemoryId::new(4);
+    pub const PENDING_TASKS: MemoryId = MemoryId::new(5);
+    pub const PENDING_INDEX: MemoryId = MemoryId::new(6);
+    pub const NEXT_ID: MemoryId = MemoryId::new(7);
+    pub const JOURNAL_ENTRIES: MemoryId = MemoryId::new(8);
+    pub const MIGRATION: MemoryId = MemoryId::new(9);
+    pub const USAGE: MemoryId = MemoryId::new(10);
+    pub const JOURNAL_USERS: MemoryId = MemoryId::new(11);
+    pub const REQUEST_IDS: MemoryId = MemoryId::new(12);
+    pub const OPEN_OPERATIONS: MemoryId = MemoryId::new(13);
+}
+
+fn memory(id: MemoryId) -> Memory {
+    MEMORY_MANAGER.with_borrow(|m| m.get(id))
 }
 
 #[derive(Clone)]
@@ -219,12 +238,6 @@ fn user_log_ids<M: ic_stable_structures::Memory>(
         .collect()
 }
 
-const STATE_MEMORY_ID: MemoryId = MemoryId::new(0);
-// MemoryId 1 is reserved for the legacy user index and must never be reused.
-const BRIDGE_LOGS_INDEX_MEMORY_ID: MemoryId = MemoryId::new(2);
-const BRIDGE_LOGS_DATA_MEMORY_ID: MemoryId = MemoryId::new(3);
-const USER_LOG_INDEX_MEMORY_ID: MemoryId = MemoryId::new(4);
-
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::new());
     static HTTP_TREE: RefCell<HttpCertificationTree> = RefCell::new(HttpCertificationTree::default());
@@ -235,24 +248,14 @@ thread_local! {
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
         RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
 
-    static STATE_STORE: RefCell<StableCell<Vec<u8>, Memory>> = RefCell::new(
-        StableCell::init(
-            MEMORY_MANAGER.with_borrow(|m| m.get(STATE_MEMORY_ID)),
-            Vec::new()
-        )
-    );
+    static STATE_STORE: RefCell<StableCell<Vec<u8>, Memory>> =
+        RefCell::new(StableCell::init(memory(mem::STATE), Vec::new()));
 
-    static USER_LOG_INDEX: RefCell<StableBTreeMap<UserLogKey, (), Memory>> = RefCell::new(
-        StableBTreeMap::init(
-            MEMORY_MANAGER.with_borrow(|m| m.get(USER_LOG_INDEX_MEMORY_ID)),
-        )
-    );
+    static USER_LOG_INDEX: RefCell<StableBTreeMap<UserLogKey, (), Memory>> =
+        RefCell::new(StableBTreeMap::init(memory(mem::USER_LOG_INDEX)));
 
     static BRIDGE_LOGS: RefCell<StableLog<BridgeLogLocal, Memory, Memory>> = RefCell::new(
-        StableLog::init(
-            MEMORY_MANAGER.with_borrow(|m| m.get(BRIDGE_LOGS_INDEX_MEMORY_ID)),
-            MEMORY_MANAGER.with_borrow(|m| m.get(BRIDGE_LOGS_DATA_MEMORY_ID)),
-        )
+        StableLog::init(memory(mem::BRIDGE_LOGS_INDEX), memory(mem::BRIDGE_LOGS_DATA))
     );
 }
 
@@ -397,6 +400,9 @@ enum TxStatus<C> {
     /// Not final. `seen` is whether any provider has it at all: one that
     /// nobody has can be broadcast again.
     Pending { seen: bool },
+    /// EVM: included in a block, not deep enough yet. Its nonce is spent, so
+    /// the sender can sign its next transaction.
+    Mined,
     /// Executed successfully and deep enough in the chain.
     Confirmed(C),
     /// Executed and failed. It moved nothing, and it burned its fee.
@@ -462,18 +468,19 @@ impl TaskOutcome {
     }
 }
 
-/// A payout as a round records it on its task before broadcasting it.
-type Payout = (BridgeTx, TxMeta);
-
-/// One encoding shared by the durable intent, pending task and broadcaster.
+/// A signed transaction and what it takes to follow it up: the one encoding
+/// shared by the durable intent, the pending task and the broadcaster. The
+/// journal stores it as a `(tx, meta)` tuple.
 pub struct SignedTransfer {
     pub tx: BridgeTx,
     pub meta: TxMeta,
 }
 
-/// The payout a task carries: the metadata is missing on tasks recorded by a
-/// version that did not keep it.
-type PayoutRecord = (BridgeTx, Option<TxMeta>);
+impl From<(BridgeTx, TxMeta)> for SignedTransfer {
+    fn from((tx, meta): (BridgeTx, TxMeta)) -> Self {
+        Self { tx, meta }
+    }
+}
 
 /// Result of atomically reserving the outgoing transaction slot of a pending
 /// task before handing a signed transaction to an external provider.
@@ -482,8 +489,9 @@ enum PayoutClaim {
     /// the candidate transaction.
     Claimed,
     /// Another (possibly stale-overlapping) round filled the slot first. Reuse
-    /// that transaction and never broadcast the candidate.
-    Existing(PayoutRecord),
+    /// that transaction and never broadcast the candidate. The metadata is
+    /// missing on tasks recorded by a version that did not keep it.
+    Existing(BridgeTx, Option<TxMeta>),
     /// This round lost the stale-lock race before it could reserve the slot.
     RunSuperseded,
     /// The task was finalized or removed while this round was building its
@@ -495,25 +503,26 @@ enum PayoutClaim {
 
 fn claim_pending_payout(
     run_generation: u64,
-    from_tx: &BridgeTx,
-    candidate: &Payout,
+    task_id: u64,
+    candidate: &SignedTransfer,
     now: u64,
 ) -> PayoutClaim {
     if !finalize_run_is_current(run_generation) {
         return PayoutClaim::RunSuperseded;
     }
-    let Some(mut task) = pending::by_tx(from_tx) else {
+    let Some(mut task) = pending::get(task_id) else {
         return PayoutClaim::TaskGone;
     };
     if let Err(error) = state::ensure_task_reconciled(&task) {
         return PayoutClaim::ReconciliationRequired(error);
     }
     if let Some(tx) = task.to_tx {
-        return PayoutClaim::Existing((tx, task.to_meta));
+        return PayoutClaim::Existing(tx, task.to_meta);
     }
-    task.to_tx = Some(candidate.0.clone());
-    task.to_meta = Some(candidate.1.clone());
+    task.to_tx = Some(candidate.tx.clone());
+    task.to_meta = Some(candidate.meta.clone());
     task.payout_resolution = None;
+    task.payout_mined = false;
     if task.payout_started_at == 0 {
         task.payout_started_at = now;
     }
@@ -539,7 +548,6 @@ enum BlockTag {
 /// toward the stale-lock takeover.
 type ReadSlot<T> = Rc<futures::lock::Mutex<Option<Result<T, String>>>>;
 type BlockCache = Rc<RefCell<HashMap<(String, BlockTag), ReadSlot<u64>>>>;
-type LedgerFeeCache = Rc<RefCell<HashMap<Principal, ReadSlot<u128>>>>;
 
 async fn read_once<T: Clone>(
     slot: &ReadSlot<T>,
@@ -559,7 +567,6 @@ struct FinalizeContext {
     evm_blocks: BlockCache,
     sol_signatures: Vec<String>,
     sol_statuses: ReadSlot<Vec<SolTxStatus>>,
-    ledger_fees: LedgerFeeCache,
 }
 
 impl FinalizeContext {
@@ -607,24 +614,6 @@ impl FinalizeContext {
             .ok_or_else(|| "missing signature status".into())
     }
 
-    async fn ledger_fee(&self, ledger: Principal) -> Result<u128, String> {
-        self.ledger_fee_with(ledger, state::ledger_fee(ledger))
-            .await
-    }
-
-    async fn ledger_fee_with(
-        &self,
-        ledger: Principal,
-        read: impl Future<Output = Result<u128, String>>,
-    ) -> Result<u128, String> {
-        let slot = self
-            .ledger_fees
-            .borrow_mut()
-            .entry(ledger)
-            .or_default()
-            .clone();
-        read_once(&slot, read).await
-    }
     async fn evm_block_number<H: HttpOutcall>(
         &self,
         chain: &str,

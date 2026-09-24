@@ -397,24 +397,36 @@ pub struct LogRuntime {
     pub next_poll_at: u64,
     pub poll_attempts: u32,
     pub error_chain: Option<BridgeTarget>,
+    /// EVM: the payout is in a block. Its nonce is spent, so it no longer
+    /// holds the chain's reservation while it waits to finalize.
+    #[serde(default)]
+    pub payout_mined: bool,
 }
 
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+/// The stored form of a task and of an archived log. Runtime fields at their
+/// default are left out: every reader, older versions included, defaults them.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BridgeLogLocal {
     #[serde(default)]
     pub task_id: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<Principal>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payout_attempt: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payout_resolution: Option<PayoutResolution>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub next_poll_at: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub poll_attempts: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_chain: Option<BridgeTarget>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub payout_mined: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     #[serde(rename = "u", alias = "user")]
@@ -478,6 +490,7 @@ impl From<BridgeLogLocal> for BridgeLog {
                 next_poll_at: log.next_poll_at,
                 poll_attempts: log.poll_attempts,
                 error_chain: log.error_chain.clone(),
+                payout_mined: log.payout_mined,
             }),
             id: log.id,
             user: log.user,
@@ -509,6 +522,7 @@ impl From<BridgeLog> for BridgeLogLocal {
             next_poll_at: log.next_poll_at,
             poll_attempts: log.poll_attempts,
             error_chain: log.error_chain.clone(),
+            payout_mined: log.payout_mined,
             id: log.id,
             user: log.user,
             from: log.from,
@@ -550,6 +564,13 @@ impl BridgeLog {
 
     pub fn is_finalized(&self) -> bool {
         self.from_tx.is_finalized() && self.to_tx.as_ref().is_some_and(|tx| tx.is_finalized())
+    }
+
+    /// Whether the task holds its EVM chain's next nonce: a payout that may
+    /// still execute and is not in a block yet. Only one task holds it, so
+    /// no two payouts are signed with the same nonce.
+    pub fn holds_nonce(&self) -> bool {
+        self.payout_may_execute() && !self.payout_mined
     }
 
     /// Whether the payout has been handed to a chain and not confirmed yet.

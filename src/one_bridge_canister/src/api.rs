@@ -89,7 +89,7 @@ async fn erc20_transfer_tx(chain: String, to: String, icp_amount: u128) -> Resul
     let to_addr = parse_evm_address(&to)?;
     let caller = msg_caller()?;
     let _signing = store::acquire_active_bridge_user(caller)?;
-    let (_, signed_tx) = store::state::build_erc20_transfer_tx(
+    let signed_tx = store::state::build_erc20_transfer_tx(
         &chain,
         &caller,
         &to_addr,
@@ -106,7 +106,7 @@ async fn erc20_transfer(chain: String, to: String, icp_amount: u128) -> Result<S
     let to_addr = parse_evm_address(&to)?;
     let caller = msg_caller()?;
     let _signing = store::acquire_active_bridge_user(caller)?;
-    let (cli, signed_tx) = store::state::build_erc20_transfer_tx(
+    let signed_tx = store::state::build_erc20_transfer_tx(
         &chain,
         &caller,
         &to_addr,
@@ -118,11 +118,8 @@ async fn erc20_transfer(chain: String, to: String, icp_amount: u128) -> Result<S
     let store::BridgeTx::Evm(_, hash) = signed_tx.tx else {
         unreachable!("EVM builder returns an EVM transaction")
     };
-    let tx_hash = B256::from(*hash).to_string();
-    let data = store::state::evm_raw_hex(&signed_tx.meta)?;
-    let _ = cli.send_raw_transaction(data).await?;
-
-    Ok(tx_hash)
+    store::state::broadcast_raw(&store::BridgeTarget::Evm(chain), &signed_tx.meta).await?;
+    Ok(B256::from(*hash).to_string())
 }
 
 #[ic_cdk::update(guard = "admit_request")]
@@ -130,7 +127,7 @@ async fn evm_transfer_tx(chain: String, to: String, evm_amount: u128) -> Result<
     let to_addr = parse_evm_address(&to)?;
     let caller = msg_caller()?;
     let _signing = store::acquire_active_bridge_user(caller)?;
-    let (_, signed_tx) = store::state::build_evm_transfer_tx(
+    let signed_tx = store::state::build_evm_transfer_tx(
         &chain,
         &caller,
         &to_addr,
@@ -147,7 +144,7 @@ async fn spl_transfer_tx(to: String, icp_amount: u128) -> Result<String, String>
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
     let _signing = store::acquire_active_bridge_user(caller)?;
-    let (_, signed_tx) =
+    let signed_tx =
         store::state::build_spl_transfer_tx(&caller, &to_addr, icp_amount, Funding::Verify).await?;
     Ok(store::state::svm_raw(&signed_tx.meta)?.to_base64())
 }
@@ -157,7 +154,7 @@ async fn sol_transfer_tx(to: String, sol_amount: u64) -> Result<String, String> 
     let to_addr = Pubkey::from_str(&to).map_err(|err| format!("invalid to address: {}", err))?;
     let caller = msg_caller()?;
     let _signing = store::acquire_active_bridge_user(caller)?;
-    let (_, signed_tx) =
+    let signed_tx =
         store::state::build_sol_transfer_tx(&caller, &to_addr, sol_amount, Funding::Verify).await?;
     Ok(store::state::svm_raw(&signed_tx.meta)?.to_base64())
 }
@@ -230,9 +227,10 @@ async fn bridge_with_id(
     .await
 }
 
+/// Deprecated: the same as `resume_operation`, kept for older clients.
 #[ic_cdk::update(guard = "admit_request")]
 async fn resume_deposit(operation_id: u64) -> Result<store::BridgeTx, String> {
-    store::state::resume_deposit(operation_id, msg_caller()?).await
+    store::state::resume_operation(operation_id, msg_caller()?).await
 }
 
 #[ic_cdk::update(guard = "admit_request")]

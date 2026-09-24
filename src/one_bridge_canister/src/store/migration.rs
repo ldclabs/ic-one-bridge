@@ -2,7 +2,9 @@
 //! heuristic. Its cursor survives a downgrade, so later legacy appends are found.
 use super::*;
 
-const BATCH_SIZE: usize = 100;
+/// Each record costs a few index reads and writes, far below a timer's
+/// instruction limit even at this batch size.
+const BATCH_SIZE: usize = 500;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Progress {
@@ -18,7 +20,7 @@ struct Progress {
     recovery_index_version: u8,
 }
 thread_local! {
-    static PROGRESS: RefCell<StableCell<Cbor<Progress>, Memory>> = RefCell::new(StableCell::init(memory(9), Cbor(Progress::default())));
+    static PROGRESS: RefCell<StableCell<Cbor<Progress>, Memory>> = RefCell::new(StableCell::init(memory(mem::MIGRATION), Cbor(Progress::default())));
 }
 
 pub fn archive_appended(id: u64, log: &BridgeLog) {
@@ -83,6 +85,7 @@ pub fn step(limit: usize) -> bool {
             break;
         };
         pending::record_archived_source(&log.from_tx, progress.next_archive);
+        pending::hold_archived_duplicate(&log.from_tx);
         if pending::known_transaction(&log.from_tx).is_none() {
             let id = if log.task_id == 0 {
                 pending::next_id()
@@ -229,15 +232,15 @@ mod tests {
         assert!(matches!(
             claim_pending_payout(
                 generation,
-                &live.from_tx,
-                &(
-                    BridgeTx::Evm(false, [18; 32].into()),
-                    TxMeta {
+                live.task_id,
+                &SignedTransfer {
+                    tx: BridgeTx::Evm(false, [18; 32].into()),
+                    meta: TxMeta {
                         deadline: TxDeadline::Nonce(0),
                         raw: None,
                         svm_validity: None
                     }
-                ),
+                },
                 now_ms()
             ),
             PayoutClaim::ReconciliationRequired(_)

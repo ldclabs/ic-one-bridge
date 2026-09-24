@@ -6,10 +6,18 @@ use super::*;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
 thread_local! {
-    static TASKS: RefCell<StableBTreeMap<u64, BridgeLogLocal, Memory>> = RefCell::new(StableBTreeMap::init(memory(5)));
-    static INDEX: RefCell<StableBTreeMap<Vec<u8>, u64, Memory>> = RefCell::new(StableBTreeMap::init(memory(6)));
-    static NEXT_ID: RefCell<StableCell<u64, Memory>> = RefCell::new(StableCell::init(memory(7), 1));
+    static TASKS: RefCell<StableBTreeMap<u64, BridgeLogLocal, Memory>> = RefCell::new(StableBTreeMap::init(memory(mem::PENDING_TASKS)));
+    static INDEX: RefCell<StableBTreeMap<Vec<u8>, u64, Memory>> = RefCell::new(StableBTreeMap::init(memory(mem::PENDING_INDEX)));
+    static NEXT_ID: RefCell<StableCell<u64, Memory>> = RefCell::new(StableCell::init(memory(mem::NEXT_ID), 1));
 }
+
+/// How long a task that would sign on an EVM chain whose nonce another task
+/// holds waits before it is looked at again: about a block, after which the
+/// holder's payout is usually mined and lets go of the nonce.
+const NONCE_HELD_RETRY_MS: u64 = 15_000;
+
+/// How long a second would-be signer on one EVM chain waits: the next round.
+const CHAIN_BUSY_RETRY_MS: u64 = 3_000;
 
 pub fn next_id() -> u64 {
     NEXT_ID.with_borrow_mut(|cell| {
@@ -58,6 +66,9 @@ pub fn archived_source(tx: &BridgeTx) -> Option<u64> {
     INDEX.with_borrow(|index| index.get(&archive_key(tx)))
 }
 
+/// Marks `tx` as the source of archived log `archive_id`. A pending task that
+/// still claims the same source picks up the hold on its next write; see
+/// `hold_archived_duplicate`.
 pub fn record_archived_source(tx: &BridgeTx, archive_id: u64) {
     INDEX.with_borrow_mut(|index| {
         let key = archive_key(tx);
@@ -65,6 +76,11 @@ pub fn record_archived_source(tx: &BridgeTx, archive_id: u64) {
             index.insert(key, archive_id);
         }
     });
+}
+
+/// Applies the reconciliation hold to a pending task whose source is already
+/// archived: a legacy duplicate found by the migration.
+pub fn hold_archived_duplicate(tx: &BridgeTx) {
     if let Some(task) = by_tx(tx) {
         update(task.task_id, |_| ());
     }
@@ -115,7 +131,7 @@ fn keys(task: &BridgeLog) -> Vec<Vec<u8>> {
     if !task.stuck {
         keys.push(suffix(suffix(vec![2], task.next_poll_at), task.task_id));
     }
-    if task.payout_may_execute()
+    if task.holds_nonce()
         && let BridgeTarget::Evm(chain) = &task.to
     {
         keys.push(suffix(chain_prefix(3, chain), task.task_id));
@@ -329,12 +345,22 @@ pub fn select_due(now: u64, limit: usize) -> Vec<BridgeLog> {
     let mut picked = Vec::new();
     for id in due {
         let Some(task) = get(id) else { continue };
+        // Only a task that may sign a payout this round competes for its
+        // chain's nonce; one polling a payout it has sent signs nothing.
         if let BridgeTarget::Evm(chain) = &task.to
-            && ((!task.payout_may_execute() && chain_reserved_by_other(chain, id))
-                || !chains.insert(chain.clone()))
+            && task.to_tx.is_none()
         {
-            update(id, |t| t.next_poll_at = now.saturating_add(3_000));
-            continue;
+            let wait = if !task.holds_nonce() && chain_reserved_by_other(chain, id) {
+                Some(NONCE_HELD_RETRY_MS)
+            } else if !chains.insert(chain.clone()) {
+                Some(CHAIN_BUSY_RETRY_MS)
+            } else {
+                None
+            };
+            if let Some(wait) = wait {
+                update(id, |t| t.next_poll_at = now.saturating_add(wait));
+                continue;
+            }
         }
         picked.push(task);
         if picked.len() == limit {
@@ -448,6 +474,53 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].task_id, other.task_id);
     }
+
+    fn ids(tasks: Vec<BridgeLog>) -> Vec<u64> {
+        let mut ids: Vec<u64> = tasks.into_iter().map(|t| t.task_id).collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_mined_payout_lets_the_next_signer_on_its_chain_go() {
+        reset();
+        let mut holder = task("ETH");
+        holder.to_tx = Some(BridgeTx::Evm(false, [5; 32].into()));
+        insert(&holder);
+        let signer = task("ETH");
+        insert(&signer);
+
+        // The unmined payout holds the nonce: the would-be signer waits a
+        // block, and the holder is still polled.
+        assert_eq!(ids(select_due(0, 3)), vec![holder.task_id]);
+        assert_eq!(
+            get(signer.task_id).unwrap().next_poll_at,
+            NONCE_HELD_RETRY_MS
+        );
+
+        // Once it is mined its nonce is spent, and both are worked on.
+        update(holder.task_id, |t| t.payout_mined = true);
+        assert!(!chain_reserved_by_other("ETH", signer.task_id));
+        assert_eq!(
+            ids(select_due(NONCE_HELD_RETRY_MS, 3)),
+            vec![holder.task_id, signer.task_id]
+        );
+    }
+
+    #[test]
+    fn would_be_signers_on_one_chain_take_turns() {
+        reset();
+        let first = task("ETH");
+        insert(&first);
+        let second = task("ETH");
+        insert(&second);
+        assert_eq!(ids(select_due(0, 3)), vec![first.task_id]);
+        assert_eq!(
+            get(second.task_id).unwrap().next_poll_at,
+            CHAIN_BUSY_RETRY_MS
+        );
+    }
+
     #[test]
     fn pages_are_bounded_and_do_not_expose_signed_bytes() {
         reset();

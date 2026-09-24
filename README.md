@@ -33,7 +33,9 @@ decimals and converts it to the destination chain's decimals.
 transaction to reach finality, then pays out `amount - token_bridge_fee` on the destination chain:
 to `to` when given, otherwise to the caller's own principal or derived address. Payouts are
 deduplicated so a retry cannot pay twice. Polling is paced by finality — every 3s for the first
-minute, then backing off to 15s, 60s and 5min while nothing advances.
+minute, then backing off to 15s, 60s and 5min while nothing advances. EVM payouts from the bridge
+address are signed one at a time per chain, but each holds the next nonce only until it is mined,
+so the next payout does not wait for the previous one to finalize.
 
 **What a round trusts.** HTTPS outcalls deliberately use non-replicated mode to control cost.
 Controllers configure independent official providers, and financial evidence needs two independent
@@ -58,7 +60,9 @@ retries use the same timestamp and memo. Use `bridge_with_id` with a stable requ
 across lost replies, `my_operations` to inspect the operation, and `resume_operation` to recover it.
 The original `bridge` API can also resume a matching unresolved deposit. Never reset a payout merely
 because an RPC cannot currently find it: ordinary retry refuses unresolved attempts, while explicit
-governance reconciliation records the evidence and exact operation revision.
+governance reconciliation records the evidence and exact operation revision. A threshold signature
+the signer refuses outright (a full signing queue, or too few cycles) produced nothing, so its payout
+is signed afresh after the task's backoff; an unknown signature outcome still needs reconciliation.
 An externally confirmed deposit without a pending task is queued automatically after governance
 reconciliation, including EVM and Solana deposits. Upgrade backfills that recovery index in bounded batches.
 Legacy duplicate sources remain under a durable reconciliation hold: neither user/admin rechecks
@@ -208,8 +212,9 @@ extension mint to an already-created recipient ATA where the existing transfer i
 
 The token ledger charges transfer fees directly to the bridge's existing ledger account when it
 pays a recipient or withdraws bridge fees. Payouts need no separate operating credit, sponsorship
-or historical-fee recognition, including the first payout after an upgrade. The account must hold
-enough tokens for the payout and its ledger fee. Governance withdrawals retain the existing
+or historical-fee recognition, including the first payout after an upgrade. Transfers leave `fee`
+unset, so the ledger charges its current fee and a fee change cannot reject a recorded transfer.
+The account must hold enough tokens for the payout and its ledger fee. Governance withdrawals retain the existing
 `icp_collected_fees - total_withdrawn_fees` ceiling; unresolved withdrawals stay counted until their
 outcome is known. This ceiling does not gate user payouts.
 
@@ -262,8 +267,8 @@ The generated Candid file is the authoritative interface:
 [one_bridge_canister.did](./src/one_bridge_canister/one_bridge_canister.did).
 
 - Read state and addresses: `info`, `evm_address`, `svm_address`.
-- Bridge and recover: `bridge`, `bridge_with_id`, `my_operations`, `resume_deposit`,
-  `resume_operation`, `cancel_operation`, `recheck_task`.
+- Bridge and recover: `bridge`, `bridge_with_id`, `my_operations`, `resume_operation`
+  (`resume_deposit` is its deprecated alias), `cancel_operation`, `recheck_task`.
 - Read history: `my_bridge_log`, `my_pending_logs`, `my_pending_logs_page`, `pending_logs`,
   `pending_logs_page`, `my_finalized_logs`, `finalized_logs`.
 - Withdraw from a user's derived wallet: `erc20_transfer`, `erc20_transfer_tx`,
