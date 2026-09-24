@@ -2,18 +2,9 @@
 members = ["src/one_bridge_canister"]
 resolver = "2"
 
-[profile.release]
-debug = false
-lto = true
-strip = true
-opt-level = 's'
-# one unit lets LTO see the whole canister: fewer duplicated monomorphisations
-# in the Wasm, and better inlining across the RPC and store modules
-codegen-units = 1
-
 [workspace.package]
 edition = "2024"
-version = "0.6.1"
+version = "0.6.2"
 repository = "https://github.com/ldclabs/ic-one-bridge"
 keywords = ["canister", "icp", "bridge", "erc20", "icrc"]
 categories = ["web-programming"]
@@ -33,7 +24,7 @@ futures = { version = "0.3", default-features = false, features = [
 http = "1"
 ic-cdk = "0.20"
 ic-cdk-timers = "1.0"
-ic-cdk-management-canister = "0.1"
+ic-cdk-management-canister = "0.2"
 ic-stable-structures = "0.7"
 ic-http-certification = "3"
 ic_auth_types = "0.10"
@@ -45,10 +36,19 @@ serde_bytes = "0.11"
 serde_json = "1"
 solana-hash = "4.6"
 solana-pubkey = "4.3"
-solana-transaction = "4.3"
-solana-instruction = "3.5"
-k256 = { version = "0.13", features = ["ecdsa"] }
+solana-transaction = "5.1"
+solana-instruction = "4.0"
+k256 = { version = "0.14", features = ["ecdsa"] }
 ic-dummy-getrandom-for-wasm = "0.1"
 
 [workspace.metadata.cargo-shear]
 ignored = ["ic-dummy-getrandom-for-wasm"]
+
+[profile.release]
+debug = false
+lto = true
+strip = true
+opt-level = 's'
+# one unit lets LTO see the whole canister: fewer duplicated monomorphisations
+# in the Wasm, and better inlining across the RPC and store modules
+codegen-units = 1

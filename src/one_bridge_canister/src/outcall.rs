@@ -1,6 +1,6 @@
 use http::Uri;
 use ic_cdk_management_canister::{
-    HttpHeader, HttpMethod, HttpRequestArgs, HttpRequestResult, http_request,
+    HttpHeader, HttpMethod, HttpRequest, HttpRequestArgs, HttpRequestResult,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -15,12 +15,11 @@ use crate::{
 
 /// Response budget for a JSON-RPC call that returns a scalar or a small object.
 ///
-/// An outcall is billed on `max_response_bytes` — the bytes it *reserves*, not
-/// the bytes that come back — and leaving it unset reserves the 2 MB maximum.
-/// These calls are non-replicated (`is_replicated: false`), which prices the
-/// reservation at ~800 cycles per byte on a 13-node subnet: ~1.7B cycles a
-/// call left unset, against ~10M for the budget below. So every method names
-/// one.
+/// Outcalls use pricing version 2, which bills the bytes that come back, but
+/// the cycles attached up front are sized from `max_response_bytes`, and
+/// leaving it unset reserves for the 2 MB maximum. The surplus is refunded, yet
+/// it has to be in the balance and stays held while the call runs. So every
+/// method names one.
 ///
 /// The budgets are deliberately far larger than the few hundred bytes of JSON
 /// these calls answer with. A response that overruns its budget is rejected
@@ -93,7 +92,10 @@ pub struct DefaultHttpOutcall;
 
 impl HttpOutcall for DefaultHttpOutcall {
     async fn request(&self, args: &HttpRequestArgs) -> Result<HttpRequestResult, String> {
-        http_request(args).await.map_err(|err| format!("{err}"))
+        HttpRequest::from_args(args.clone())
+            .send()
+            .await
+            .map_err(|err| format!("{err}"))
     }
 }
 
@@ -342,6 +344,7 @@ fn request_args(call: &RpcCall<'_>) -> Result<HttpRequestArgs, String> {
         body: Some(body),
         transform: None,
         is_replicated: Some(false),
+        pricing_version: Some(2),
     })
 }
 
@@ -671,7 +674,7 @@ pub mod tests {
     }
 
     /// Every outcall must cap the response it reserves; an uncapped one silently
-    /// reserves — and pays for — 2 MB.
+    /// holds cycles for 2 MB.
     #[test]
     fn every_request_reserves_a_bounded_response_from_a_single_replica() {
         let mock = MockHttpOutcall::new(vec![result("0x1".into())]);
@@ -682,6 +685,7 @@ pub mod tests {
         assert_eq!(mock.max_response_bytes(), vec![Some(SMALL_RESPONSE)]);
         let request = mock.requests().remove(0);
         assert_eq!(request.is_replicated, Some(false));
+        assert_eq!(request.pricing_version, Some(2));
         assert!(request.transform.is_none());
     }
 
