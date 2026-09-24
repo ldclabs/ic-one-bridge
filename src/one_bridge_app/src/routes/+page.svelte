@@ -15,8 +15,9 @@
   const principal = $derived(authStore.identity.getPrincipal().toText())
   const isAuthenticated = $derived(authStore.identity.isAuthenticated)
 
-  let mainBridge = $state<BridgeCanisterAPI | null>(null)
-  let bridges = $state<BridgeCanisterAPI[]>([])
+  // the main bridge first, then its sub-bridges, one per extra token
+  let bridges = $state.raw<BridgeCanisterAPI[]>([])
+  const mainBridge = $derived(bridges[0] ?? null)
   let activeTab: 'bridge' | 'wallet' = $state('bridge')
 
   function onSignIn() {
@@ -26,11 +27,10 @@
   onMount(() => {
     let alive = true
     let refreshing = false
-    const initial = toastRun(async () => {
+    const stopLoading = toastRun(async () => {
       const bridge = await BridgeCanisterAPI.loadBridge(BRIDGE_CANISTER_ID)
       const others = await bridge.loadSubBridges()
       if (!alive) return
-      mainBridge = bridge
       bridges = [bridge, ...others]
     })
     const refresh = async () => {
@@ -49,7 +49,7 @@
     return () => {
       alive = false
       clearInterval(timer)
-      initial.abort()
+      stopLoading()
       window.removeEventListener('bridge-activity', refresh)
     }
   })
@@ -171,11 +171,16 @@
             </div>
             <div class="relative">
               <div class:hidden={activeTab !== 'bridge'}>
-                <BridgeCard {isAuthenticated} {onSignIn} {mainBridge} />
+                <BridgeCard
+                  {isAuthenticated}
+                  {onSignIn}
+                  {bridges}
+                  active={activeTab === 'bridge'}
+                />
               </div>
               {#if isAuthenticated && mainBridge}
                 <div class:hidden={activeTab !== 'wallet'}>
-                  <WalletCard {mainBridge} />
+                  <WalletCard {bridges} active={activeTab === 'wallet'} />
                 </div>
               {/if}
             </div>

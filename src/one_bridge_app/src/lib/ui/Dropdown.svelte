@@ -154,14 +154,4 @@
   .dropdown-menu[style*='opacity: 1'] {
     transform: scaleY(1) translateY(0);
   }
-
-  /* flipped above the trigger when there is no room below */
-  .dropdown-menu.flipped {
-    transform-origin: bottom;
-    transform: scaleY(0.95) translateY(10px);
-  }
-
-  .dropdown-menu.flipped[style*='opacity: 1'] {
-    transform: scaleY(1) translateY(0);
-  }
 </style>

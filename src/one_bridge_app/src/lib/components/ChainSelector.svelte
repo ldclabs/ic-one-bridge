@@ -48,7 +48,7 @@
 {/snippet}
 
 <Dropdown
-  {open}
+  bind:open
   {disabled}
   {trigger}
   {containerClass}

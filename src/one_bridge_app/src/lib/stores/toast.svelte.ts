@@ -1,4 +1,4 @@
-import { errMessage, tryRun, type TryRunResult } from '$lib/utils/tryrun'
+import { errMessage, tryRun } from '$lib/utils/tryrun'
 import type { Snippet } from 'svelte'
 
 export interface ToastModel {
@@ -40,24 +40,10 @@ export function triggerToast(toast: Omit<ToastModel, 'id' | 'onclose'>) {
   }
 }
 
-export const ErrorLogs = $state<Error[]>([])
-
-export function toastRun<T>(
-  fn: (signal: AbortSignal, abortingQue: (() => void)[]) => T | Promise<T>,
-  errMsg?: string
-): TryRunResult<T> {
-  return tryRun(fn, (err: any) => {
-    if (err) {
-      console.error(err)
-      ErrorLogs.push(err)
-      if (ErrorLogs.length > 200) {
-        ErrorLogs.splice(0, 10)
-      }
-      triggerToast({
-        type: 'error',
-        message: errMsg ?? errMessage(err)
-      })
-    }
+export function toastRun(fn: (signal: AbortSignal) => unknown): () => void {
+  return tryRun(fn, (err) => {
+    console.error(err)
+    triggerToast({ type: 'error', message: errMessage(err) })
   })
 }
 

@@ -1,13 +1,12 @@
 import {
   idlFactory,
   type BridgeLog,
-  type BridgeTarget,
   type BridgeTx,
   type StateInfo,
   type OperationInfo,
   type _SERVICE
 } from '$declarations/one_bridge_canister/one_bridge_canister.did.js'
-import { getChain, type Chain } from '$lib/chains'
+import { getChain } from '$lib/chains'
 import { type BridgeLogInfo, type BridgingStatus } from '$lib/types/bridge'
 import { dynAgent } from '$lib/utils/auth'
 import {
@@ -17,6 +16,7 @@ import {
   type BridgeRequest
 } from '$lib/utils/bridge-request'
 import {
+  chainName,
   readinessReason,
   logSettled,
   txFinalized,
@@ -26,18 +26,15 @@ import {
 import { unwrapResult } from '$lib/types/result'
 import { EvmRpc } from '$lib/utils/evmrpc'
 import { SvmRpc } from '$lib/utils/svmrpc'
-import { tokenDisplay, TokenDisplay, type TokenInfo } from '$lib/utils/token'
+import { tokenDisplay, type TokenInfo } from '$lib/utils/token'
 import { Principal } from '@icp-sdk/core/principal'
 import { bytesToHex } from '@ldclabs/cose-ts/utils'
 import { getBase58Codec } from '@solana/kit'
-import { tick } from 'svelte'
-import { SvelteMap } from 'svelte/reactivity'
 import { createActor } from './actors'
 import { TokenLedgerAPI } from './tokenledger'
 
 export {
   type BridgeLog,
-  type BridgeTarget,
   type BridgeTx,
   type StateInfo
 } from '$declarations/one_bridge_canister/one_bridge_canister.did.js'
@@ -90,43 +87,29 @@ export type ChainAccount = {
 }
 
 export class BridgeCanisterAPI {
-  static #bridges: SvelteMap<string, BridgeCanisterAPI> = new SvelteMap()
-  static #loading: Map<string, Promise<BridgeCanisterAPI>> = new Map()
+  static #bridges = new Map<string, Promise<BridgeCanisterAPI>>()
 
-  static async loadBridge(canisterId: string): Promise<BridgeCanisterAPI> {
-    const loaded = this.#bridges.get(canisterId)
-    if (loaded) {
-      return loaded
-    }
-
-    // share one in-flight load, and only cache the bridge once its state is
-    // loaded, so concurrent callers never get a stateless bridge and a failed
-    // load is not cached forever
-    let loading = this.#loading.get(canisterId)
-    if (!loading) {
-      loading = (async () => {
-        const bridge = new BridgeCanisterAPI(canisterId)
-        await bridge.loadState()
-        this.#bridges.set(canisterId, bridge)
-        return bridge
-      })()
-      this.#loading.set(canisterId, loading)
-      loading.finally(() => this.#loading.delete(canisterId)).catch(() => {})
-    }
-
-    return loading
+  // a bridge is handed out only once its state is loaded, so callers never get
+  // a stateless one
+  static loadBridge(canisterId: string): Promise<BridgeCanisterAPI> {
+    return shared(this.#bridges, canisterId, async () => {
+      const bridge = new BridgeCanisterAPI(canisterId)
+      await bridge.loadState()
+      return bridge
+    })
   }
 
   readonly canisterId: Principal
   #actor: _SERVICE
-  #token = $state<TokenInfo | null>(null)
-  #display: TokenDisplay | null = null
-  #tokenLedger: TokenLedgerAPI | null = null
-  #tokenLedgerLoading: { id: string; promise: Promise<TokenLedgerAPI> } | null =
-    null
-  #svmRpc: SvmRpc | null = null
-  #evmRPC: Map<string, EvmRpc> = new Map()
-  #state = $state<StateInfo | null>(null)
+  // both are replaced whole and never mutated, so they skip deep proxying
+  #token = $state.raw<TokenInfo | null>(null)
+  #state = $state.raw<StateInfo | null>(null)
+  #refreshing: Promise<StateInfo> | null = null
+  // chain clients, keyed by ledger id, 'SOL' and EVM chain name. A client is
+  // shared once its provider answered
+  #ledgers = new Map<string, Promise<TokenLedgerAPI>>()
+  #svmRpc = new Map<'SOL', Promise<SvmRpc | null>>()
+  #evmRPC = new Map<string, Promise<EvmRpc>>()
 
   private constructor(canisterId: string) {
     this.canisterId = Principal.fromText(canisterId)
@@ -171,15 +154,19 @@ export class BridgeCanisterAPI {
 
   //#region amounts
 
-  parseAmount(amount: string | number): bigint {
-    return this.#display?.parseAmount(amount) ?? 0n
+  parseAmount(amount: string): bigint {
+    return this.#state
+      ? tokenDisplay(this.#state.token_decimals).parseAmount(amount)
+      : 0n
   }
 
   displayAmount(amount: bigint): string {
-    return this.#display?.displayValue(amount) ?? ''
+    return this.#state
+      ? tokenDisplay(this.#state.token_decimals).displayValue(amount)
+      : ''
   }
 
-  parseNativeAmount(chain: string, amount: string | number): bigint {
+  parseNativeAmount(chain: string, amount: string): bigint {
     return tokenDisplay(getChain(chain).nativeDecimals).parseAmount(amount)
   }
 
@@ -249,7 +236,16 @@ export class BridgeCanisterAPI {
     return this.#state ?? (await this.refreshState())
   }
 
-  async refreshState(): Promise<StateInfo> {
+  // the page poll, a manual refresh and a submission can overlap; they share
+  // one `info()` call
+  refreshState(): Promise<StateInfo> {
+    this.#refreshing ??= this.#fetchState().finally(() => {
+      this.#refreshing = null
+    })
+    return this.#refreshing
+  }
+
+  async #fetchState(): Promise<StateInfo> {
     const state = unwrapResult(await this.#actor.info(), 'call info failed')
     const previous = this.#state
     if (
@@ -263,18 +259,19 @@ export class BridgeCanisterAPI {
       configKey([previous.svm_providers, previous.svm_token_address]) !==
         configKey([state.svm_providers, state.svm_token_address])
     )
-      this.#svmRpc = null
-    const sameLedger = this.#token?.canisterId === state.token_ledger.toText()
-    if (!sameLedger) this.#tokenLedger = null
-    this.#token = {
+      this.#svmRpc.clear()
+    const ledger = state.token_ledger.toText()
+    const token: TokenInfo = {
       name: state.token_name,
       symbol: state.token_symbol,
       decimals: state.token_decimals,
-      fee: sameLedger ? (this.#token?.fee ?? 0n) : 0n,
+      fee: this.#token?.canisterId === ledger ? this.#token.fee : 0n,
       logo: state.token_logo,
-      canisterId: state.token_ledger.toText()
+      canisterId: ledger
     }
-    this.#display = new TokenDisplay(state.token_decimals)
+    // keep the same object while nothing changed, so views that read the
+    // token do not re-render on every poll
+    if (configKey(this.#token) !== configKey(token)) this.#token = token
     this.#state = state
     return state
   }
@@ -310,14 +307,16 @@ export class BridgeCanisterAPI {
     return subBridges.filter((b) => b !== null)
   }
 
-  async supportChains(): Promise<Chain[]> {
-    const state = await this.loadState()
+  // the chains this bridge reaches, by name; empty until the state is loaded
+  chainNames(): string[] {
+    const state = this.#state
+    if (!state) return []
     const names = ['ICP']
     if (state.svm_token_address[0] !== SVM_UNSET) {
       names.push('SOL')
     }
     names.push(...state.evm_token_contracts.map(([name]) => name))
-    return names.map(getChain)
+    return names
   }
 
   // the token's identifier on `chain` and its explorer page, or two empty
@@ -346,81 +345,64 @@ export class BridgeCanisterAPI {
   //#region chain clients
 
   async loadICPTokenAPI(): Promise<TokenLedgerAPI> {
-    await this.loadState()
-    const token = this.#token!
-    const id = token.canisterId
-    if (this.#tokenLedger?.canisterId.toText() === id) return this.#tokenLedger
-    if (this.#tokenLedgerLoading?.id === id)
-      return this.#tokenLedgerLoading.promise
-    const promise = (async () => {
-      const ledger = new TokenLedgerAPI(token)
-      const info = await ledger.fetchTokenInfo()
+    const state = await this.loadState()
+    const id = state.token_ledger.toText()
+    return shared(this.#ledgers, id, async () => {
+      const ledger = new TokenLedgerAPI(id)
+      const fee = await ledger.fee()
       if (this.#token?.canisterId !== id)
         throw new Error('The token ledger changed. Refresh before continuing.')
-      this.#token.fee = info.fee
-      this.#tokenLedger = ledger
+      this.#token = { ...this.#token, fee }
       return ledger
-    })()
-    this.#tokenLedgerLoading = { id, promise }
-    try {
-      return await promise
-    } finally {
-      if (this.#tokenLedgerLoading?.promise === promise)
-        this.#tokenLedgerLoading = null
-    }
+    })
   }
 
-  async loadSvmTokenAPI(): Promise<SvmRpc | null> {
-    if (!this.#svmRpc) {
+  // null when this bridge carries no SPL token
+  loadSvmTokenAPI(): Promise<SvmRpc | null> {
+    return shared(this.#svmRpc, 'SOL', async () => {
       const state = await this.loadState()
-      if (state.svm_token_address[0] !== SVM_UNSET) {
-        if (!state.svm_providers.length)
-          throw new Error(
-            'Public browser RPC endpoints for SOL are not configured; governance must publish anonymous endpoints.'
-          )
-        // cache only once a provider answered: an unawaited selection leaves
-        // the client on providers[0] and turns a total outage into an
-        // unhandled rejection
-        const rpc = new SvmRpc(
-          state.svm_providers,
-          state.svm_token_address[0],
-          state.svm_token_address[2]
+      if (state.svm_token_address[0] === SVM_UNSET) return null
+      if (!state.svm_providers.length)
+        throw new Error(
+          'Public browser RPC endpoints for SOL are not configured; governance must publish anonymous endpoints.'
         )
-        await rpc.selectProvider()
-        this.#svmRpc = rpc
-      }
-    }
-
-    return this.#svmRpc
+      const rpc = new SvmRpc(
+        state.svm_providers,
+        state.svm_token_address[0],
+        state.svm_token_address[2]
+      )
+      // a client whose provider selection threw must not be shared, or every
+      // later call silently uses providers[0]
+      await rpc.selectProvider()
+      return rpc
+    })
   }
 
-  async loadEVMTokenAPI(chain: string): Promise<EvmRpc> {
-    if (this.#evmRPC.has(chain)) {
-      return this.#evmRPC.get(chain)!
-    }
-
-    const state = await this.loadState()
-    const contract = state.evm_token_contracts.find(([name]) => name === chain)
-    if (!contract) {
-      throw new Error(`EVM token contract for chain ${chain} not found`)
-    }
-    const provider = state.evm_providers.find(([name]) => name === chain)
-    if (!provider) {
-      throw new Error(`EVM providers for chain ${chain} not found`)
-    }
-    const [_maxConfirmations, providerUrls] = provider[1]
-    if (providerUrls.length === 0) {
-      throw new Error(
-        `Public browser RPC endpoints for ${chain} are not configured; the bridge administrator must publish anonymous endpoints`
+  loadEVMTokenAPI(chain: string): Promise<EvmRpc> {
+    return shared(this.#evmRPC, chain, async () => {
+      const state = await this.loadState()
+      const contract = state.evm_token_contracts.find(
+        ([name]) => name === chain
       )
-    }
+      if (!contract) {
+        throw new Error(`EVM token contract for chain ${chain} not found`)
+      }
+      const provider = state.evm_providers.find(([name]) => name === chain)
+      if (!provider) {
+        throw new Error(`EVM providers for chain ${chain} not found`)
+      }
+      const [_maxConfirmations, providerUrls] = provider[1]
+      if (providerUrls.length === 0) {
+        throw new Error(
+          `Public browser RPC endpoints for ${chain} are not configured; the bridge administrator must publish anonymous endpoints`
+        )
+      }
 
-    const api = new EvmRpc(providerUrls, contract[1][0])
-    // same as above: a client whose provider selection threw must not be
-    // cached, or every later call silently uses providers[0]
-    await api.selectProvider()
-    this.#evmRPC.set(chain, api)
-    return api
+      const api = new EvmRpc(providerUrls, contract[1][0])
+      // same as above: selection must succeed before the client is shared
+      await api.selectProvider()
+      return api
+    })
   }
 
   //#endregion
@@ -584,8 +566,8 @@ export class BridgeCanisterAPI {
   }
 
   toBridgeLogInfo(log: BridgeLog): BridgeLogInfo {
-    const from = getChainName(log.from)
-    const to = getChainName(log.to)
+    const from = chainName(log.from)
+    const to = chainName(log.to)
     return {
       id: log.id[0] ?? 0n,
       taskId: log.runtime[0]?.task_id,
@@ -632,9 +614,9 @@ export class BridgeCanisterAPI {
   ): Promise<void> {
     let required = this.toChainAmount(fromChain, amount)
     if (fromChain === 'ICP') {
-      // ICP deposits go through icrc2_transfer_from, so the ledger takes its fee
-      // from the user's account on top of the amount
-      required += this.#token?.fee ?? 0n
+      // the ledger charges its fee twice on top of the amount: once for the
+      // approval, once for the bridge's icrc2_transfer_from
+      required += 2n * (this.#token?.fee ?? 0n)
     }
 
     let balance: bigint
@@ -873,8 +855,8 @@ export class BridgeCanisterAPI {
 export class BridgingProgress {
   #api: BridgeCanisterAPI
   #tx: BridgeTx
-  #log = $state<BridgeLog | null>(null)
-  #isComplete = $derived.by(() => isFinalized(this.#log?.to_tx[0]))
+  #log = $state.raw<BridgeLog | null>(null)
+  #isComplete = $derived.by(() => txFinalized(this.#log?.to_tx[0]))
   #owner = dynAgent.id.getPrincipal().toText()
   #timer: ReturnType<typeof setTimeout> | undefined
   #stopped = false
@@ -908,12 +890,11 @@ export class BridgingProgress {
       if (this.#stopped || dynAgent.id.getPrincipal().toText() !== this.#owner)
         return
       this.#log = log
-      await tick()
       if (!this.isSettled) {
         this.#timer = setTimeout(() => this.#refreshLog(), 5000)
       }
     } catch (error) {
-      console.error(`Error refreshing log ${this.#tx}:`, error)
+      console.error('Error refreshing the bridge log:', error)
       // keep polling: a transient failure must not strand the UI in "Bridging..."
       if (!this.#stopped)
         this.#timer = setTimeout(() => this.#refreshLog(), 5000)
@@ -936,7 +917,7 @@ export class BridgingProgress {
     if (!this.#log) {
       return 'bridging request accepted.'
     }
-    if (isFinalized(this.#log.to_tx[0])) {
+    if (txFinalized(this.#log.to_tx[0])) {
       return ''
     }
     if (logSettled(this.#log))
@@ -947,10 +928,10 @@ export class BridgingProgress {
     if (this.#log.error.length > 0) {
       return `${this.#log.error[0]}`
     }
-    if (isFinalized(this.#log.from_tx)) {
-      return `waiting for confirmation on ${getChainName(this.#log.to)}`
+    if (txFinalized(this.#log.from_tx)) {
+      return `waiting for confirmation on ${chainName(this.#log.to)}`
     }
-    return `waiting for confirmation on ${getChainName(this.#log.from)}`
+    return `waiting for confirmation on ${chainName(this.#log.from)}`
   }
 }
 
@@ -963,6 +944,10 @@ export type TransferTxInfo = {
   Sol?: string
 }
 
+// a Solana transaction whose blockhash expired can never land, so one no
+// provider has seen after this long was dropped
+const SOL_UNSEEN_TIMEOUT_MS = 120_000
+
 export class TransferingProgress {
   #api: BridgeCanisterAPI
   #tx = $state<TransferTxInfo | null>(null)
@@ -970,6 +955,7 @@ export class TransferingProgress {
   #owner = dynAgent.id.getPrincipal().toText()
   #timer: ReturnType<typeof setTimeout> | undefined
   #stopped = false
+  #sentAt = Date.now()
 
   static track(
     api: BridgeCanisterAPI,
@@ -1022,12 +1008,16 @@ export class TransferingProgress {
           this.#error = `transaction failed on ${this.#tx.chain}`
           return
         }
+        if (!status && Date.now() - this.#sentAt > SOL_UNSEEN_TIMEOUT_MS) {
+          this.#error = `transaction not seen on ${this.#tx.chain} after 2 minutes, it has likely expired. Check the explorer before trying again`
+          return
+        }
 
         if (!this.#stopped)
           this.#timer = setTimeout(() => this.#refreshLog(), 5000)
       }
     } catch (error) {
-      console.error(`Error refreshing log ${this.#tx}:`, error)
+      console.error(`Error checking the ${this.#tx.chain} transaction:`, error)
       // keep polling: a transient failure must not strand the UI in "Transfering..."
       if (!this.#stopped)
         this.#timer = setTimeout(() => this.#refreshLog(), 5000)
@@ -1089,17 +1079,6 @@ export class TransferingProgress {
   }
 }
 
-function getChainName(target: BridgeTarget): string {
-  if ('Evm' in target) {
-    return target.Evm
-  } else if ('Sol' in target) {
-    return 'SOL'
-  } else if ('Icp' in target) {
-    return 'ICP'
-  }
-  return 'Unknown'
-}
-
 function getTx(tx: BridgeTx): string {
   if ('Evm' in tx) {
     const [_isFinalized, rawTx] = tx.Evm
@@ -1118,7 +1097,7 @@ function getBridgingStatus(log?: BridgeLog | null): BridgingStatus {
   if (!log) {
     return 'Accepted'
   }
-  if (isFinalized(log.to_tx[0])) {
+  if (txFinalized(log.to_tx[0])) {
     return 'Completed'
   }
   if (logSettled(log)) return 'Closed'
@@ -1130,8 +1109,23 @@ function getBridgingStatus(log?: BridgeLog | null): BridgingStatus {
   return 'Pending'
 }
 
-function isFinalized(tx?: BridgeTx): boolean {
-  return txFinalized(tx)
+// Concurrent callers share one load per key and keep its result, while a
+// failed load is dropped so the next call retries instead of reusing it.
+function shared<K, V>(
+  cache: Map<K, Promise<V>>,
+  key: K,
+  load: () => Promise<V>
+): Promise<V> {
+  let promise = cache.get(key)
+  if (!promise) {
+    const loading = load()
+    cache.set(key, loading)
+    loading.catch(() => {
+      if (cache.get(key) === loading) cache.delete(key)
+    })
+    promise = loading
+  }
+  return promise
 }
 
 function configKey(value: unknown): string {

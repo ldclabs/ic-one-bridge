@@ -5,67 +5,30 @@ import {
 } from '$declarations/icrc1_ledger_canister/icrc1_ledger_canister.did.js'
 import { unwrapResult } from '$lib/types/result'
 import { dynAgent } from '$lib/utils/auth'
-import { type TokenInfo } from '$lib/utils/token'
 import { Principal } from '@icp-sdk/core/principal'
 import { createActor } from './actors'
 
 export class TokenLedgerAPI {
   readonly canisterId: Principal
-  #token: TokenInfo
   #actor: _SERVICE
   #icpActor: _SERVICE
 
-  constructor(token: TokenInfo) {
-    this.canisterId = Principal.fromText(token.canisterId)
+  constructor(canisterId: string) {
+    this.canisterId = Principal.fromText(canisterId)
     this.#actor = createActor<_SERVICE>({
-      canisterId: token.canisterId,
+      canisterId,
       idlFactory: idlFactory
     })
     this.#icpActor = createActor<_SERVICE>({
       canisterId: 'ryjl3-tyaaa-aaaaa-aaaba-cai',
       idlFactory: idlFactory
     })
-    this.#token = token
   }
 
-  get token(): TokenInfo {
-    return this.#token
-  }
-
-  async fetchTokenInfo(): Promise<TokenInfo> {
-    const metadata = await this.#actor.icrc1_metadata()
-
-    const token: TokenInfo = {
-      name: this.token.name,
-      symbol: this.token.symbol,
-      decimals: this.token.decimals,
-      fee: this.token.fee,
-      logo: this.token.logo,
-      canisterId: this.canisterId.toText()
-    }
-
-    for (const [key, value] of metadata) {
-      switch (key) {
-        case 'icrc1:name':
-          token.name = (value as { 'Text': string }).Text
-          continue
-        case 'icrc1:symbol':
-          token.symbol = (value as { 'Text': string }).Text
-          continue
-        case 'icrc1:decimals':
-          const decimals = (value as { 'Nat': bigint }).Nat
-          token.decimals = Number(decimals)
-          continue
-        case 'icrc1:fee':
-          token.fee = (value as { 'Nat': bigint }).Nat
-          continue
-        case 'icrc1:logo':
-          token.logo = (value as { 'Text': string }).Text
-          continue
-      }
-    }
-
-    return token
+  // the fee alone: the bridge already publishes the token's name, symbol,
+  // decimals and logo, so the full metadata would only be read to be dropped
+  async fee(): Promise<bigint> {
+    return this.#actor.icrc1_fee()
   }
 
   async balance(): Promise<bigint> {

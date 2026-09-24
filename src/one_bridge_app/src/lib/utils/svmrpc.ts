@@ -3,7 +3,9 @@ import {
   createSolanaRpc,
   getAddressEncoder,
   getProgramDerivedAddress,
+  isSolanaError,
   mainnet,
+  SOLANA_ERROR__JSON_RPC__INVALID_PARAMS,
   type Address,
   type Base64EncodedWireTransaction,
   type Signature
@@ -35,14 +37,10 @@ export class SvmRpc {
     this.#rpc = selected
   }
 
+  // an address that never held SOL reads 0, so any error is a real failure
   async getBalance(addr: string): Promise<bigint> {
-    try {
-      const { value } = await this.#rpc.getBalance(address(addr)).send()
-      return BigInt(value)
-    } catch (e) {
-      console.error('Error fetching SOL balance for', addr, ':', e)
-      return 0n
-    }
+    const { value } = await this.#rpc.getBalance(address(addr)).send()
+    return BigInt(value)
   }
 
   async #associatedTokenAddress(addr: string): Promise<Address> {
@@ -66,8 +64,10 @@ export class SvmRpc {
       const { value } = await this.#rpc.getTokenAccountBalance(address).send()
       return BigInt(value.amount)
     } catch (e) {
-      console.error('Error fetching SPL balance for', addr, ':', e)
-      return 0n
+      // the token account does not exist until it first receives the token;
+      // every other failure must surface rather than read as an empty balance
+      if (isSolanaError(e, SOLANA_ERROR__JSON_RPC__INVALID_PARAMS)) return 0n
+      throw e
     }
   }
 

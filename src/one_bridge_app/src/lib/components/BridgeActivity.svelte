@@ -1,5 +1,8 @@
 <script lang="ts">
-  import type { OperationInfo } from '$declarations/one_bridge_canister/one_bridge_canister.did.js'
+  import type {
+    BridgeTx,
+    OperationInfo
+  } from '$declarations/one_bridge_canister/one_bridge_canister.did.js'
   import {
     BridgingProgress,
     type BridgeCanisterAPI
@@ -135,9 +138,9 @@
     })
   }
 
-  function recheck(log: BridgeLogInfo) {
+  function recheck(tx: BridgeTx) {
     act(async () => {
-      await bridge.recheckTask(log.fromTransaction)
+      await bridge.recheckTask(tx)
       if (alive)
         notice =
           'A confirmation check has been scheduled. This does not create another payout.'
@@ -286,7 +289,7 @@
               {#if task && canRecheck(task)}<button
                   disabled={busy}
                   class="rounded-md bg-white/5 px-3 py-2 text-sm text-white/70 disabled:opacity-40"
-                  onclick={() => recheck(bridge.toBridgeLogInfo(task))}
+                  onclick={() => recheck(task.from_tx)}
                   >Check confirmation</button
                 >{/if}
             </div>
@@ -304,7 +307,9 @@
       <div class="max-h-[640px] overflow-auto rounded-lg border border-white/5"
         ><BridgeLogs
           {logs}
-          onRecheck={mine && tab === 'pending' ? recheck : undefined}
+          onRecheck={mine && tab === 'pending'
+            ? (log) => recheck(log.fromTransaction)
+            : undefined}
           {busy}
         /></div
       >

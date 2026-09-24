@@ -272,8 +272,8 @@ const api = {
   async recheck_task() {
     return { Ok: null }
   },
-  async icrc1_metadata() {
-    return [['icrc1:fee', { Nat: 10_000n }]]
+  async icrc1_fee() {
+    return 10_000n
   },
   async icrc1_balance_of({ owner: account }) {
     return account.toText() === bridge.toText()

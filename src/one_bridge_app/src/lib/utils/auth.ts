@@ -15,17 +15,15 @@ export const EXPIRATION_MS = 1000 * 60 * 60 // 1 hour
 
 export class IdentityEx implements Identity {
   expiredHook: (() => void) | null = null
+  readonly expiration: number // in milliseconds
 
   constructor(
     public readonly id: Identity,
-    public readonly expiration: number, // in milliseconds
-    public readonly username: string = '' // this is name identity if username exists
+    expiration: number
   ) {
-    this.id = id
     this.expiration = id.getPrincipal().isAnonymous()
       ? Number.MAX_SAFE_INTEGER
       : expiration
-    this.username = username
   }
 
   get isExpired() {
@@ -140,9 +138,3 @@ export function createAgent(identity: Identity): AuthAgent {
 }
 
 export const dynAgent = createAgent(anonymousIdentity)
-export const anonAgent = new AuthAgent({
-  identity: anonymousIdentity,
-  host: 'https://icp-api.io',
-  verifyQuerySignatures: false,
-  shouldFetchRootKey: IS_LOCAL
-})

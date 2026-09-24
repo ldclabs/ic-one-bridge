@@ -56,17 +56,17 @@ export class TokenDisplay {
    * the user typed into the amount that will be signed, so a silent 0 or a
    * silently truncated value is the one outcome worth avoiding.
    */
-  parseAmount(amount: string | number): bigint {
-    const str =
-      typeof amount === 'number' ? amount.toFixed(this.#decimals) : amount
-    const clean = str.trim().replace(/[,']/g, '')
+  parseAmount(amount: string): bigint {
+    const clean = amount.trim().replace(/[,']/g, '')
     if (!/^\d*(\.\d*)?$/.test(clean)) {
-      throw new Error(`Invalid amount: ${str}`)
+      throw new Error(`Invalid amount: ${amount}`)
     }
 
     const [integral, fractional] = clean.split('.')
     if (fractional && fractional.length > this.#decimals) {
-      throw new Error(`Amount ${str} has more than ${this.#decimals} decimals`)
+      throw new Error(
+        `Amount ${amount} has more than ${this.#decimals} decimals`
+      )
     }
 
     let ulps = integral ? BigInt(integral) * 10n ** BigInt(this.#decimals) : 0n
@@ -77,8 +77,8 @@ export class TokenDisplay {
   }
 }
 
-// native tokens are keyed by decimals, so the handful of Intl.NumberFormat
-// instances are built once instead of on every render
+// keyed by decimals, so the handful of Intl.NumberFormat instances are built
+// once instead of on every render or state refresh
 const displays = new Map<number, TokenDisplay>()
 
 export function tokenDisplay(decimals: number): TokenDisplay {

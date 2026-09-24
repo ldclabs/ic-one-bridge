@@ -4,14 +4,14 @@
     type BridgeCanisterAPI,
     type MyAddresses
   } from '$lib/canisters/bridge.svelte'
-  import { type Chain } from '$lib/chains'
+  import { getChain, type Chain } from '$lib/chains'
   import ArrowRightUpLine from '$lib/icons/arrow-right-up-line.svelte'
-  import { formDefault } from '$lib/prefs'
+  import { formDefault, preferredBridge } from '$lib/prefs'
   import { authStore } from '$lib/stores/auth.svelte'
   import { toastRun } from '$lib/stores/toast.svelte'
   import { pruneAddress } from '$lib/utils/helper'
   import { type TokenInfo } from '$lib/utils/token'
-  import { onDestroy, tick, untrack } from 'svelte'
+  import { onMount, untrack } from 'svelte'
   import AccountAddresses from './AccountAddresses.svelte'
   import AddressInput from './AddressInput.svelte'
   import AmountInput from './AmountInput.svelte'
@@ -25,24 +25,38 @@
   import TokenLink from './TokenLink.svelte'
 
   const {
-    mainBridge
+    bridges,
+    active
   }: {
-    mainBridge: BridgeCanisterAPI
+    // the main bridge first, already loaded
+    bridges: BridgeCanisterAPI[]
+    // the card is on screen; a hidden card does not poll balances
+    active: boolean
   } = $props()
 
-  const defaultToken = formDefault('Token', 'PANDA')
   const defaultFrom = formDefault('From', 'ICP')
 
   let alive = true
+  let refreshRun = 0
   let refreshTimer: ReturnType<typeof setTimeout> | undefined
+  const mainBridge = $derived(bridges[0]!)
   let myAddresses = $state<MyAddresses | null>(null)
-  let bridges = $state<BridgeCanisterAPI[]>([])
-  // the effect below keeps it in sync, only the initial value is read here
-  let selectedBridge = $state<BridgeCanisterAPI>(untrack(() => mainBridge))
-  let supportChains = $state<Chain[]>([])
-  let supportTokens = $state<TokenInfo[]>([])
-  let bridgeCanister = $derived(selectedBridge.canisterId.toText())
-  let selectedToken = $state<TokenInfo | null>(null)
+  // only the initial value is read here; the token selector changes it
+  let selectedBridge = $state<BridgeCanisterAPI>(
+    untrack(() => preferredBridge(bridges)!)
+  )
+  const supportTokens = $derived(
+    bridges.map((b) => b.token).filter((t) => t !== null)
+  )
+  const bridgeCanister = $derived(selectedBridge.canisterId.toText())
+  const selectedToken = $derived(selectedBridge.token)
+  // The state poll replaces the whole bridge state every 15 s. Effects key on
+  // these plain strings instead, so they rerun only when the value changes
+  const keysReady = $derived(mainBridge.runtime?.keys_ready.join() ?? '')
+  const chainNames = $derived(selectedBridge.chainNames().join())
+  const supportChains = $derived(
+    chainNames ? chainNames.split(',').map(getChain) : []
+  )
   let fromChain = $state<Chain | null>(null)
   let fromAddress = $state<string>('')
   let fromBalance = $state<bigint>(0n)
@@ -74,53 +88,42 @@
     )
   })
 
+  // the deposit addresses change only with the signing keys
   $effect(() => {
-    const keys = mainBridge.runtime?.keys_ready.join()
-    return toastRun(async (_signal) => {
-      void keys
-      myAddresses = await mainBridge.myAddresses(
-        authStore.identity.getPrincipal().toText()
-      )
-      await refreshMyTokenInfo()
-    }).abort
+    const bridge = mainBridge
+    void keysReady
+    return untrack(() =>
+      toastRun(async (signal) => {
+        const addresses = await bridge.myAddresses(
+          authStore.identity.getPrincipal().toText()
+        )
+        if (!signal.aborted) myAddresses = addresses
+      })
+    )
   })
 
+  // keep the chosen chain while the bridge still reaches it
   $effect(() => {
-    selectedBridge = mainBridge
-    loadBridges(mainBridge).then(() => {
-      if (selectedBridge.token?.symbol != defaultToken) {
-        selectedBridge =
-          bridges.find((b) => b.token?.symbol === defaultToken) || mainBridge
-      }
+    const chains = supportChains
+    untrack(() => {
+      const name = fromChain?.name || defaultFrom
+      fromChain = chains.find((c) => c.name === name) ?? chains[0] ?? null
     })
   })
 
+  // balances follow the selection; the gas fee and the amount unit also
+  // depend on whether the native coin is sent
   $effect(() => {
-    if (!selectedBridge.state) return
-
-    return toastRun(async (_signal) => {
-      if (!selectedBridge.state) return
-
-      selectedToken = selectedBridge.token!
-      supportChains = await selectedBridge.supportChains()
-      await tick()
-      // keep the current selection when it is still supported, this effect also
-      // reruns whenever the bridge state is refreshed
-      fromChain =
-        supportChains.find(
-          (c) => c.name === (fromChain?.name || defaultFrom)
-        ) ||
-        supportChains[0] ||
-        null
-
-      await refreshMyTokenInfo()
-    }).abort
+    void [selectedBridge, fromChain?.name, nativeToken, myAddresses]
+    untrack(() => refreshMyTokenInfo())
   })
 
-  async function loadBridges(main: BridgeCanisterAPI) {
-    bridges = [main, ...(await main.loadSubBridges())]
-    supportTokens = bridges.map((b) => b.token).filter((t) => t !== null)
-  }
+  // catch up on what moved while the card was hidden
+  let wasActive = untrack(() => active)
+  $effect(() => {
+    if (active && !wasActive) untrack(() => refreshMyTokenInfo())
+    wasActive = active
+  })
 
   function resetTransfer() {
     isTransfering = false
@@ -226,29 +229,25 @@
   }
 
   async function refreshMyTokenInfo(all: boolean = false) {
-    await tick()
-
-    if (!selectedBridge || !fromChain || !myAddresses) {
+    // only the latest run may write, so a slow answer for a chain the user
+    // already left cannot land on the one now selected
+    const run = ++refreshRun
+    const bridge = selectedBridge
+    const from = fromChain
+    const native = nativeToken
+    const addresses = myAddresses
+    if (!from || !addresses) {
       fromBalance = 0n
+      isLoading = false
       return
     }
 
     try {
       isLoading = true
+      if (all) await Promise.all(bridges.map((b) => b.refreshState()))
 
-      if (all) {
-        await mainBridge.refreshState()
-        if (selectedBridge !== mainBridge) {
-          await selectedBridge.refreshState()
-        }
-        await loadBridges(mainBridge)
-      }
-
-      const account = await selectedBridge.myAccountOn(
-        fromChain.name,
-        myAddresses,
-        nativeToken
-      )
+      const account = await bridge.myAccountOn(from.name, addresses, native)
+      if (run !== refreshRun) return
       fromAddress = account.address
       accountError = ''
       feeWarning = account.feeWarning
@@ -257,20 +256,17 @@
       // a token transfer on ICP pays the ledger fee in the token itself;
       // everything else pays the chain's own fee
       gasFee =
-        fromChain.name === 'ICP' && !nativeToken
-          ? selectedBridge.token!.fee
-          : account.nativeFee
+        from.name === 'ICP' && !native ? bridge.token!.fee : account.nativeFee
     } catch (err) {
-      accountError = errMessage(err)
+      if (run === refreshRun) accountError = errMessage(err)
     } finally {
-      isLoading = false
+      if (run === refreshRun) isLoading = false
     }
   }
 
   function onSelectNativeToken() {
-    // the gas fee and the amount unit depend on it, refresh before validating again
+    // the amount unit changes with it; the balances refresh on their own
     error = null
-    refreshMyTokenInfo()
   }
 
   function onSelectToken(token: TokenInfo) {
@@ -278,20 +274,18 @@
     nativeToken = false
     if (bridge) {
       selectedBridge = bridge
-      refreshMyTokenInfo()
     }
   }
 
-  async function onSelectFromChain(chain: Chain) {
+  function onSelectFromChain(chain: Chain) {
     fromChain = chain
-
-    await refreshMyTokenInfo()
   }
 
   async function onTransfer() {
     const [amount, err] = validateTransfer()
     error = err || null
     if (disabledTransfering || err || amount <= 0n) return
+    if (!selectedBridge.state || !selectedBridge.token || !fromChain) return
 
     const owner = authStore.identity.getPrincipal().toText()
     const assertOwner = () => {
@@ -300,13 +294,9 @@
           'The signed-in account changed. Please start again with the correct account.'
         )
     }
+    const chain = fromChain.name
     isTransfering = true
     toastRun(async () => {
-      if (!selectedBridge.state || !selectedBridge.token || !fromChain) {
-        return
-      }
-
-      const chain = fromChain.name
       try {
         assertOwner()
         if (chain === 'ICP') {
@@ -373,10 +363,19 @@
       }
     })
   }
-  onDestroy(() => {
-    alive = false
-    clearTimeout(refreshTimer)
-    transferingProgress?.stop()
+
+  onMount(() => {
+    // balances also move outside the app. A run still in flight is left to
+    // finish rather than superseded
+    const timer = setInterval(() => {
+      if (active && !document.hidden && !isLoading) refreshMyTokenInfo()
+    }, 15_000)
+    return () => {
+      alive = false
+      clearInterval(timer)
+      clearTimeout(refreshTimer)
+      transferingProgress?.stop()
+    }
   })
 </script>
 
